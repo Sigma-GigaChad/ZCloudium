@@ -494,15 +494,20 @@ test("a failure after the block expires starts a fresh budget instead of re-bloc
 
     advance(BLOCK_MS + 1000);
 
-    // The first failure after the block expires spends one unit of a fresh
-    // budget instead of landing on a counter that is still at the threshold.
-    const afterBlock = await post(base, "/_auth/login", { username: USERNAME, password: "wrong-password" });
-    assert.equal(afterBlock.status, 401, "one failure after the block expires must not re-block");
-
-    // The rest of that fresh budget is intact, so a single mistake does not lock
-    // the operator out again: seven failures in total, still no block.
-    const freshBudget = await failPasswordTimes(base, MAX_FAILURES - 2);
-    assert.deepEqual(freshBudget, Array(MAX_FAILURES - 2).fill(401));
+    // The budget behind the block expires with it, and the observable is the
+    // sequence, not the first answer. A counter that is still at the threshold
+    // re-blocks on the first failure after the expiry, and that request is
+    // answered 401 with the same page either way, because the block is consulted
+    // when a request enters and not when a failure is recorded: asserting one
+    // 401 here would hold under the unfixed code and prove nothing. What the
+    // reset means is that the seven failures after it are all rejections, so
+    // that is what this asserts.
+    const freshBudget = await failPasswordTimes(base, MAX_FAILURES - 1);
+    assert.deepEqual(
+      freshBudget,
+      Array(MAX_FAILURES - 1).fill(401),
+      "the failures after the block expires must spend a fresh budget, not re-block on the first one",
+    );
 
     const correct = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
     assert.equal(correct.status, 303, "the operator must be able to sign in again once the block expires");
