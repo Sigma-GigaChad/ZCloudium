@@ -109,11 +109,26 @@ is reachable only through that gateway.
   as a QR code and as an `otpauth://` URI for your authenticator application.
 - **Later connections**: username and password, then the six digit code. A code
   cannot be replayed: the last accepted step is stored server side.
-- **Sessions**: an HMAC signed cookie, 12 hours by default.
+- **Sessions**: an HMAC signed cookie, **12 hours by default**. The lifetime is
+  the window during which a stolen cookie stays usable, so it is short on
+  purpose, and on the full access profile that cookie is worth root on the
+  machine. Change it with `ZCLOUDIUM_SESSION_TTL_HOURS` (a positive number of
+  hours, fractional allowed); any value that is not a positive number is refused
+  and replaced by 12, with a line in the logs saying so. Closing the browser does
+  not end the session, and neither does restarting the container: delete
+  `/data/auth/secret.key` to invalidate every session at once (the next start
+  creates a new signing key, so every existing cookie stops verifying), or
+  `/data/auth` to reset the account and the sessions together, which brings the
+  setup wizard back. There is no password change route: resetting the account is
+  how you rotate the credentials.
 - **Failures**: from the eighth failed attempt, the source address is blocked
   for five minutes.
 - **Health**: `GET /_auth/health` answers `ok` without a session, which is what
-  the container healthcheck uses.
+  the container healthcheck uses. With `ZCLOUDIUM_AUTH=off` there is no gateway
+  and that path falls through to the web app, which answers 200 with the
+  interface shell: the container still reports healthy, but the probe no longer
+  tests the gateway (both compose files carry a commented override that probes
+  `/api/server-info` instead).
 - **Accounts**: stored in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
   mode 0600). The session signing key is `/data/auth/secret.key`. Removing
   `/data/auth` resets the whole thing and the wizard runs again.
@@ -132,6 +147,37 @@ environment:
 
 Anyone who reaches the port then gets a shell on the container, as root in the
 full access profile. Keep it on a private network, or turn it back on.
+
+### Upgrading from a version that carried a `command:` block
+
+Before the gateway, both compose files ended with a `command:` list holding the
+runtime arguments (`--web --host=0.0.0.0 --port=3030 --workspace=... --no-open
+--no-token`), and the README invited you to copy that file to
+`compose.local.yml` and adapt it. The entrypoint now builds those arguments
+itself, so a `command:` block kept from that version is **appended to
+`start.mjs` and ignored**: the container starts, uses the environment instead,
+and logs one line saying so:
+
+```
+[start] ignoring the extra command line arguments (--web --host=0.0.0.0 ...): the workspace, the addresses and the data directory come from the environment.
+```
+
+What to do, in your `compose.local.yml`:
+
+1. delete the whole `command:` block;
+2. if it carried a workspace other than `/workspace`, set
+   `ZCODE_SERVER_WORKSPACE` to that path instead;
+3. if it carried a different loopback port, nothing needs migrating: the
+   entrypoint picks the addresses, the gateway keeps publishing 3030;
+4. if it carried `--no-token`, nothing to do either: the entrypoint passes it to
+   the runtime on loopback, and `ZCLOUDIUM_AUTH` decides whether the gateway is
+   in front.
+
+In the full access profile there is one more consequence: the workspace is no
+longer a command line argument but `ZCODE_SERVER_WORKSPACE`, which that file now
+sets to `/host/home/<user>`. Without it the image default `/workspace` wins, and
+the agent works in a throwaway path inside the container instead of your home on
+the machine.
 
 ## Browser automation for the agent
 
@@ -379,6 +425,19 @@ Tested by actually running things, not only written:
   `GET /api/server-info` returns `200` with
   `{"version":"3.14.0","workspaces":[{"path":"/workspace"}]}` and `GET /`
   returns the application shell
+- **session lifetime**: the session cookie issued by the wizard carries
+  `Max-Age=43200` (12 hours) by default, `Max-Age=3600` with
+  `ZCLOUDIUM_SESSION_TTL_HOURS=1`, and an unusable value
+  (`ZCLOUDIUM_SESSION_TTL_HOURS=forever`) falls back to 43200 with a line in the
+  logs saying so. The default is pinned by a test, so the code and this
+  documentation cannot drift apart
+- **full access workspace**: with the full access profile the runtime reports
+  `workspaces[].path` as the mounted operator home (measured on a throwaway home
+  in the test), not the image default `/workspace`: the workspace comes from
+  `ZCODE_SERVER_WORKSPACE`
+- **leftover `command:` block**: a container started with the old argument list
+  appended logs `ignoring the extra command line arguments (...)` and still runs
+  with the loopback arguments built from the environment
 - **browser MCP server**: handshake over stdio as uid 1000 under the same
   hardening, 30 tools listed, `navigate_page` on a `data:` URL succeeded,
   `evaluate_script` returned the page title and the user agent

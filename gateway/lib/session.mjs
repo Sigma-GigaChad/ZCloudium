@@ -9,7 +9,13 @@ export const SESSION_COOKIE = COOKIE_NAME;
 export const PENDING_SETUP_COOKIE = SETUP_COOKIE;
 export const PENDING_LOGIN_COOKIE = LOGIN_COOKIE;
 
-export const DEFAULT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * Twelve hours. This is the window during which a stolen cookie stays usable,
+ * so it is deliberately short: the port can front an agent that runs with root
+ * on the host in the full access profile. Raise it with
+ * ZCLOUDIUM_SESSION_TTL_HOURS, and know what that extends.
+ */
+export const DEFAULT_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 export function createSessionKey() {
   return randomBytes(32);

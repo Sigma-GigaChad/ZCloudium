@@ -10,9 +10,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
+import { DEFAULT_SESSION_TTL_MS } from "../gateway/lib/session.mjs";
 import {
   DEFAULT_DATA_DIR,
+  DEFAULT_SESSION_TTL_HOURS,
   DEFAULT_WORKSPACE,
+  HOUR_MS,
   PUBLISHED_HOST,
   PUBLISHED_PORT,
   RUNTIME_ENTRY,
@@ -22,6 +25,7 @@ import {
   gatewayOptions,
   homeOf,
   parseEnv,
+  parseSessionTtlHours,
   runtimeArgs,
   start,
 } from "../gateway/start.mjs";
@@ -37,6 +41,8 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
     browserMcp: true,
     workspace: DEFAULT_WORKSPACE,
     dataDir: DEFAULT_DATA_DIR,
+    sessionTtlHours: DEFAULT_SESSION_TTL_HOURS,
+    sessionTtlMs: DEFAULT_SESSION_TTL_MS,
   });
   assert.equal(DEFAULT_WORKSPACE, "/workspace");
   assert.equal(DEFAULT_DATA_DIR, "/data");
@@ -45,6 +51,38 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
   assert.equal(PUBLISHED_PORT, 3030);
   assert.equal(UPSTREAM_HOST, "127.0.0.1");
   assert.equal(UPSTREAM_PORT, 3131);
+});
+
+/**
+ * The documentation states the session lifetime in hours, so the code has to
+ * pin the same number: this is the test that stops the two from drifting apart.
+ */
+test("a session lasts 12 hours by default, and that default is a single number", () => {
+  assert.equal(HOUR_MS, 3_600_000);
+  assert.equal(DEFAULT_SESSION_TTL_HOURS, 12);
+  assert.equal(DEFAULT_SESSION_TTL_MS, 12 * HOUR_MS);
+  assert.equal(parseEnv({}).sessionTtlMs, 12 * HOUR_MS);
+  assert.equal(parseEnv({}).sessionTtlHours, 12);
+});
+
+test("ZCLOUDIUM_SESSION_TTL_HOURS accepts a positive number of hours", () => {
+  assert.equal(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "1" }).sessionTtlMs, 1 * HOUR_MS);
+  assert.equal(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "6" }).sessionTtlHours, 6);
+  assert.equal(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: " 24 " }).sessionTtlMs, 24 * HOUR_MS);
+  assert.equal(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "0.5" }).sessionTtlMs, HOUR_MS / 2);
+  assert.equal(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "8760" }).sessionTtlHours, 8760);
+});
+
+test("anything that is not a positive number falls back to the default", () => {
+  for (const value of ["", "   ", "0", "-1", "-0.5", "abc", "12h", "NaN", "Infinity", "1e999"]) {
+    const config = parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: value });
+    assert.equal(config.sessionTtlHours, DEFAULT_SESSION_TTL_HOURS, `"${value}" must fall back`);
+    assert.equal(config.sessionTtlMs, DEFAULT_SESSION_TTL_MS, `"${value}" must fall back`);
+  }
+  assert.equal(parseSessionTtlHours(undefined), DEFAULT_SESSION_TTL_HOURS);
+  assert.equal(parseSessionTtlHours(null), DEFAULT_SESSION_TTL_HOURS);
+  assert.equal(parseSessionTtlHours("0"), DEFAULT_SESSION_TTL_HOURS);
+  assert.equal(parseSessionTtlHours("0.25"), 0.25);
 });
 
 test("the workspace and the data directory come from their environment variables", () => {
@@ -103,12 +141,16 @@ test("the gateway options point at the loopback address the runtime was given", 
     port: 3030,
     dataDir: "/state",
     upstreamUrl: "http://127.0.0.1:3131",
+    sessionTtlMs: DEFAULT_SESSION_TTL_MS,
   });
 
   const args = runtimeArgs(config);
   const host = args[args.indexOf("--host") + 1];
   const port = args[args.indexOf("--port") + 1];
   assert.equal(gatewayOptions(config).upstreamUrl, `http://${host}:${port}`);
+
+  const shorter = gatewayOptions(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "3" }));
+  assert.equal(shorter.sessionTtlMs, 3 * HOUR_MS, "the configured lifetime must reach the gateway");
 });
 
 test("the home used for the agent configuration is $HOME, then the system home", () => {
@@ -158,7 +200,7 @@ function fakeProcess() {
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Wires start() with stubs and returns everything the assertions need. */
-async function runStart(env, { gateway = null, mcp = async () => ({ status: "unchanged" }) } = {}) {
+async function runStart(env, { gateway = null, mcp = async () => ({ status: "unchanged" }), argv = ["node", "/opt/cloudium/gateway/start.mjs"] } = {}) {
   const child = fakeChild();
   const spawns = [];
   const signals = fakeProcess();
@@ -169,6 +211,7 @@ async function runStart(env, { gateway = null, mcp = async () => ({ status: "unc
 
   const result = await start({
     env,
+    argv,
     logger: (line) => logs.push(line),
     signals,
     spawnRuntime: (file, args, options) => {
@@ -200,7 +243,9 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
   assert.equal(spawns[0].file, process.execPath);
   assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...LOOPBACK_ARGS]);
   assert.equal(spawns[0].options.stdio, "inherit");
-  assert.deepEqual(gatewayCalls, [{ host: "0.0.0.0", port: 3030, dataDir: "/data", upstreamUrl: "http://127.0.0.1:3131" }]);
+  assert.deepEqual(gatewayCalls, [
+    { host: "0.0.0.0", port: 3030, dataDir: "/data", upstreamUrl: "http://127.0.0.1:3131", sessionTtlMs: DEFAULT_SESSION_TTL_MS },
+  ]);
   assert.equal(result.child, child);
   assert.equal(result.gateway.port, PUBLISHED_PORT);
 
@@ -247,6 +292,46 @@ test("the browser MCP configuration is merged into $HOME by default", async () =
 test("ZCLOUDIUM_BROWSER_MCP=off leaves the agent configuration untouched", async () => {
   const { mcpCalls } = await runStart({ HOME: "/data", ZCLOUDIUM_BROWSER_MCP: "off" });
   assert.deepEqual(mcpCalls, []);
+});
+
+test("the session lifetime from the environment reaches the gateway", async () => {
+  const { gatewayCalls } = await runStart({ HOME: "/data", ZCLOUDIUM_SESSION_TTL_HOURS: "2" });
+  assert.equal(gatewayCalls.length, 1);
+  assert.equal(gatewayCalls[0].sessionTtlMs, 2 * HOUR_MS);
+
+  const reported = await runStart({ HOME: "/data", ZCLOUDIUM_SESSION_TTL_HOURS: "1" });
+  assert.equal(
+    reported.logs.some((line) => /sessions last 1 hour$/.test(line)),
+    true,
+    `the reported lifetime must read correctly, got ${JSON.stringify(reported.logs)}`,
+  );
+
+  const fallback = await runStart({ HOME: "/data", ZCLOUDIUM_SESSION_TTL_HOURS: "forever" });
+  assert.equal(fallback.gatewayCalls[0].sessionTtlMs, DEFAULT_SESSION_TTL_MS, "an unusable value must not weaken the default");
+  assert.equal(
+    fallback.logs.some((line) => /ZCLOUDIUM_SESSION_TTL_HOURS/.test(line) && /12 hours/.test(line)),
+    true,
+    `the substitution must be reported, got ${JSON.stringify(fallback.logs)}`,
+  );
+});
+
+test("extra command line arguments are reported and ignored", async () => {
+  const stale = ["node", "/opt/cloudium/gateway/start.mjs", "--web", "--host=0.0.0.0", "--port=3030", "--workspace=/workspace"];
+  const { spawns, logs } = await runStart({ HOME: "/data" }, { argv: stale });
+
+  assert.deepEqual(
+    spawns[0].args,
+    [RUNTIME_ENTRY, ...LOOPBACK_ARGS],
+    "the runtime arguments must still come from the environment, not from the command line",
+  );
+  assert.equal(
+    logs.some((line) => /command line/i.test(line)),
+    true,
+    `the operator must be told, got ${JSON.stringify(logs)}`,
+  );
+
+  const quiet = await runStart({ HOME: "/data" });
+  assert.equal(quiet.logs.some((line) => /command line/i.test(line)), false, "nothing to report without extra arguments");
 });
 
 test("a merge failure is reported but does not prevent the startup", async () => {

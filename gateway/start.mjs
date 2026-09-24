@@ -17,6 +17,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyBrowserMcp } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
+import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
@@ -32,6 +33,15 @@ export const UPSTREAM_PORT = 3131;
 export const DEFAULT_WORKSPACE = "/workspace";
 export const DEFAULT_DATA_DIR = "/data";
 
+export const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * The session lifetime, expressed in hours because that is how the
+ * documentation states it. The value itself lives in session.mjs, so the
+ * default cannot be described in one place and implemented in another.
+ */
+export const DEFAULT_SESSION_TTL_HOURS = DEFAULT_SESSION_TTL_MS / HOUR_MS;
+
 const OFF = "off";
 
 const isOff = (value) => typeof value === "string" && value.trim().toLowerCase() === OFF;
@@ -41,13 +51,29 @@ const envValue = (env, name, fallback) => {
   return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : fallback;
 };
 
+/**
+ * Reads a number of hours. Anything that is not a positive number is refused
+ * and replaced by the default: a typo must not silently produce a session that
+ * outlives the documentation.
+ */
+export function parseSessionTtlHours(raw, fallback = DEFAULT_SESSION_TTL_HOURS) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return fallback;
+  }
+  const hours = Number(String(raw).trim());
+  return Number.isFinite(hours) && hours > 0 ? hours : fallback;
+}
+
 /** Environment parsing: what the container was asked to do. */
 export function parseEnv(env = process.env) {
+  const sessionTtlHours = parseSessionTtlHours(env.ZCLOUDIUM_SESSION_TTL_HOURS);
   return {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
     browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
     dataDir: envValue(env, "ZCODE_DATA_BASE_DIR", DEFAULT_DATA_DIR),
+    sessionTtlHours,
+    sessionTtlMs: sessionTtlHours * HOUR_MS,
   };
 }
 
@@ -73,13 +99,14 @@ export function runtimeArgs({ authEnabled = true, workspace = DEFAULT_WORKSPACE 
   ];
 }
 
-/** Options for createGateway: published address, loopback upstream, data volume. */
-export function gatewayOptions({ dataDir = DEFAULT_DATA_DIR } = {}) {
+/** Options for createGateway: published address, loopback upstream, data volume, session lifetime. */
+export function gatewayOptions({ dataDir = DEFAULT_DATA_DIR, sessionTtlMs = DEFAULT_SESSION_TTL_MS } = {}) {
   return {
     host: PUBLISHED_HOST,
     port: PUBLISHED_PORT,
     dataDir,
     upstreamUrl: `http://${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
+    sessionTtlMs,
   };
 }
 
@@ -117,6 +144,7 @@ function describeMerge(result) {
  */
 export async function start({
   env = process.env,
+  argv = process.argv,
   logger = (line) => process.stdout.write(`${line}\n`),
   signals = process,
   spawnRuntime = (file, args, options) => spawn(file, args, options),
@@ -126,6 +154,30 @@ export async function start({
 } = {}) {
   const config = parseEnv(env);
   const args = runtimeArgs(config);
+
+  // The addresses, the workspace and the data directory come from the
+  // environment. A leftover command line is appended to this script and does
+  // nothing, so say so instead of ignoring it in silence.
+  const extra = argv.slice(2);
+  if (extra.length > 0) {
+    logger(
+      `[start] ignoring the extra command line arguments (${extra.join(" ")}): the workspace, the addresses and ` +
+        "the data directory come from the environment. Remove the command block from your compose file, and set " +
+        "ZCODE_SERVER_WORKSPACE and ZCODE_DATA_BASE_DIR instead.",
+    );
+  }
+
+  // The lifetime is reported because it is the window during which a stolen
+  // cookie stays usable.
+  const requestedTtl = envValue(env, "ZCLOUDIUM_SESSION_TTL_HOURS", null);
+  const lifetime = `${config.sessionTtlHours} ${config.sessionTtlHours === 1 ? "hour" : "hours"}`;
+  if (requestedTtl !== null && Number(requestedTtl) !== config.sessionTtlHours) {
+    logger(
+      `[start] ZCLOUDIUM_SESSION_TTL_HOURS="${requestedTtl}" is not a positive number of hours, ` +
+        `falling back to ${lifetime}`,
+    );
+  }
+  logger(`[start] sessions last ${lifetime}`);
 
   // Before the runtime starts, so that it reads a configuration that already
   // contains the browser server instead of writing its own state over it.

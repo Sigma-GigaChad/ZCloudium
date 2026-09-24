@@ -128,9 +128,11 @@ USER node
 EXPOSE 3030
 
 # /_auth/health is served by the gateway and answers without a session, which is
-# exactly what a probe needs. With ZCLOUDIUM_AUTH=off there is no gateway, so the
-# probe cannot succeed: override the healthcheck in that case, both compose files
-# show how.
+# exactly what a probe needs. With ZCLOUDIUM_AUTH=off there is no gateway and this
+# path falls through to the web app, which answers 200 with the interface shell
+# (measured), so the container still reports healthy while the probe no longer
+# tests anything: override the healthcheck to probe /api/server-info, both compose
+# files show how.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 

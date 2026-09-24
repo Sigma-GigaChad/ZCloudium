@@ -66,6 +66,10 @@ services:
       # Browser automation through the MCP server baked into the image. "off"
       # leaves the agent configuration untouched.
       ZCLOUDIUM_BROWSER_MCP: "on"
+      # How long a session lasts, in hours. 12 by default, which is also the
+      # window during which a stolen cookie stays usable: raise it only with
+      # that in mind. Any value that is not a positive number falls back to 12.
+      ZCLOUDIUM_SESSION_TTL_HOURS: "12"
 
     ## ---------- Hardening ----------
     # The container root filesystem cannot be modified: a compromise does not

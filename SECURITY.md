@@ -101,9 +101,20 @@ What it does not do:
 - the failure counter (8 failures, then five minutes blocked per source address)
   is in memory: restarting the container resets it.
 
-Defaults worth knowing: 12 hour sessions, a TOTP code that cannot be replayed
-(the last accepted step is stored), and a `next` parameter restricted to
-same-origin paths, so it cannot be turned into an open redirect.
+Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
+to change it, a positive number of hours, anything else is refused and replaced
+by 12 with a log line), a TOTP code that cannot be replayed (the last accepted
+step is stored), and a `next` parameter restricted to same-origin paths, so it
+cannot be turned into an open redirect.
+
+The session lifetime is what a stolen cookie is worth. Twelve hours is a
+deliberate compromise between usability and exposure; on the full access profile
+that cookie is worth root on the machine, so raising the value raises the window
+during which a cookie taken from a browser, a proxy or a log stays usable.
+Restarting the container does not end a session, since the signing key lives in
+the volume: delete `/data/auth/secret.key` to invalidate all of them at once
+(the next start creates a new key), or `/data/auth` to reset the account as well
+and bring the setup wizard back.
 
 `ZCLOUDIUM_AUTH=off` removes the gateway entirely: the runtime is published
 directly, with `--no-token`, so **anyone who reaches the port gets a shell on
