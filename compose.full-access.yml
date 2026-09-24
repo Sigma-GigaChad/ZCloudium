@@ -1,15 +1,17 @@
-# Accès total : l'agent tourne en root DANS le conteneur et voit l'intégralité du
-# FS de la machine monté sur /host. Il peut donc lire et écrire n'importe où, y
-# compris /etc, /var et /root, et casser le système s'il se trompe de chemin.
+# Full access: the agent runs as root INSIDE the container and sees the whole
+# filesystem of the machine mounted on /host. It can therefore read and write
+# anywhere, including /etc, /var and /root, and break the system if it takes a
+# wrong path.
 #
-# À n'utiliser QUE derrière un réseau privé : combiné à --no-token, quiconque
-# atteint le port 3030 obtient un accès root à cette machine.
+# Use it only behind a private network. The authentication gateway is on by
+# default, and it matters more here than anywhere else: without it, anyone who
+# reaches port 3030 gets root on this machine.
 #
-# Durcissement conservé malgré tout (voir SECURITY.md) : capacités réduites au
-# strict nécessaire d'administration, no-new-privileges, limites de ressources,
-# pas de socket Docker par défaut, pas de mode privileged.
+# Hardening kept anyway (see SECURITY.md): capabilities reduced to the minimum
+# administration needs, no-new-privileges, resource limits, no Docker socket by
+# default, no privileged mode.
 #
-# Trois valeurs à adapter : le port publié, et les deux chemins /host/home/<user>.
+# Three values to adapt: the published port, and the two /host/home/<user> paths.
 
 services:
   z-cloudium:
@@ -18,53 +20,69 @@ services:
     restart: unless-stopped
     stop_grace_period: 20s
 
-    ## root dans le conteneur + / monté sur /host = root sur le FS de la machine.
-    ## C'est cela qui donne « sudo », pas un paquet sudo installé dans l'image :
-    ## sudo ne ferait que re-rootiser à l'intérieur du conteneur, sans droit
-    ## supplémentaire. Seules ces deux lignes comptent.
+    ## root inside the container plus / mounted on /host equals root on the
+    ## machine filesystem. That is what gives "sudo", not a sudo package
+    ## installed in the image: sudo would only re-root inside the container,
+    ## with no additional right. Only these two lines matter.
     user: root
 
     ports:
-      # 127.0.0.1 par défaut, par prudence. Pour l'accès depuis le réseau privé,
-      # remplacer par l'IP de la machine — et rien d'autre :
+      # 127.0.0.1 by default, out of caution. For access from the private
+      # network, replace it with the machine's IP and nothing else:
       #   "10.10.100.50:3030:3030"
-      # Jamais "3030:3030" : sur ce profil, le port est la seule barrière.
+      # Never "3030:3030". Keep 127.0.0.1 unless you have a reason: on this
+      # profile the gateway is the barrier, and a private interface is the
+      # second layer.
       - "127.0.0.1:3030:3030"
 
     volumes:
       - /:/host
-      # État interne du conteneur (cache, configuration propre) hors de /host.
+      # Internal state of the container (its own cache, its own configuration)
+      # outside of /host.
       - z-cloudium-data:/data
-      # Optionnel — et équivalent à root sur l'hôte : permet à l'agent de piloter
-      # les conteneurs de la machine. À n'ouvrir qu'en connaissance de cause.
+      # Optional, and equivalent to root on the host: lets the agent drive the
+      # machine's containers. Open it only in full knowledge of the facts.
       # - /var/run/docker.sock:/var/run/docker.sock
 
     environment:
-      # HOME + ZCODE_DATA_BASE_DIR vers le vrai home de la machine : l'agent
-      # retrouve ton ~/.zcode existant — skills (~/.zcode/skills), commandes
-      # (~/.zcode/cli), mémoires (~/.zcode/cli/memories/projects), configuration
-      # (~/.zcode/v2). Copie d'abord ton ~/.zcode de poste vers ce home.
+      # HOME plus ZCODE_DATA_BASE_DIR towards the real home of the machine: the
+      # agent finds your existing ~/.zcode again, that is skills
+      # (~/.zcode/skills), commands (~/.zcode/cli), memories
+      # (~/.zcode/cli/memories/projects) and configuration (~/.zcode/v2).
+      # Copy your workstation ~/.zcode to this home first.
       HOME: /host/home/delta
       ZCODE_DATA_BASE_DIR: /host/home/delta
       ZCODE_MODEL_TELEMETRY_ENABLED: "0"
 
-      # git refuse d'opérer sur un dépôt appartenant à un autre uid que root
-      # (« detected dubious ownership »). On lève la protection pour ce process
-      # uniquement, sans modifier la config git de la machine.
+      # git refuses to work on a repository owned by a uid other than root
+      # ("detected dubious ownership"). The protection is lifted for this
+      # process only, without touching the machine's git configuration.
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: "*"
 
-    ## ---------- Durcissement ----------
-    # Pas de rootfs en lecture seule ici, volontairement : avec root sur /host,
-    # cela n'empêcherait aucune persistance (l'attaquant écrirait dans /etc du
-    # système) tout en cassant l'usage légitime, notamment `apt install` dans le
-    # conteneur. Ce serait du durcissement de façade. Le profil restreint
-    # (compose.yml) l'applique, lui, sans coût.
+      # Authentication gateway, on by default, and this is the profile that
+      # needs it most: with root on /host, leaving it off would mean that
+      # reaching the port means owning the machine. ZCLOUDIUM_AUTH=off is
+      # possible and documented, and it is a decision, not an accident.
+      ZCLOUDIUM_AUTH: "on"
+      # Browser automation through the MCP server baked into the image: the
+      # entrypoint adds it to $HOME/.zcode/cli/config.json, the home of the
+      # machine, after keeping a copy of the previous file in
+      # config.json.zcloudium-backup. Set "off" to leave that file alone.
+      ZCLOUDIUM_BROWSER_MCP: "on"
+
+    ## ---------- Hardening ----------
+    # No read-only rootfs here, deliberately: with root on /host it would not
+    # prevent any persistence (an attacker would write into the system's /etc)
+    # while breaking legitimate use, `apt install` inside the container in
+    # particular. That would be cosmetic hardening. The restricted profile
+    # (compose.yml) applies it, and it costs nothing there.
     #
-    # Capacités réduites au strict nécessaire d'administration. Volontairement
-    # absentes : NET_RAW (forge de paquets), SYS_ADMIN, SYS_MODULE, SYS_PTRACE,
-    # MKNOD, SETFCAP, AUDIT_WRITE, SYS_CHROOT.
+    # Capabilities reduced to the strict minimum of administration. Deliberately
+    # absent: NET_RAW (packet forgery), SYS_ADMIN, SYS_MODULE, SYS_PTRACE,
+    # MKNOD, SETFCAP, AUDIT_WRITE, SYS_CHROOT. Note that dropping capabilities
+    # also disables Chromium's sandbox, see SECURITY.md.
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -77,21 +95,21 @@ services:
       - KILL
       - SETGID
       - SETUID
-    # Garde-fous de ressources : un agent qui s'emballe ne doit pas faire tomber
-    # la machine. À ajuster selon sa taille.
+    # Resource guards: an agent that runs away must not take the machine down.
+    # Adjust to its size, in particular mem_limit once browser automation is in
+    # use.
     pids_limit: 1024
     mem_limit: 8g
     cpus: 4
 
-    command:
-      - --web
-      - --host=0.0.0.0
-      - --port=3030
-      - --workspace=/host/home/delta
-      - --no-open
-      # Sans authentification. Sur ce profil, c'est la seule barrière avec le bind
-      # réseau : à retirer si le réseau privé n'est pas de confiance.
-      - --no-token
+    # With ZCLOUDIUM_AUTH=off there is no gateway, and the probe falls through
+    # to the web app. Uncomment this to probe the runtime instead:
+    # healthcheck:
+    #   test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/server-info').then(r=>process.exit(r.ok||r.status===401?0:1)).catch(()=>process.exit(1))\""]
+    #   interval: 30s
+    #   timeout: 5s
+    #   start_period: 20s
+    #   retries: 3
 
 volumes:
   z-cloudium-data:

@@ -1,6 +1,6 @@
-# Les scripts de ce repo sont exécutés sur une VM Linux : forcer LF dans le
-# working tree, sinon un checkout sous Windows les convertit en CRLF et bash
-# échoue sur « bad interpreter: /usr/bin/env bash^M ».
+# The scripts of this repository run on a Linux VM: force LF in the working
+# tree, otherwise a checkout under Windows converts them to CRLF and bash fails
+# with "bad interpreter: /usr/bin/env bash^M".
 * text=auto eol=lf
 *.sh text eol=lf
 Dockerfile text eol=lf

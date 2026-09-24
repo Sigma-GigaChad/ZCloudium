@@ -1,22 +1,26 @@
 # syntax=docker/dockerfile:1
 
-# ZCode Web — build DEPUIS LES SOURCES AMONT (zai-org/ZCode).
+# ZCode Web, built FROM THE UPSTREAM SOURCES (zai-org/ZCode).
 #
-# Chemin « je ne fais confiance qu'à l'éditeur d'origine » : on compile nous-mêmes
-# le snapshot open source, sans passer par un fork ni par un binaire tiers.
-# En échange : build long (15-30 min, quelques Go), et pnpm/Node présents dans
-# l'étape builder uniquement.
+# The "I only trust the original vendor" path: the open source snapshot is
+# compiled here, without a fork and without a third party binary. The price is a
+# long build (15 to 30 minutes, a few GB), with pnpm and Node present in the
+# builder stage only.
 #
-# STATUT : ce chemin n'est PAS validé. Il échoue tel quel sur
-# « Missing @zcode/shared dist files » : l'étape de build des sources amont ne
-# produit pas packages/shared/dist, alors que le collecteur d'assets SEA l'exige.
-# L'étape `pnpm run build:bootstrap` ajoutée ci-dessous est la séquence officielle
-# du projet (scripts/bootstrap.mjs) et devrait produire ce dist, mais je ne l'ai
-# pas vérifiée. Utiliser Dockerfile (runtime précompilé) est le chemin testé.
+# STATUS: this path is NOT validated. As is, it fails on
+# "Missing @zcode/shared dist files": the upstream source build does not produce
+# packages/shared/dist, while the SEA asset collector requires it. The
+# `pnpm run build:bootstrap` step added below is the official sequence of the
+# project (scripts/bootstrap.mjs) and should produce that dist, but it has not
+# been verified. Using Dockerfile (precompiled runtime) is the tested path.
 #
-# Base glibc obligatoire (bookworm, pas alpine) : le paquet runtime embarque les
-# binaires précompilés node-pty (@lydell/node-pty-linux-x64) et aucune variante
-# musl n'est fournie par scripts/zcode-distribution/assets.mjs.
+# This file also predates the authentication gateway: it does not ship the
+# gateway entrypoint, and its runtime lives in /opt/zcode rather than
+# /opt/zcodium. Wiring it is part of validating this path.
+#
+# glibc base is mandatory (bookworm, not alpine): the runtime package embeds the
+# precompiled node-pty binaries (@lydell/node-pty-linux-x64) and no musl variant
+# is published by scripts/zcode-distribution/assets.mjs.
 
 ARG NODE_VERSION=24.14.0
 
@@ -33,8 +37,8 @@ ENV CI=1 \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     ZCODE_SKIP_REMOTE_ASSETS=1
 
-# python3/make/g++ : filet de sécurité si une dépendance native n'a pas de
-# prebuilt pour linux-x64. N'existe que dans cette étape.
+# python3/make/g++: a safety net when a native dependency has no prebuilt for
+# linux-x64. It exists in this stage only.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -43,8 +47,8 @@ RUN npm install -g "pnpm@${PNPM_VERSION}"
 
 WORKDIR /src
 
-# Fetch d'une seule révision : accepte un tag, une branche ou un SHA.
-# `--branch` ne gère pas les SHA, d'où le fetch + FETCH_HEAD.
+# Fetch a single revision: accepts a tag, a branch or a SHA. `--branch` does not
+# handle SHAs, hence the fetch plus FETCH_HEAD.
 RUN git init -q . \
  && git remote add origin "${ZCODE_REPO}" \
  && git fetch -q --depth 1 origin "${ZCODE_REF}" \
@@ -54,11 +58,11 @@ RUN git init -q . \
 RUN pnpm install --frozen-lockfile \
  && pnpm prepare:desktop-runtime || true
 
-# build:bootstrap est la séquence officielle de scripts/bootstrap.mjs : elle
-# construit tous les packages/* (dont @zcode/shared, absent de build:zcode).
+# build:bootstrap is the official sequence of scripts/bootstrap.mjs: it builds
+# every packages/* (including @zcode/shared, which build:zcode leaves out).
 RUN pnpm run build:bootstrap
 
-# --base-url n'alimente que l'install.sh généré, dont on ne se sert pas ici.
+# --base-url only feeds the generated install.sh, which is not used here.
 RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
  && mkdir -p /out \
  && tar -xzf "$(ls dist/zcode/releases/*/zcode-*.tar.gz | head -n 1)" -C /out \
@@ -71,7 +75,7 @@ ARG ZCODE_REF=v3.14.3
 ARG ZCODE_COMMIT=unknown
 
 LABEL org.opencontainers.image.title="z-cloudium" \
-      org.opencontainers.image.description="ZCode Web — build depuis zai-org/ZCode (non validé)" \
+      org.opencontainers.image.description="ZCode Web, built from zai-org/ZCode (not validated)" \
       org.opencontainers.image.version="${ZCODE_REF}" \
       org.opencontainers.image.revision="${ZCODE_COMMIT}" \
       org.opencontainers.image.source="https://github.com/zai-org/ZCode" \
