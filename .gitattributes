@@ -1,0 +1,9 @@
+# Les scripts de ce repo sont exécutés sur une VM Linux : forcer LF dans le
+# working tree, sinon un checkout sous Windows les convertit en CRLF et bash
+# échoue sur « bad interpreter: /usr/bin/env bash^M ».
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.from-source text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

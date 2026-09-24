@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1
+
+# ZCode Web — build DEPUIS LES SOURCES AMONT (zai-org/ZCode).
+#
+# Chemin « je ne fais confiance qu'à l'éditeur d'origine » : on compile nous-mêmes
+# le snapshot open source, sans passer par un fork ni par un binaire tiers.
+# En échange : build long (15-30 min, quelques Go), et pnpm/Node présents dans
+# l'étape builder uniquement.
+#
+# STATUT : ce chemin n'est PAS validé. Il échoue tel quel sur
+# « Missing @zcode/shared dist files » : l'étape de build des sources amont ne
+# produit pas packages/shared/dist, alors que le collecteur d'assets SEA l'exige.
+# L'étape `pnpm run build:bootstrap` ajoutée ci-dessous est la séquence officielle
+# du projet (scripts/bootstrap.mjs) et devrait produire ce dist, mais je ne l'ai
+# pas vérifiée. Utiliser Dockerfile (runtime précompilé) est le chemin testé.
+#
+# Base glibc obligatoire (bookworm, pas alpine) : le paquet runtime embarque les
+# binaires précompilés node-pty (@lydell/node-pty-linux-x64) et aucune variante
+# musl n'est fournie par scripts/zcode-distribution/assets.mjs.
+
+ARG NODE_VERSION=24.14.0
+
+FROM node:${NODE_VERSION}-bookworm AS builder
+
+ARG ZCODE_REPO=https://github.com/zai-org/ZCode.git
+ARG ZCODE_REF=v3.14.3
+ARG PNPM_VERSION=10.33.2
+
+ENV CI=1 \
+    HUSKY=0 \
+    COREPACK_ENABLE_PROJECT_SPEC=0 \
+    ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    ZCODE_SKIP_REMOTE_ASSETS=1
+
+# python3/make/g++ : filet de sécurité si une dépendance native n'a pas de
+# prebuilt pour linux-x64. N'existe que dans cette étape.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "pnpm@${PNPM_VERSION}"
+
+WORKDIR /src
+
+# Fetch d'une seule révision : accepte un tag, une branche ou un SHA.
+# `--branch` ne gère pas les SHA, d'où le fetch + FETCH_HEAD.
+RUN git init -q . \
+ && git remote add origin "${ZCODE_REPO}" \
+ && git fetch -q --depth 1 origin "${ZCODE_REF}" \
+ && git checkout -q FETCH_HEAD \
+ && git submodule update --init --recursive || true
+
+RUN pnpm install --frozen-lockfile \
+ && pnpm prepare:desktop-runtime || true
+
+# build:bootstrap est la séquence officielle de scripts/bootstrap.mjs : elle
+# construit tous les packages/* (dont @zcode/shared, absent de build:zcode).
+RUN pnpm run build:bootstrap
+
+# --base-url n'alimente que l'install.sh généré, dont on ne se sert pas ici.
+RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
+ && mkdir -p /out \
+ && tar -xzf "$(ls dist/zcode/releases/*/zcode-*.tar.gz | head -n 1)" -C /out \
+ && test -f /out/zcode/bin/zcode.mjs \
+ && test -f /out/zcode/server/entry-http.js
+
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+
+ARG ZCODE_REF=v3.14.3
+ARG ZCODE_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="zcode-web" \
+      org.opencontainers.image.description="ZCode Web — build depuis zai-org/ZCode (non validé)" \
+      org.opencontainers.image.version="${ZCODE_REF}" \
+      org.opencontainers.image.revision="${ZCODE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/zai-org/ZCode" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates curl less procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /data /workspace \
+ && chown node:node /data /workspace
+
+COPY --from=builder --chown=node:node /out/zcode /opt/zcode
+
+ENV ZCODE_DATA_BASE_DIR=/data \
+    ZCODE_SERVER_WORKSPACE=/workspace \
+    ZCODE_MODEL_TELEMETRY_ENABLED=0
+
+RUN ln -sfn /opt/zcode/bin/zcode.mjs /usr/local/bin/zcode
+
+VOLUME ["/data"]
+
+WORKDIR /workspace
+USER node
+EXPOSE 3030
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3030/api/server-info').then(r=>process.exit(r.ok||r.status===401?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["node", "/opt/zcode/bin/zcode.mjs"]
+CMD ["--web", "--host", "0.0.0.0", "--port", "3030", "--workspace", "/workspace", "--no-open", "--no-token"]

@@ -1,0 +1,4 @@
+# Le contexte de build ne sert qu'au Dockerfile : les sources amont sont clonées
+# dans le builder. Garder le contexte minimal évite d'envoyer le repo local.
+*
+!Dockerfile

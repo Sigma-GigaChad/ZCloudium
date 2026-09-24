@@ -1,0 +1,72 @@
+# Profil restreint : l'agent travaille dans /workspace, en utilisateur non
+# privilégié (uid 1000), avec le rootfs du conteneur en lecture seule.
+# C'est le profil à préférer tant que l'accès total n'est pas nécessaire.
+#
+# Durcissement appliqué : rootfs read-only + tmpfs, no-new-privileges,
+# cap_drop ALL (aucune capacité), limites de ressources, utilisateur non-root.
+# Voir SECURITY.md pour le détail et les compromis.
+
+services:
+  zcode-web:
+    image: zcode-web:latest
+    container_name: zcode-web
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+    ## Utilisateur non privilégié, comme dans l'image. Redondant volontairement.
+    user: "1000:1000"
+
+    ports:
+      # Bind sur une seule interface : celle de la VM sur le réseau privé.
+      # Ne jamais écrire "3030:3030" (toutes les interfaces, sans authentification).
+      - "10.10.100.50:3030:3030"
+
+    volumes:
+      # /data : clé API, réglages, sessions, skills. Sans ce volume, chaque
+      # recréation de conteneur repart d'une installation vierge.
+      # Docker initialise le volume avec l'uid 1000 de /data dans l'image.
+      - zcode-data:/data
+      # Le projet sur lequel l'agent travaille. Sur un bind mount, faire
+      # `chown 1000:1000` côté hôte : le conteneur tourne en uid 1000.
+      - /srv/zcode/workspace:/workspace
+
+    environment:
+      # HOME et ZCODE_DATA_BASE_DIR pointent tous deux vers /data : les skills
+      # ($HOME/.zcode/skills), les mémoires (<base>/.zcode/cli/memories) et la
+      # configuration vivent ainsi dans le volume, donc persistent.
+      HOME: /data
+      ZCODE_DATA_BASE_DIR: /data
+      ZCODE_SERVER_WORKSPACE: /workspace
+      ZCODE_MODEL_TELEMETRY_ENABLED: "0"
+
+    ## ---------- Durcissement ----------
+    # Le rootfs du conteneur ne peut pas être modifié : une compromise ne
+    # persiste pas, et l'outillage de l'image (node, git) ne peut pas être
+    # altéré depuis l'intérieur. Les écritures légitimes passent par /data,
+    # /workspace et /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    # Empêche toute élévation via binaire setuid/fichier-capability.
+    security_opt:
+      - no-new-privileges:true
+    # Aucune capacité : uid 1000 n'en a besoin d'aucune pour son travail.
+    cap_drop:
+      - ALL
+    # Garde-fous de ressources (à ajuster selon la VM).
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+
+    command:
+      - --web
+      - --host=0.0.0.0
+      - --port=3030
+      - --workspace=/workspace
+      - --no-open
+      # Sans authentification : acceptable uniquement sur réseau privé.
+      # Pour l'activer, retirer cette ligne (le token apparaît dans les logs).
+      - --no-token
+
+volumes:
+  zcode-data:
