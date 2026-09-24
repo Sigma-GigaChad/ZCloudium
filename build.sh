@@ -2,9 +2,9 @@
 #
 # Construit l'image ZCode Web depuis le runtime précompilé épinglé.
 #
-#   ./build.sh                 -> zcode-web:3.14.3 + zcode-web:latest
+#   ./build.sh                 -> ghcr.io/sigma-gigachad/z-cloudium:{3.14.3,latest}
 #   ./build.sh --push          -> idem, puis push vers le registry configuré
-#   IMAGE=ghcr.io/moi/zcode ./build.sh --push
+#   IMAGE=mon-registry/z-cloudium ./build.sh --push
 #   RUNTIME_URL=<autre tarball> ./build.sh
 #
 # Ni pnpm, ni Node, ni aucune dépendance de build n'est nécessaire sur la machine
@@ -15,7 +15,9 @@ cd "$(dirname "$0")"
 
 VERSION_TAG="$(tr -d '[:space:]' < zcode.version)"
 EXPECTED_SHA="$(tr -d '[:space:]' < zcode.sha256)"
-IMAGE="${IMAGE:-zcode-web}"
+## Nom complet en minuscules : GHCR l'exige, et les fichiers compose tirent
+## exactement la même référence — un build local satisfait donc le compose.
+IMAGE="${IMAGE:-ghcr.io/sigma-gigachad/z-cloudium}"
 RUNTIME_URL="${RUNTIME_URL:-https://github.com/ZCodium-project/ZCodium/releases/download/${VERSION_TAG}/zcodium-${VERSION_TAG#v}.tar.gz}"
 
 PUSH=0

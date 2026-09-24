@@ -1,61 +1,64 @@
 # Accès total : l'agent tourne en root DANS le conteneur et voit l'intégralité du
-# FS de la VM monté sur /host. Il peut donc lire et écrire n'importe où, y compris
-# /etc, /var et /root, et casser la VM s'il se trompe de chemin.
+# FS de la machine monté sur /host. Il peut donc lire et écrire n'importe où, y
+# compris /etc, /var et /root, et casser le système s'il se trompe de chemin.
 #
 # À n'utiliser QUE derrière un réseau privé : combiné à --no-token, quiconque
-# atteint le port 3030 obtient un accès root à cette VM.
+# atteint le port 3030 obtient un accès root à cette machine.
 #
 # Durcissement conservé malgré tout (voir SECURITY.md) : capacités réduites au
 # strict nécessaire d'administration, no-new-privileges, limites de ressources,
 # pas de socket Docker par défaut, pas de mode privileged.
 #
-# Les chemins /host/home/<user> sont à adapter à la VM.
+# Trois valeurs à adapter : le port publié, et les deux chemins /host/home/<user>.
 
 services:
-  zcode-web:
-    image: zcode-web:latest
-    container_name: zcode-web
+  z-cloudium:
+    image: ghcr.io/sigma-gigachad/z-cloudium:latest
+    container_name: z-cloudium
     restart: unless-stopped
     stop_grace_period: 20s
 
-    ## root dans le conteneur + / monté sur /host = root sur le FS de la VM.
+    ## root dans le conteneur + / monté sur /host = root sur le FS de la machine.
     ## C'est cela qui donne « sudo », pas un paquet sudo installé dans l'image :
     ## sudo ne ferait que re-rootiser à l'intérieur du conteneur, sans droit
     ## supplémentaire. Seules ces deux lignes comptent.
     user: root
 
     ports:
-      # Impératif : bind sur l'IP privée de la VM. Jamais "3030:3030" ici.
-      - "10.10.100.50:3030:3030"
+      # 127.0.0.1 par défaut, par prudence. Pour l'accès depuis le réseau privé,
+      # remplacer par l'IP de la machine — et rien d'autre :
+      #   "10.10.100.50:3030:3030"
+      # Jamais "3030:3030" : sur ce profil, le port est la seule barrière.
+      - "127.0.0.1:3030:3030"
 
     volumes:
       - /:/host
       # État interne du conteneur (cache, configuration propre) hors de /host.
-      - zcode-data:/data
+      - z-cloudium-data:/data
       # Optionnel — et équivalent à root sur l'hôte : permet à l'agent de piloter
-      # les conteneurs de la VM. À n'ouvrir qu'en connaissance de cause.
+      # les conteneurs de la machine. À n'ouvrir qu'en connaissance de cause.
       # - /var/run/docker.sock:/var/run/docker.sock
 
     environment:
-      # HOME + ZCODE_DATA_BASE_DIR vers le vrai home de la VM : l'agent retrouve
-      # ton ~/.zcode existant — skills (~/.zcode/skills), commandes (~/.zcode/cli),
-      # mémoires (~/.zcode/cli/memories/projects), configuration (~/.zcode/v2).
-      # Copie d'abord ton ~/.zcode de poste vers ce home.
+      # HOME + ZCODE_DATA_BASE_DIR vers le vrai home de la machine : l'agent
+      # retrouve ton ~/.zcode existant — skills (~/.zcode/skills), commandes
+      # (~/.zcode/cli), mémoires (~/.zcode/cli/memories/projects), configuration
+      # (~/.zcode/v2). Copie d'abord ton ~/.zcode de poste vers ce home.
       HOME: /host/home/delta
       ZCODE_DATA_BASE_DIR: /host/home/delta
       ZCODE_MODEL_TELEMETRY_ENABLED: "0"
 
       # git refuse d'opérer sur un dépôt appartenant à un autre uid que root
       # (« detected dubious ownership »). On lève la protection pour ce process
-      # uniquement, sans modifier la config git de la VM.
+      # uniquement, sans modifier la config git de la machine.
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: "*"
 
     ## ---------- Durcissement ----------
     # Pas de rootfs en lecture seule ici, volontairement : avec root sur /host,
-    # cela n'empêcherait aucune persistance (l'attaquant écrirait dans /etc de la
-    # VM) tout en cassant l'usage légitime, notamment `apt install` dans le
+    # cela n'empêcherait aucune persistance (l'attaquant écrirait dans /etc du
+    # système) tout en cassant l'usage légitime, notamment `apt install` dans le
     # conteneur. Ce serait du durcissement de façade. Le profil restreint
     # (compose.yml) l'applique, lui, sans coût.
     #
@@ -75,7 +78,7 @@ services:
       - SETGID
       - SETUID
     # Garde-fous de ressources : un agent qui s'emballe ne doit pas faire tomber
-    # la VM. À ajuster selon la taille de la VM.
+    # la machine. À ajuster selon sa taille.
     pids_limit: 1024
     mem_limit: 8g
     cpus: 4
@@ -91,4 +94,4 @@ services:
       - --no-token
 
 volumes:
-  zcode-data:
+  z-cloudium-data:

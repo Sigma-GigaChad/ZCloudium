@@ -70,7 +70,7 @@ FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 ARG ZCODE_REF=v3.14.3
 ARG ZCODE_COMMIT=unknown
 
-LABEL org.opencontainers.image.title="zcode-web" \
+LABEL org.opencontainers.image.title="z-cloudium" \
       org.opencontainers.image.description="ZCode Web — build depuis zai-org/ZCode (non validé)" \
       org.opencontainers.image.version="${ZCODE_REF}" \
       org.opencontainers.image.revision="${ZCODE_COMMIT}" \

@@ -1,0 +1,76 @@
+name: upstream-check
+
+# Le versioning de ce repo repose sur une release amont épinglée à la main
+# (zcode.version + zcode.sha256). Sans veille, l'épinglage ne bouge jamais :
+# ce workflow ouvre un ticket quand une nouvelle release existe.
+#
+# Il ne modifie rien et ne build rien — le bump reste une décision explicite
+# (`./check-upstream.sh --bump` en local).
+
+on:
+  schedule:
+    # Tous les lundis à 06:17 UTC.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comparer avec la dernière release amont
+        id: check
+        run: |
+          current="$(tr -d '[:space:]' < zcode.version)"
+          latest="$(curl -fsSL \
+            https://api.github.com/repos/ZCodium-project/ZCodium/releases/latest \
+            | grep -o '"tag_name": *"[^"]*"' \
+            | head -n 1 \
+            | cut -d '"' -f 4)"
+
+          if [ -z "$latest" ]; then
+            echo "Impossible de lire la dernière release amont." >&2
+            exit 1
+          fi
+
+          echo "Épinglé : ${current} / dernière release : ${latest}"
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "outdated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ouvrir un ticket si une mise à jour est disponible
+        if: steps.check.outputs.outdated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing="$(gh issue list --state open --search 'in:title Mise à jour amont' \
+            --json number --jq 'length')"
+          if [ "$existing" != "0" ]; then
+            echo "Un ticket de mise à jour est déjà ouvert."
+            exit 0
+          fi
+
+          gh issue create \
+            --title "Mise à jour amont disponible : ${{ steps.check.outputs.latest }}" \
+            --body "$(cat <<EOF
+          Release amont disponible : **${{ steps.check.outputs.latest }}** (épinglée : ${{ steps.check.outputs.current }}).
+
+          \`\`\`bash
+          ./check-upstream.sh --bump     # met à jour zcode.version + zcode.sha256
+          ./check-upstream.sh --build    # bump puis rebuild local
+          \`\`\`
+
+          Le bump récupère le sha256 officiel de la release. Relire le diff avant de
+          pousser : le runtime est du code tiers, et l'image sera reconstruite
+          automatiquement par le workflow \`build-image\` au prochain push sur \`main\`.
+          EOF
+          )"

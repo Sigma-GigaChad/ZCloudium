@@ -1,0 +1,108 @@
+name: build-image
+
+# Construit l'image et la publie sur GHCR.
+#
+# Pas de step « build » séparé pour vérifier : le Dockerfile vérifie lui-même
+# l'intégrité du runtime (sha256 épinglé) et refuse de construire si le tarball
+# tiers contient un binaire setuid. Un build qui passe est donc déjà un contrôle.
+#
+# Un job `smoke` tire ensuite l'image publiée dans un conteneur réel et vérifie
+# que l'interface répond : on ne livre pas une image qu'on n'a pas démarrée.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/sigma-gigachad/z-cloudium
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lire la version épinglée
+        id: version
+        run: |
+          tag="$(tr -d '[:space:]' < zcode.version)"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Version épinglée : ${tag}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build et push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Démarrer l'image publiée
+        run: |
+          docker run -d --name smoke \
+            -p 127.0.0.1:3030:3030 \
+            --read-only --tmpfs /tmp:size=128m \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            "${{ env.IMAGE }}:${{ needs.build.outputs.version }}"
+
+      - name: Attendre que le serveur réponde
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3030/api/server-info; then
+              echo "Le serveur répond après ${i} tentatives."
+              curl -s http://127.0.0.1:3030/api/server-info
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Le serveur n'a jamais répondu." >&2
+          docker logs smoke >&2
+          exit 1
+
+      - name: Vérifier que l'interface est bien servie
+        run: |
+          code="$(curl -s -o /tmp/index.html -w '%{http_code}' http://127.0.0.1:3030/)"
+          echo "GET / -> ${code}"
+          grep -q "<title>" /tmp/index.html
+          test "$code" = "200"
+
+      - name: Nettoyage
+        if: always()
+        run: docker rm -f smoke || true

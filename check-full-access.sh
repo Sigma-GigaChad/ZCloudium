@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-zcode-web:latest}"
+IMAGE="${IMAGE:-ghcr.io/sigma-gigachad/z-cloudium:latest}"
 FAKE_HOME="/tmp/zcode-access-check-home"
 TEST_REPO="/tmp/zcode-access-check-repo"
 

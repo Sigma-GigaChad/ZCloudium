@@ -28,7 +28,7 @@ ARG ZCODIUM_VERSION=v3.14.3
 ARG TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/v3.14.3/zcodium-3.14.3.tar.gz
 ARG TARBALL_SHA256=7af6e216ed65bd44bcf4d410d92c651757b19d65afef5a66e314c3927f0dac53
 
-LABEL org.opencontainers.image.title="zcode-web" \
+LABEL org.opencontainers.image.title="z-cloudium" \
       org.opencontainers.image.description="ZCode Web (runtime ZCodium ${ZCODIUM_VERSION})" \
       org.opencontainers.image.version="${ZCODIUM_VERSION}" \
       org.opencontainers.image.revision="${TARBALL_SHA256}" \
