@@ -12,6 +12,8 @@ import { totp } from "../gateway/lib/totp.mjs";
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const USERNAME = "operator";
 const PASSWORD = "correct-horse-battery-staple";
+/** The bound the documentation advertises for one block, and therefore a contract. */
+const BLOCK_MS = 5 * 60 * 1000;
 
 /** Stub of the ZCode server: plain HTTP plus a WebSocket upgrade. */
 async function startUpstream() {
@@ -435,6 +437,39 @@ test("repeated wrong codes are refused with 429 instead of being tried forever",
     const blocked = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, loginCookie);
     assert.equal(blocked.status, 429);
     assert.equal(cookieFrom(blocked, "zc_sess"), null);
+  }));
+
+/**
+ * The block is documented as bounded, so the budget behind it has to expire with
+ * it. A counter that is never reset leaves the key at the threshold forever, and
+ * one failure every block period then keeps every client, the operator included,
+ * locked out of the sign in page for good.
+ */
+test("a failure after the block expires starts a fresh budget instead of re-blocking", () =>
+  withGateway(async ({ base, advance }) => {
+    await completeSetup(base);
+
+    const spent = await failPasswordTimes(base, MAX_FAILURES);
+    assert.deepEqual(spent, Array(MAX_FAILURES).fill(401));
+
+    // The block still fires at the threshold: the correct password is refused.
+    const blocked = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(blocked.status, 429);
+
+    advance(BLOCK_MS + 1000);
+
+    // The first failure after the block expires spends one unit of a fresh
+    // budget instead of landing on a counter that is still at the threshold.
+    const afterBlock = await post(base, "/_auth/login", { username: USERNAME, password: "wrong-password" });
+    assert.equal(afterBlock.status, 401, "one failure after the block expires must not re-block");
+
+    // The rest of that fresh budget is intact, so a single mistake does not lock
+    // the operator out again: seven failures in total, still no block.
+    const freshBudget = await failPasswordTimes(base, MAX_FAILURES - 2);
+    assert.deepEqual(freshBudget, Array(MAX_FAILURES - 2).fill(401));
+
+    const correct = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(correct.status, 303, "the operator must be able to sign in again once the block expires");
   }));
 
 test("the enrolment step is throttled like the sign in code step", () =>

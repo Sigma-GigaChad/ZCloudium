@@ -134,14 +134,18 @@ is reachable only through that gateway.
 - **Failures**: eight failed attempts from the same key block that key for five
   minutes, and the limit applies to all three steps (the password, the six digit
   code, and the TOTP enrolment of the first connection), so a known password does
-  not leave the code open to be walked through. The key is the connecting socket
-  address: the `x-forwarded-for` header is ignored unless you set
-  `ZCLOUDIUM_TRUST_PROXY=on`, which is only correct behind a proxy that
-  overwrites that header. Behind the Docker port mapping every client shares one
-  socket address, so the block is global: eight failures from anyone lock
-  everybody out for five minutes. That is a denial of service, bounded and
-  visible in the logs, and it is the price of not letting a client choose its own
-  key. Details in [SECURITY.md](SECURITY.md).
+  not leave the code open to be walked through. The block is a real bound: the
+  failure budget expires with it, so the first failure after a block ends starts
+  a fresh count and eight new failures are needed before the key is blocked
+  again. A failed attempt every five minutes therefore cannot keep a key blocked
+  for good. The key is the connecting socket address: the `x-forwarded-for`
+  header is ignored unless you set `ZCLOUDIUM_TRUST_PROXY=on`, which is only
+  correct behind a proxy that overwrites that header. Behind the Docker port
+  mapping every client shares one socket address, so the block is global: eight
+  failures from anyone lock everybody out for five minutes. That is a denial of
+  service, bounded to one block of five minutes at a time and visible in the
+  logs, and it is the price of not letting a client choose its own key. Details
+  in [SECURITY.md](SECURITY.md).
 - **Health**: `GET /_auth/health` answers `ok` without a session, which is what
   the container healthcheck uses. With `ZCLOUDIUM_AUTH=off` there is no gateway
   and that path falls through to the web app, which answers 200 with the

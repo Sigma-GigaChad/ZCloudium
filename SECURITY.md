@@ -133,6 +133,16 @@ to the six digit code and to the TOTP enrolment of the first connection. Without
 that, a known password would leave the second factor open to be walked through,
 six digits at a time.
 
+The five minutes are a bound on the block, and the failure budget expires with
+it: the first failure after a block ends starts a fresh count of one, so eight
+new failures are needed before the key is blocked again. A key whose count
+survived its block would stay at the threshold, and one failure every five
+minutes would then keep every client, the operator included, out of the sign in
+page for good. What the bound guarantees is that a block always ends and that
+the window that follows can be used to sign in, not that nobody can trigger
+another one: an attacker who keeps failing can keep re-blocking, as the bullet
+below on the global block explains.
+
 **The key is the connecting socket address by default, not a header.** That is
 the safe direction and it has a cost:
 
@@ -144,10 +154,12 @@ the safe direction and it has a cost:
   not rewrite the header, every client shares the socket address of the last hop.
   The block is then global: eight failed attempts from anyone lock every user out
   for five minutes. That is a denial of service a stranger can trigger, and it is
-  the price of not trusting a header. It is bounded (five minutes), it is visible
-  in the logs (`[auth] too many failures from <address>`, then one line per
-  refused attempt), and it can be avoided by binding the port to loopback and
-  reaching it through a proxy that sets the header, with
+  the price of not trusting a header. It is bounded, and the bound is the whole
+  of it: five minutes, after which the budget behind the key starts again, so a
+  key is never blocked for more than five minutes at a time. It is visible in the
+  logs (`[auth] too many failures from <address>`, then one line per refused
+  attempt on the code and enrolment steps), and it can be avoided by binding the
+  port to loopback and reaching it through a proxy that sets the header, with
   `ZCLOUDIUM_TRUST_PROXY=on`;
 - turning `ZCLOUDIUM_TRUST_PROXY=on` means the header decides who is blocked. It
   is only correct when the proxy in front **overwrites** the header with the
@@ -240,9 +252,13 @@ Read this before launching the full access profile.
    nothing there: root on a mounted filesystem is enough.
 3. **The failure block is keyed on the connecting socket, so behind NAT it is
    global.** Eight failed attempts from anyone block every client for five
-   minutes: a stranger can deny the sign in page, not the data. The alternative,
-   trusting `x-forwarded-for`, hands the choice of the key back to the client and
-   removes the limit. The section above spells out both directions.
+   minutes: a stranger can deny the sign in page, not the data. Each block ends
+   after those five minutes and the budget starts again, so the denial is
+   repeatable but never permanent: an attacker who keeps failing can keep
+   re-blocking, and the window between two blocks is when the operator can sign
+   in. The alternative, trusting `x-forwarded-for`, hands the choice of the key
+   back to the client and removes the limit. The section above spells out both
+   directions.
 4. **The VM must be disposable.** Treat it as a machine compromised by design:
    no infrastructure credentials, no access to the rest of the fleet, no SSH keys
    reused elsewhere. If it falls, nothing else does.

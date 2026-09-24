@@ -189,10 +189,17 @@ export async function createGateway({
     return Boolean(entry) && entry.blockedUntil > now();
   };
   const noteFailure = (address) => {
-    const entry = failures.get(address) ?? { count: 0, blockedUntil: 0 };
+    const at = now();
+    const stored = failures.get(address);
+    // A block that has ended also ends the budget behind it, so the count starts
+    // again. Without this the count stays at the threshold after a block ends, and
+    // one failure per block period keeps the key blocked forever: a permanent
+    // denial of service on the sign in page, and the advertised bound made false.
+    const blockExpired = Boolean(stored && stored.blockedUntil > 0 && stored.blockedUntil <= at);
+    const entry = blockExpired ? { count: 0, blockedUntil: 0 } : (stored ?? { count: 0, blockedUntil: 0 });
     entry.count += 1;
     if (entry.count >= MAX_FAILURES) {
-      entry.blockedUntil = now() + BLOCK_MS;
+      entry.blockedUntil = at + BLOCK_MS;
       logger(`[auth] too many failures from ${address}, temporarily blocked`);
     }
     failures.set(address, entry);
