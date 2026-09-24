@@ -1,0 +1,9 @@
+# Playwright artifacts: node_modules, the installed browsers' metadata, the
+# screenshots, videos and traces of a failed run, the HTML report, and the state
+# the wizard leaves behind for the other specs.
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.auth/

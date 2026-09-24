@@ -1,0 +1,15 @@
+{
+  "name": "z-cloudium-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright end to end suite for the ZCloudium image: it drives a real browser against a real container. Self contained on purpose, so that it never becomes a dependency of the image or of the main test command.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}
