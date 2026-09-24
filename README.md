@@ -12,7 +12,8 @@ monorepo à chaque version.
 
 ```bash
 # 1. L'image est privée : s'authentifier une fois auprès de GHCR.
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <ton-user> --password-stdin
+#    Le token doit porter le scope read:packages (PAT classique).
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u <ton-user> --password-stdin
 
 # 2. Récupérer le compose et lancer.
 git clone https://github.com/Sigma-GigaChad/z-cloudium.git
@@ -52,12 +53,32 @@ image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
 
 Les tags disponibles sont `latest`, `<version>` (ex. `3.14.3`) et `sha-<commit>`.
 
-### Rendre l'image publique
+### Authentification du paquet
 
-Le paquet GHCR est privé comme le repo, d'où l'étape `docker login`. Un paquet
-publié depuis un repo privé **peut** être rendu public (réglages du paquet, côté
-GitHub). C'est ce qui enlève l'authentification et rend le `docker compose up`
-réellement clé en main pour un tiers.
+Le paquet GHCR est **privé** comme le repo, et l'étape `docker login` n'est pas
+optionnelle : sans elle, `docker pull` répond `denied`.
+
+Le token doit porter le scope **`read:packages`** — un token OAuth de la CLI `gh`
+ne l'a pas (son scope `repo` ne suffit pas pour les paquets). Il faut donc un
+**PAT classique** avec `read:packages` :
+
+```
+GitHub → Settings → Developer settings → Personal access tokens (classic)
+→ Generate new token → cocher « read:packages »
+```
+
+Deux façons de supprimer cette étape pour rendre le lancement réellement clé en
+main :
+
+- **Rendre le paquet public** : la visibilité d'un paquet GHCR est indépendante de
+  celle du repo. Un paquet publié depuis un repo privé peut être public.
+  Chemin : `GitHub → ton organisation → onglet Packages → z-cloudium →
+  Package settings → Change visibility → Public`.
+- Ou faire builder chacun depuis les sources (`./build.sh`, quinze secondes) : plus
+  aucun registry dans la boucle.
+
+Pour ton propre usage sur une VM privée, le PAT `read:packages` est le choix le plus
+conservateur : rien n'est exposé publiquement.
 
 ### Travailler sur de vrais fichiers
 
@@ -244,6 +265,10 @@ Testé par exécution réelle, pas seulement écrit :
   capacités d'administration, lecture de `/etc/shadow` OK, écriture sur le FS monté
   OK, skills visibles via `$HOME/.zcode`
 - `check-full-access.sh` valide les 5 mécanismes du profil accès total
+- **CI** : jobs `build` et `smoke` verts au premier passage (commit `d6a7e61`).
+  Trois tags poussés — `latest`, `3.14.3`, `sha-d6a7e61` — sous le digest
+  `sha256:83ae9903…`. Le job `smoke` a tiré l'image **publiée**, l'a démarrée avec
+  le durcissement complet et a vérifié que l'interface répond.
 
 ## Détails d'implémentation
 
