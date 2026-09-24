@@ -27,6 +27,16 @@ wizard: choose a username, a password, then enrol the TOTP code in your
 authenticator application. After that, the port asks for the password and the
 code before it serves anything.
 
+> **Finish the wizard before the port is reachable by anyone else.** As long as no
+> account exists, the setup wizard answers without any credential: whoever
+> connects first creates the account, and that account owns the instance. On the
+> full access profile, that account has root on the machine. So start the
+> container, open the interface from the machine itself, complete the wizard, and
+> only then publish the port to a private network. An instance left with its
+> wizard unfinished, a container whose `/data` volume was recreated, or a
+> deployment where `/data/auth` was deleted, is open to whoever reaches it. See
+> [SECURITY.md](SECURITY.md).
+
 That is all. The default compose file needs **no editing**: port on localhost,
 workspace in a Docker volume, hardening active, authentication on. The account,
 the session key and the API key are written into the volume, so they survive
@@ -121,8 +131,17 @@ is reachable only through that gateway.
   `/data/auth` to reset the account and the sessions together, which brings the
   setup wizard back. There is no password change route: resetting the account is
   how you rotate the credentials.
-- **Failures**: from the eighth failed attempt, the source address is blocked
-  for five minutes.
+- **Failures**: eight failed attempts from the same key block that key for five
+  minutes, and the limit applies to all three steps (the password, the six digit
+  code, and the TOTP enrolment of the first connection), so a known password does
+  not leave the code open to be walked through. The key is the connecting socket
+  address: the `x-forwarded-for` header is ignored unless you set
+  `ZCLOUDIUM_TRUST_PROXY=on`, which is only correct behind a proxy that
+  overwrites that header. Behind the Docker port mapping every client shares one
+  socket address, so the block is global: eight failures from anyone lock
+  everybody out for five minutes. That is a denial of service, bounded and
+  visible in the logs, and it is the price of not letting a client choose its own
+  key. Details in [SECURITY.md](SECURITY.md).
 - **Health**: `GET /_auth/health` answers `ok` without a session, which is what
   the container healthcheck uses. With `ZCLOUDIUM_AUTH=off` there is no gateway
   and that path falls through to the web app, which answers 200 with the
@@ -131,7 +150,9 @@ is reachable only through that gateway.
   `/api/server-info` instead).
 - **Accounts**: stored in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
   mode 0600). The session signing key is `/data/auth/secret.key`. Removing
-  `/data/auth` resets the whole thing and the wizard runs again.
+  `/data/auth` resets the whole thing and the wizard runs again, which reopens
+  the first connection window: until the wizard is finished again, anyone can
+  claim the instance.
 
 ### Turning authentication off
 
@@ -438,6 +459,16 @@ Tested by actually running things, not only written:
 - **leftover `command:` block**: a container started with the old argument list
   appended logs `ignoring the extra command line arguments (...)` and still runs
   with the loopback arguments built from the environment
+- **failure block**: from inside a container, eight wrong passwords each carrying
+  a different `x-forwarded-for` are all answered `401` and attributed to the
+  socket address in the logs, and the correct password that follows is answered
+  `429` (before this was keyed on the socket, that same sequence ended on `303`,
+  so the header was enough to start over). Eight wrong codes at the second factor
+  followed by a genuinely valid code are answered `429` with no session, where
+  the second factor used to accept the valid code after eight failures
+- **open redirect**: a sign in whose `next` is `/\evil.com`, `/%5Cevil.com`,
+  `//evil.com` or `/\/evil.com` ends on `/`, the root of this origin, instead of
+  redirecting to the host the value names
 - **browser MCP server**: handshake over stdio as uid 1000 under the same
   hardening, 30 tools listed, `navigate_page` on a `data:` URL succeeded,
   `evaluate_script` returned the page title and the user agent

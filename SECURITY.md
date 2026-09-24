@@ -85,6 +85,26 @@ choice, with the consequences described further down.
 What it does: it authenticates a browser session (password plus TOTP), it keeps
 the runtime off every published interface, and it owns the session cookies.
 
+**The one window where it protects nothing: before the wizard is finished.** With
+no `/data/auth/users.json`, `POST /_auth/setup` needs no session at all, because
+that is what creates the first account. Between the moment the container starts
+and the moment somebody completes the wizard, the published port is genuinely
+unauthenticated: **whoever connects first creates the account, and therefore owns
+the instance**. On the full access profile, that first visitor creates an account
+that has root on the host machine. This is not a theoretical window: a container
+restarted with an empty or lost data volume, or a first deployment left running
+before its wizard was completed, is in exactly that state. What the operator must
+do about it:
+
+- complete the wizard immediately after the first start, before exposing the port
+  to anything, and treat an unfinished wizard as "the service is open";
+- keep the port on loopback, or on a private interface, until the wizard is done;
+- check that `/data/auth/users.json` exists on a running deployment: it is the
+  only sign that an account was created. If it is missing while the port is
+  reachable, the instance is claimable by anyone who reaches it;
+- remember that deleting `/data/auth` reopens the window, and that a container
+  created without the `/data` volume reopens it on every start.
+
 What it does not do:
 
 - it is not a sandbox: once you are authenticated, you get exactly what the
@@ -98,14 +118,47 @@ What it does not do:
 - its accounts live in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
   mode 0600) and its signing key in `/data/auth/secret.key`. Anyone who can read
   the volume can run the instance, and can also add an account;
-- the failure counter (8 failures, then five minutes blocked per source address)
-  is in memory: restarting the container resets it.
+- the failure counter is in memory: restarting the container resets it.
 
 Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
 to change it, a positive number of hours, anything else is refused and replaced
 by 12 with a log line), a TOTP code that cannot be replayed (the last accepted
-step is stored), and a `next` parameter restricted to same-origin paths, so it
-cannot be turned into an open redirect.
+step is stored), and a `next` parameter restricted to a same origin path.
+
+### The failure block, and what it is keyed on
+
+Eight failed attempts from one key block that key for five minutes. The block is
+checked on all three steps that can be attacked, so it applies to the password,
+to the six digit code and to the TOTP enrolment of the first connection. Without
+that, a known password would leave the second factor open to be walked through,
+six digits at a time.
+
+**The key is the connecting socket address by default, not a header.** That is
+the safe direction and it has a cost:
+
+- a client that could choose its key would have no rate limit at all, since
+  changing a header is enough to start again from zero. The gateway therefore
+  ignores `x-forwarded-for` unless it is told otherwise, and the file that
+  documents `ZCLOUDIUM_TRUST_PROXY=on` is the only place it is read from;
+- behind the Docker port mapping, and behind any NAT or reverse proxy that does
+  not rewrite the header, every client shares the socket address of the last hop.
+  The block is then global: eight failed attempts from anyone lock every user out
+  for five minutes. That is a denial of service a stranger can trigger, and it is
+  the price of not trusting a header. It is bounded (five minutes), it is visible
+  in the logs (`[auth] too many failures from <address>`, then one line per
+  refused attempt), and it can be avoided by binding the port to loopback and
+  reaching it through a proxy that sets the header, with
+  `ZCLOUDIUM_TRUST_PROXY=on`;
+- turning `ZCLOUDIUM_TRUST_PROXY=on` means the header decides who is blocked. It
+  is only correct when the proxy in front **overwrites** the header with the
+  address it saw: if it appends to a client supplied value, an attacker keeps
+  choosing the first element of the list, which is the key again.
+
+The `next` parameter is refused unless it is a same origin path: it is rejected
+when it carries a backslash (raw or percent encoded), an encoded slash or any
+whitespace, and then resolved against a fixed origin, so `/\evil.com` or
+`/<tab>/evil.com` cannot become a protocol relative URL. The redirect the gateway
+sends is the resolved path, never the value it was given.
 
 The session lifetime is what a stolen cookie is worth. Twelve hours is a
 deliberate compromise between usability and exposure; on the full access profile
@@ -114,7 +167,7 @@ during which a cookie taken from a browser, a proxy or a log stays usable.
 Restarting the container does not end a session, since the signing key lives in
 the volume: delete `/data/auth/secret.key` to invalidate all of them at once
 (the next start creates a new key), or `/data/auth` to reset the account as well
-and bring the setup wizard back.
+and bring the setup wizard back (and reopen the window described above).
 
 `ZCLOUDIUM_AUTH=off` removes the gateway entirely: the runtime is published
 directly, with `--no-token`, so **anyone who reaches the port gets a shell on
@@ -166,32 +219,47 @@ exercise. Keep that machine disposable.
 
 Read this before launching the full access profile.
 
-1. **A full access container is a root session with a web interface.** The
+1. **The window before the wizard is finished is unauthenticated, and it is the
+   biggest of these risks.** A container whose `/data/auth/users.json` does not
+   exist yet answers the setup wizard without any credential: the first visitor
+   creates the account and owns the instance. On this profile, that account has
+   root on the machine. An empty, lost or freshly recreated data volume puts a
+   running container back into that state, and so does deleting `/data/auth`.
+   Complete the wizard immediately after the first start, keep the port off every
+   untrusted network until it is done, and verify that `users.json` exists on a
+   deployment that is exposed. See "The one window where it protects nothing" in
+   the gateway section above.
+2. **A full access container is a root session with a web interface.** The
    gateway is the barrier on the port; the private interface is the second layer.
    Binding on the private IP assumes that the private network is genuinely
    trusted (dedicated VLAN, WireGuard, Tailscale). Dropped capabilities change
    nothing there: root on a mounted filesystem is enough.
-2. **The VM must be disposable.** Treat it as a machine compromised by design:
+3. **The failure block is keyed on the connecting socket, so behind NAT it is
+   global.** Eight failed attempts from anyone block every client for five
+   minutes: a stranger can deny the sign in page, not the data. The alternative,
+   trusting `x-forwarded-for`, hands the choice of the key back to the client and
+   removes the limit. The section above spells out both directions.
+4. **The VM must be disposable.** Treat it as a machine compromised by design:
    no infrastructure credentials, no access to the rest of the fleet, no SSH keys
    reused elsewhere. If it falls, nothing else does.
-3. **Files owned by root in your home.** Verified in testing: run as root, the
+5. **Files owned by root in your home.** Verified in testing: run as root, the
    agent creates root owned files in `$HOME/.zcode`
    (`v2/provider_config.json`, sqlite databases, certificates), and the entrypoint
    merges the browser MCP entry into `$HOME/.zcode/cli/config.json` (keeping a
    `config.json.zcloudium-backup` copy of the previous file). Your VM user will
    no longer be able to modify them without `sudo`. That is the price of uid 0,
    not a bug.
-4. **Network egress is not filtered.** The agent can reach everything the VM
+6. **Network egress is not filtered.** The agent can reach everything the VM
    reaches. The control that really counts against exfiltration is at the network
    level (VLAN, outbound firewall rules), not inside the container.
-5. **The runtime comes from a third party** (the ZCodium fork). Integrity is
+7. **The runtime comes from a third party** (the ZCodium fork). Integrity is
    verified by a pinned hash, the presence of setuid binaries is checked, but the
    code has not been audited. If that is not acceptable, `Dockerfile.from-source`
    compiles the original upstream, a path that is not validated to this day.
-6. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
+8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.
-7. **Web mode has no multi-user management**: no accounts beyond the single
+9. **Web mode has no multi-user management**: no accounts beyond the single
    gateway account, no audit log of the agent's actions, no per-user isolation.
 8. **The browser sandbox is off** (see the previous section). Point the browser
    at pages you trust, or do not enable it.
@@ -202,6 +270,10 @@ Read this before launching the full access profile.
 
 ## Recommendations
 
+- **Finish the wizard before anything can reach the port.** On a first start,
+  open it from the machine itself (or over a tunnel), create the account, and
+  only then expose the port to the private network. An instance with the wizard
+  still open is an instance anyone can claim.
 - **Snapshot the VM before the first use** and before letting the agent work
   unsupervised.
 - Start with the restricted profile; move to full access only for a real need.
@@ -210,6 +282,9 @@ Read this before launching the full access profile.
 - Keep `ZCLOUDIUM_AUTH=on`. If you must turn it off, publish the port on
   loopback only, and remember that the container healthcheck then probes the web
   app instead of the gateway.
+- Leave `ZCLOUDIUM_TRUST_PROXY` off unless a reverse proxy you control overwrites
+  `x-forwarded-for`, and remember that with it off every client behind the same
+  last hop shares one block.
 - Mount `docker.sock` only if the agent must drive containers, and knowing that
   it is equivalent to root on the host.
 - Put TLS in front of the port if the network is not fully trusted: the gateway

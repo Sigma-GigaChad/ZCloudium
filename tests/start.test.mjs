@@ -26,6 +26,7 @@ import {
   homeOf,
   parseEnv,
   parseSessionTtlHours,
+  parseTrustProxy,
   runtimeArgs,
   start,
 } from "../gateway/start.mjs";
@@ -39,6 +40,7 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
   assert.deepEqual(parseEnv({}), {
     authEnabled: true,
     browserMcp: true,
+    trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
     dataDir: DEFAULT_DATA_DIR,
     sessionTtlHours: DEFAULT_SESSION_TTL_HOURS,
@@ -94,6 +96,23 @@ test("the workspace and the data directory come from their environment variables
   assert.equal(config.dataDir, "/state");
 });
 
+/**
+ * The rate limit key is the connecting socket by default, because a header the
+ * client sets is a key the client can change. Trusting the forwarded header is
+ * an explicit decision, and the default must stay the safe side.
+ */
+test("ZCLOUDIUM_TRUST_PROXY defaults to off and is only on when explicitly asked", () => {
+  assert.equal(parseEnv({}).trustProxy, false, "the safe default");
+  for (const value of ["on", "ON", " on ", "true", "TRUE", "1", "yes"]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_TRUST_PROXY: value }).trustProxy, true, `"${value}" must enable it`);
+  }
+  for (const value of ["off", "false", "0", "no", "", "   ", "onward"]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_TRUST_PROXY: value }).trustProxy, false, `"${value}" must keep the default`);
+  }
+  assert.equal(parseTrustProxy(undefined), false);
+  assert.equal(parseTrustProxy(null), false);
+});
+
 test("only an explicit ZCLOUDIUM_AUTH=off disables the gateway", () => {
   for (const value of ["off", "OFF", " off "]) {
     assert.equal(parseEnv({ ZCLOUDIUM_AUTH: value }).authEnabled, false, value);
@@ -142,6 +161,7 @@ test("the gateway options point at the loopback address the runtime was given", 
     dataDir: "/state",
     upstreamUrl: "http://127.0.0.1:3131",
     sessionTtlMs: DEFAULT_SESSION_TTL_MS,
+    trustProxy: false,
   });
 
   const args = runtimeArgs(config);
@@ -151,6 +171,9 @@ test("the gateway options point at the loopback address the runtime was given", 
 
   const shorter = gatewayOptions(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "3" }));
   assert.equal(shorter.sessionTtlMs, 3 * HOUR_MS, "the configured lifetime must reach the gateway");
+
+  const trusting = gatewayOptions(parseEnv({ ZCLOUDIUM_TRUST_PROXY: "on" }));
+  assert.equal(trusting.trustProxy, true, "the configured proxy trust must reach the gateway");
 });
 
 test("the home used for the agent configuration is $HOME, then the system home", () => {
@@ -251,7 +274,16 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
   assert.equal(spawns[0].options.stdio, "inherit");
   assert.deepEqual(
     gatewayCalls.map(({ logger, ...options }) => options),
-    [{ host: "0.0.0.0", port: 3030, dataDir: "/data", upstreamUrl: "http://127.0.0.1:3131", sessionTtlMs: DEFAULT_SESSION_TTL_MS }],
+    [
+      {
+        host: "0.0.0.0",
+        port: 3030,
+        dataDir: "/data",
+        upstreamUrl: "http://127.0.0.1:3131",
+        sessionTtlMs: DEFAULT_SESSION_TTL_MS,
+        trustProxy: false,
+      },
+    ],
   );
   assert.equal(result.child, child);
   assert.equal(result.gateway.port, PUBLISHED_PORT);
@@ -312,6 +344,31 @@ test("the browser MCP configuration is merged into $HOME by default", async () =
 test("ZCLOUDIUM_BROWSER_MCP=off leaves the agent configuration untouched", async () => {
   const { mcpCalls } = await runStart({ HOME: "/data", ZCLOUDIUM_BROWSER_MCP: "off" });
   assert.deepEqual(mcpCalls, []);
+});
+
+test("the rate limit key is reported at startup, so the operator knows what it is", async () => {
+  const safe = await runStart({ HOME: "/data" });
+  assert.equal(
+    safe.logs.some((line) => /rate limit keyed on the connecting socket/i.test(line)),
+    true,
+    `the default must be stated, got ${JSON.stringify(safe.logs)}`,
+  );
+
+  const trusting = await runStart({ HOME: "/data", ZCLOUDIUM_TRUST_PROXY: "on" });
+  assert.equal(trusting.gatewayCalls[0].trustProxy, true);
+  assert.equal(
+    trusting.logs.some((line) => /x-forwarded-for/i.test(line)),
+    true,
+    `trusting a header must be stated, got ${JSON.stringify(trusting.logs)}`,
+  );
+
+  const unrecognised = await runStart({ HOME: "/data", ZCLOUDIUM_TRUST_PROXY: "maybe" });
+  assert.equal(unrecognised.gatewayCalls[0].trustProxy, false, "an unknown value keeps the safe default");
+  assert.equal(
+    unrecognised.logs.some((line) => /ZCLOUDIUM_TRUST_PROXY/.test(line) && /maybe/.test(line)),
+    true,
+    `an unrecognised value must be reported, got ${JSON.stringify(unrecognised.logs)}`,
+  );
 });
 
 test("the session lifetime from the environment reaches the gateway", async () => {

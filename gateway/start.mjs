@@ -46,10 +46,29 @@ const OFF = "off";
 
 const isOff = (value) => typeof value === "string" && value.trim().toLowerCase() === OFF;
 
+/** Values that explicitly ask for a switch to be on, and values that refuse it. */
+export const TRUST_PROXY_ON = ["on", "true", "1", "yes"];
+export const TRUST_PROXY_OFF = ["off", "false", "0", "no"];
+
 const envValue = (env, name, fallback) => {
   const raw = env[name];
   return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : fallback;
 };
+
+/**
+ * Whether the rate limit may be keyed on the x-forwarded-for header.
+ *
+ * Only an explicit request turns this on. The key decides who gets blocked, so a
+ * client able to set that header could otherwise pick a new key for every
+ * attempt, which is the same as having no limit at all. It is only correct behind
+ * a reverse proxy that overwrites the header with the address it saw.
+ */
+export function parseTrustProxy(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return false;
+  }
+  return TRUST_PROXY_ON.includes(String(raw).trim().toLowerCase());
+}
 
 /**
  * Reads a number of hours. Anything that is not a positive number is refused
@@ -70,6 +89,7 @@ export function parseEnv(env = process.env) {
   return {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
     browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
+    trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
     dataDir: envValue(env, "ZCODE_DATA_BASE_DIR", DEFAULT_DATA_DIR),
     sessionTtlHours,
@@ -99,14 +119,19 @@ export function runtimeArgs({ authEnabled = true, workspace = DEFAULT_WORKSPACE 
   ];
 }
 
-/** Options for createGateway: published address, loopback upstream, data volume, session lifetime. */
-export function gatewayOptions({ dataDir = DEFAULT_DATA_DIR, sessionTtlMs = DEFAULT_SESSION_TTL_MS } = {}) {
+/** Options for createGateway: published address, loopback upstream, data volume, session lifetime, rate limit key. */
+export function gatewayOptions({
+  dataDir = DEFAULT_DATA_DIR,
+  sessionTtlMs = DEFAULT_SESSION_TTL_MS,
+  trustProxy = false,
+} = {}) {
   return {
     host: PUBLISHED_HOST,
     port: PUBLISHED_PORT,
     dataDir,
     upstreamUrl: `http://${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
     sessionTtlMs,
+    trustProxy,
   };
 }
 
@@ -178,6 +203,27 @@ export async function start({
     );
   }
   logger(`[start] sessions last ${lifetime}`);
+
+  // Which key the failure block uses decides who gets blocked, so it is stated,
+  // not left implicit.
+  const requestedProxy = envValue(env, "ZCLOUDIUM_TRUST_PROXY", null);
+  if (
+    requestedProxy !== null &&
+    !TRUST_PROXY_ON.includes(requestedProxy.toLowerCase()) &&
+    !TRUST_PROXY_OFF.includes(requestedProxy.toLowerCase())
+  ) {
+    logger(
+      `[start] ZCLOUDIUM_TRUST_PROXY="${requestedProxy}" is not a recognised value, keeping the default: ` +
+        "the rate limit ignores forwarded addresses",
+    );
+  }
+  logger(
+    config.trustProxy
+      ? "[start] rate limit keyed on the x-forwarded-for header (ZCLOUDIUM_TRUST_PROXY=on): only safe behind a " +
+          "proxy that overwrites it, and every client it forwards then shares one key"
+      : "[start] rate limit keyed on the connecting socket (default): set ZCLOUDIUM_TRUST_PROXY=on only behind a " +
+          "proxy that sets x-forwarded-for itself",
+  );
 
   // Before the runtime starts, so that it reads a configuration that already
   // contains the browser server instead of writing its own state over it.

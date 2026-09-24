@@ -31,8 +31,18 @@ export const DEFAULT_UPSTREAM = "http://127.0.0.1:3131";
 export const ISSUER = "ZCloudium";
 
 const PENDING_TTL_SECONDS = 600;
-const MAX_FAILURES = 8;
+/**
+ * Failed attempts allowed from one rate limit key before it is blocked, and how
+ * long the block lasts. The limit applies to the password step, the code step and
+ * the enrolment step, so a six digit second factor cannot be walked through.
+ *
+ * The key is the connecting socket address by default. See `trustProxy` below.
+ */
+export const MAX_FAILURES = 8;
 const BLOCK_MS = 5 * 60 * 1000;
+
+/** Raised against a fixed origin to prove that a `next` value stays on it. */
+const NEXT_ORIGIN = "http://gateway.invalid";
 
 function html(res, status, body) {
   const buffer = Buffer.from(body, "utf8");
@@ -69,6 +79,15 @@ function withCookie(res, status, body, cookie) {
   res.end(buffer);
 }
 
+/** The same answer on every throttled step, so a blocked client learns nothing else. */
+function tooManyAttemptsPage() {
+  return pages.messagePage({
+    title: "Too many attempts",
+    heading: "Too many attempts",
+    message: "This address is temporarily blocked. Try again in a few minutes.",
+  });
+}
+
 async function readForm(req, limit) {
   const chunks = [];
   let size = 0;
@@ -82,12 +101,34 @@ async function readForm(req, limit) {
   return Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString("utf8")));
 }
 
-/** Only same-origin absolute paths are honoured, so `next` cannot be turned into an open redirect. */
-function safeNext(value) {
-  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) {
+/**
+ * Only a same origin absolute path is honoured, so `next` cannot be turned into
+ * an open redirect.
+ *
+ * The URL specification is generous with the characters it rewrites: a backslash
+ * is a slash for special schemes and tabs or newlines are stripped before
+ * parsing, so `/\evil.com` and `/<tab>/evil.com` both mean `//evil.com` to a
+ * browser. The value is therefore refused when it carries a backslash, a percent
+ * encoded backslash or slash, or any whitespace, and then resolved against a
+ * fixed origin: a result that leaves that origin is refused. Returning the
+ * resolved path is what the gateway then puts in its own redirect.
+ */
+export function safeNext(value) {
+  if (typeof value !== "string" || value === "" || !value.startsWith("/")) {
     return "/";
   }
-  return value;
+  if (/\\/.test(value) || /%(2f|5c)/i.test(value) || /\s/.test(value)) {
+    return "/";
+  }
+  try {
+    const resolved = new URL(value, NEXT_ORIGIN);
+    if (resolved.origin !== NEXT_ORIGIN) {
+      return "/";
+    }
+    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+  } catch {
+    return "/";
+  }
 }
 
 export async function createGateway({
@@ -98,6 +139,18 @@ export async function createGateway({
   logger = () => {},
   sessionTtlMs = DEFAULT_SESSION_TTL_MS,
   maxBodyBytes = 64 * 1024,
+  /**
+   * Whether the rate limit key may be read from the x-forwarded-for header.
+   *
+   * Off by default, and that is the safe direction: a header a client can set is
+   * a key a client can change, which turns the block into decoration. Turn it on
+   * only behind a reverse proxy that overwrites the header with the address it
+   * saw, and know that the proxy then becomes the only thing separating two
+   * clients. Behind the Docker port mapping, the socket address is the bridge
+   * address, so every client shares one key: that is the price of not trusting a
+   * header, and it is the failure mode to prefer.
+   */
+  trustProxy = false,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
 } = {}) {
@@ -112,10 +165,15 @@ export async function createGateway({
   // them forever. They are tracked here and destroyed explicitly on shutdown.
   const upgradedSockets = new Set();
 
-  const clientAddress = (req) =>
-    String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
+  const clientAddress = (req) => {
+    if (trustProxy) {
+      const forwarded = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
+      if (forwarded) {
+        return forwarded;
+      }
+    }
+    return req.socket.remoteAddress || "unknown";
+  };
 
   const blocked = (address) => {
     const entry = failures.get(address);
@@ -206,6 +264,13 @@ export async function createGateway({
       }
 
       if (req.method === "POST") {
+        // The code step is throttled too, otherwise the six digits can be tried
+        // forever once the password is known.
+        if (blocked(address)) {
+          logger(`[auth] refusing a two-factor attempt from ${address}: temporarily blocked`);
+          html(res, 429, tooManyAttemptsPage());
+          return;
+        }
         const user = findUser(users, pending.user);
         if (!user) {
           html(res, 401, pages.verifyPage({ error: "Unknown account." }));
@@ -299,6 +364,14 @@ export async function createGateway({
       }
 
       if (req.method === "POST") {
+        // The enrolment step is reachable without any session, so it is throttled
+        // like the sign in code step: an attacker must not be able to walk the
+        // six digits, and the account must not be created by one who tries.
+        if (blocked(address)) {
+          logger(`[auth] refusing an enrolment attempt from ${address}: temporarily blocked`);
+          html(res, 429, tooManyAttemptsPage());
+          return;
+        }
         const form = await readForm(req, maxBodyBytes);
         const result = verifyTotp(pending.totpSecret, String(form.code ?? ""), { at: now() });
         if (!result.ok) {

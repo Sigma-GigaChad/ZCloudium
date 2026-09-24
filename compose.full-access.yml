@@ -87,6 +87,12 @@ services:
       # window during which a stolen cookie stays usable: on this profile that
       # cookie is worth root on the machine, so raise it only with that in mind.
       ZCLOUDIUM_SESSION_TTL_HOURS: "12"
+      # Leave this off unless a reverse proxy in front of the container
+      # overwrites x-forwarded-for: with it on, the failure block is keyed on a
+      # header the client can set, which is the same as having no block at all.
+      # With it off (the default) the block is keyed on the connecting socket,
+      # and every client behind the Docker port mapping shares one key.
+      # ZCLOUDIUM_TRUST_PROXY: "off"
 
     ## ---------- Hardening ----------
     # No read-only rootfs here, deliberately: with root on /host it would not

@@ -6,7 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGateway } from "../gateway/lib/server.mjs";
+import { createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
 import { totp } from "../gateway/lib/totp.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -49,7 +49,7 @@ async function startUpstream() {
   };
 }
 
-async function withGateway(run) {
+async function withGateway(run, options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
   const upstream = await startUpstream();
   // Time is injected so the suite can cross a TOTP step instead of sleeping 30s.
@@ -63,6 +63,7 @@ async function withGateway(run) {
     dataDir,
     logger: () => {},
     now,
+    ...options,
   });
   try {
     await run({
@@ -80,12 +81,13 @@ async function withGateway(run) {
   }
 }
 
-function post(base, path, fields, cookie) {
+function post(base, path, fields, cookie, headers = {}) {
   return fetch(`${base}${path}`, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
       ...(cookie ? { cookie } : {}),
+      ...headers,
     },
     body: new URLSearchParams(fields).toString(),
     redirect: "manual",
@@ -381,4 +383,159 @@ test("a WebSocket upgrade without a session is refused", () =>
     await completeSetup(base);
     const status = await wsStatusLine(port, "/ws", null);
     assert.equal(/101/.test(status), false, `expected no upgrade, got "${status}"`);
+  }));
+
+/**
+ * The failure block is a rate limit, so what it is keyed on is part of its
+ * contract: a client that can choose its own key has no rate limit at all.
+ */
+async function failPasswordTimes(base, times, addressOf) {
+  const statuses = [];
+  for (let attempt = 0; attempt < times; attempt += 1) {
+    const headers = addressOf ? { "x-forwarded-for": addressOf(attempt) } : {};
+    const response = await post(base, "/_auth/login", { username: USERNAME, password: "wrong-password" }, null, headers);
+    statuses.push(response.status);
+  }
+  return statuses;
+}
+
+test("a varied x-forwarded-for header does not evade the failure block", () =>
+  withGateway(async ({ base }) => {
+    await completeSetup(base);
+
+    // Every attempt claims a different source address. The socket is the same,
+    // so the same budget must be spent.
+    const rejects = await failPasswordTimes(base, MAX_FAILURES, (attempt) => `10.0.0.${attempt}`);
+    assert.deepEqual(rejects, Array(MAX_FAILURES).fill(401));
+
+    const blocked = await post(
+      base,
+      "/_auth/login",
+      { username: USERNAME, password: PASSWORD },
+      null,
+      { "x-forwarded-for": "10.0.0.250" },
+    );
+    assert.equal(blocked.status, 429, "the block must be keyed on the socket address, not on a header the client controls");
+    assert.equal(cookieFrom(blocked, "zc_sess"), null);
+  }));
+
+test("repeated wrong codes are refused with 429 instead of being tried forever", () =>
+  withGateway(async ({ base, now, advance }) => {
+    const { secret } = await completeSetup(base, now);
+    const loginCookie = cookieFrom(await submitPassword(base), "zc_login");
+
+    for (let attempt = 0; attempt < MAX_FAILURES; attempt += 1) {
+      const response = await post(base, "/_auth/verify", { code: "000000" }, loginCookie);
+      assert.equal(response.status, 401, `wrong code ${attempt + 1} must still be answered as a rejection`);
+    }
+
+    // The address is blocked now, so even the right code is refused: that is
+    // what makes a six digit second factor impossible to walk through.
+    advance(30_000);
+    const blocked = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, loginCookie);
+    assert.equal(blocked.status, 429);
+    assert.equal(cookieFrom(blocked, "zc_sess"), null);
+  }));
+
+test("the enrolment step is throttled like the sign in code step", () =>
+  withGateway(async ({ base, dataDir }) => {
+    const step1 = await post(base, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(step1, "zc_setup");
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const secret = (await enroll.text()).match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    assert.ok(secret, "the enrolment page must display the secret");
+
+    for (let attempt = 0; attempt < MAX_FAILURES; attempt += 1) {
+      const response = await post(base, "/_auth/setup/totp", { code: "000000" }, setupCookie);
+      assert.equal(response.status, 400, `wrong enrolment code ${attempt + 1}`);
+    }
+
+    const blocked = await post(base, "/_auth/setup/totp", { code: totp(secret) }, setupCookie);
+    assert.equal(blocked.status, 429);
+    await assert.rejects(
+      readFile(join(dataDir, "auth", "users.json"), "utf8"),
+      "the throttle must keep the account from being created",
+    );
+  }));
+
+test("trustProxy keys the block on the forwarded address, which is the documented opt in", () =>
+  withGateway(
+    async ({ base }) => {
+      await completeSetup(base);
+      await failPasswordTimes(base, MAX_FAILURES, () => "10.0.0.1");
+
+      const otherClient = await post(
+        base,
+        "/_auth/login",
+        { username: USERNAME, password: "wrong-password" },
+        null,
+        { "x-forwarded-for": "10.0.0.2" },
+      );
+      assert.equal(otherClient.status, 401, "a second forwarded address keeps its own budget once the header is trusted");
+
+      const blocked = await post(
+        base,
+        "/_auth/login",
+        { username: USERNAME, password: "wrong-password" },
+        null,
+        { "x-forwarded-for": "10.0.0.1" },
+      );
+      assert.equal(blocked.status, 429, "the exhausted forwarded address stays blocked");
+    },
+    { trustProxy: true },
+  ));
+
+test("safeNext refuses anything a browser would resolve outside this origin", () => {
+  const refused = [
+    "",
+    "   ",
+    "relative/path",
+    "//evil.com",
+    "/\\evil.com",
+    "/\\/evil.com",
+    "/\\\\evil.com",
+    "\\\\evil.com",
+    "/%5Cevil.com",
+    "/%5cevil.com",
+    "/a%5Cb",
+    "/%2F%2Fevil.com",
+    "/\t/evil.com",
+    "/\n/evil.com",
+    "/\r\nLocation: http://evil.com",
+    "http://evil.com",
+    "https://evil.com",
+    "javascript:alert(1)",
+    "data:text/html,<script>1</script>",
+    null,
+    undefined,
+    42,
+    {},
+  ];
+  for (const value of refused) {
+    assert.equal(safeNext(value), "/", `${JSON.stringify(value)} must not be honoured`);
+  }
+});
+
+test("safeNext keeps a same origin path, with its query and its fragment", () => {
+  assert.equal(safeNext("/"), "/");
+  assert.equal(safeNext("/settings"), "/settings");
+  assert.equal(safeNext("/settings?tab=model"), "/settings?tab=model");
+  assert.equal(safeNext("/settings?tab=model#anchor"), "/settings?tab=model#anchor");
+  assert.equal(safeNext("/a/b/c"), "/a/b/c");
+});
+
+test("a backslash in next cannot turn a successful sign in into an open redirect", () =>
+  withGateway(async ({ base, now, advance }) => {
+    const { secret } = await completeSetup(base, now);
+
+    for (const next of ["/\\evil.com", "/%5Cevil.com", "//evil.com", "/\\/evil.com", "/\\\\evil.com"]) {
+      advance(30_000);
+      const step1 = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD, next });
+      assert.equal(step1.status, 303, `next=${next}`);
+      const loginCookie = cookieFrom(step1, "zc_login");
+
+      const step2 = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, loginCookie);
+      assert.equal(step2.status, 303, `next=${next}`);
+      assert.equal(step2.headers.get("location"), "/", `next=${next} must land on the root of this origin`);
+    }
   }));
