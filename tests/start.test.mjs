@@ -220,6 +220,12 @@ async function runStart(env, { gateway = null, mcp = async () => ({ status: "unc
     },
     createGatewayFn: async (options) => {
       gatewayCalls.push(options);
+      // The real module logs through the logger it is given: the first line it
+      // emits is its listening line, then one line per authentication event. The
+      // stub emits the same shape, so the test can check the wiring rather than
+      // the shape of the options object.
+      options.logger?.("[auth] gateway listening on 0.0.0.0:3030, proxying to http://127.0.0.1:3131");
+      options.logger?.("[auth] failed password attempt from 127.0.0.1");
       return gateway ?? { port: PUBLISHED_PORT, close: async () => {} };
     },
     applyMcpConfigFn: async (options) => {
@@ -234,7 +240,7 @@ async function runStart(env, { gateway = null, mcp = async () => ({ status: "unc
 
 test("with the gateway on, the runtime is spawned on loopback and the gateway starts in front", async () => {
   const closed = [];
-  const { result, child, spawns, signals, exits, gatewayCalls } = await runStart(
+  const { result, child, spawns, signals, exits, gatewayCalls, logs } = await runStart(
     { HOME: "/data" },
     { gateway: { port: PUBLISHED_PORT, close: async () => closed.push(true) } },
   );
@@ -243,11 +249,25 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
   assert.equal(spawns[0].file, process.execPath);
   assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...LOOPBACK_ARGS]);
   assert.equal(spawns[0].options.stdio, "inherit");
-  assert.deepEqual(gatewayCalls, [
-    { host: "0.0.0.0", port: 3030, dataDir: "/data", upstreamUrl: "http://127.0.0.1:3131", sessionTtlMs: DEFAULT_SESSION_TTL_MS },
-  ]);
+  assert.deepEqual(
+    gatewayCalls.map(({ logger, ...options }) => options),
+    [{ host: "0.0.0.0", port: 3030, dataDir: "/data", upstreamUrl: "http://127.0.0.1:3131", sessionTtlMs: DEFAULT_SESSION_TTL_MS }],
+  );
   assert.equal(result.child, child);
   assert.equal(result.gateway.port, PUBLISHED_PORT);
+
+  // The gateway must be able to log, and what it logs must reach the entrypoint
+  // logger: without this, the failed attempts and the rejected codes of a
+  // deployment are invisible in `docker logs`.
+  assert.equal(typeof gatewayCalls[0].logger, "function", "the gateway must receive a logger");
+  assert.ok(
+    logs.includes("[auth] failed password attempt from 127.0.0.1"),
+    `the lines the gateway emits must reach the entrypoint logger, got: ${JSON.stringify(logs)}`,
+  );
+  assert.ok(
+    logs.includes("[auth] gateway listening on 0.0.0.0:3030, proxying to http://127.0.0.1:3131"),
+    "the gateway listening line must reach the same logger",
+  );
 
   signals.signal("SIGTERM");
   assert.deepEqual(child.killed, ["SIGTERM"]);

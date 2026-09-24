@@ -244,7 +244,12 @@ export async function start({
   });
 
   if (config.authEnabled) {
-    gateway = await createGatewayFn(gatewayOptions(config));
+    // The logger travels with the options, so the gateway reports its own
+    // startup and every authentication event through the same sink as the rest
+    // of the startup lines. Without it, a refused password, the reason a code was
+    // rejected and the temporary block of an address are written nowhere, which
+    // is exactly what an operator needs after a suspicious connection.
+    gateway = await createGatewayFn({ ...gatewayOptions(config), logger });
     logger(
       `[start] gateway listening on ${PUBLISHED_HOST}:${gateway.port} (authentication on), ` +
         `runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})`,
