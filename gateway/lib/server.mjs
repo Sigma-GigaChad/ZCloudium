@@ -112,6 +112,11 @@ async function readForm(req, limit) {
  * encoded backslash or slash, or any whitespace, and then resolved against a
  * fixed origin: a result that leaves that origin is refused. Returning the
  * resolved path is what the gateway then puts in its own redirect.
+ *
+ * Dot segment normalisation is the reason the resolved path needs its own check:
+ * `/..//evil.com` resolves to `//evil.com` while the origin stays the fixed one,
+ * so the origin test above cannot see it, and a browser reads a path that starts
+ * with two slashes as a protocol relative URL, in other words another host.
  */
 export function safeNext(value) {
   if (typeof value !== "string" || value === "" || !value.startsWith("/")) {
@@ -125,7 +130,11 @@ export function safeNext(value) {
     if (resolved.origin !== NEXT_ORIGIN) {
       return "/";
     }
-    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+    const path = `${resolved.pathname}${resolved.search}${resolved.hash}`;
+    if (path.startsWith("//")) {
+      return "/";
+    }
+    return path;
   } catch {
     return "/";
   }

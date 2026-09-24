@@ -499,6 +499,15 @@ test("safeNext refuses anything a browser would resolve outside this origin", ()
     "/%5cevil.com",
     "/a%5Cb",
     "/%2F%2Fevil.com",
+    // Dot segment normalisation turns these into `//evil.com` while the origin
+    // stays the fixed one, so only the resolved path can reveal them.
+    "/..//evil.com",
+    "/..//evil.com?x=1",
+    "/.//evil.com",
+    "/%2e%2e//evil.com",
+    "/a/..//evil.com",
+    "/a/b/../../..//evil.com",
+    "/..././..//evil.com",
     "/\t/evil.com",
     "/\n/evil.com",
     "/\r\nLocation: http://evil.com",

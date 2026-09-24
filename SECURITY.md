@@ -158,7 +158,11 @@ The `next` parameter is refused unless it is a same origin path: it is rejected
 when it carries a backslash (raw or percent encoded), an encoded slash or any
 whitespace, and then resolved against a fixed origin, so `/\evil.com` or
 `/<tab>/evil.com` cannot become a protocol relative URL. The redirect the gateway
-sends is the resolved path, never the value it was given.
+sends is the resolved path, never the value it was given. Dot segment
+normalisation gets its own test, because resolving can turn a single leading
+slash into two while the origin stays the fixed one: `/..//evil.com` resolves to
+`//evil.com`, which a browser reads as another host. A resolved path that starts
+with `//` is therefore refused as well.
 
 The session lifetime is what a stolen cookie is worth. Twelve hours is a
 deliberate compromise between usability and exposure; on the full access profile

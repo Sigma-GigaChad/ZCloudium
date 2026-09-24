@@ -466,9 +466,21 @@ Tested by actually running things, not only written:
   so the header was enough to start over). Eight wrong codes at the second factor
   followed by a genuinely valid code are answered `429` with no session, where
   the second factor used to accept the valid code after eight failures
+- **failure block, and the end of it**: the same container, measured before and
+  after the fix: eight wrong passwords are answered `401` and the ninth `429` in
+  both. Once the five minutes are over, the gateway before the fix answered the
+  next wrong password `401` and the one after it `429`, so one attempt every five
+  minutes kept the sign in page refused indefinitely. It now answers `401` to
+  eight fresh wrong passwords and only the ninth is `429`, which is the budget
+  starting again
 - **open redirect**: a sign in whose `next` is `/\evil.com`, `/%5Cevil.com`,
   `//evil.com` or `/\/evil.com` ends on `/`, the root of this origin, instead of
-  redirecting to the host the value names
+  redirecting to the host the value names. The value the sign in page renders in
+  its hidden field is the sanitised one, and that is where a path that dot
+  segment normalisation turns into a protocol relative one was visible:
+  `next=/..//evil.com`, `/.//evil.com`, `/%2e%2e//evil.com` and `/a/..//evil.com`
+  render as `/` (the gateway before the fix rendered `value="//evil.com"` for
+  each of them), while a legitimate `/settings?tab=model` still renders in full
 - **browser MCP server**: handshake over stdio as uid 1000 under the same
   hardening, 30 tools listed, `navigate_page` on a `data:` URL succeeded,
   `evaluate_script` returned the page title and the user agent
