@@ -410,8 +410,8 @@ browser must not be pointed at untrusted pages. See SECURITY.md.
 
 Tested by actually running things, not only written:
 
-- **test suite**: 85 tests, all green, in a throwaway container
-  (`node:24.14.0-bookworm-slim`, `node --test`)
+- **test suite**: all green, in a throwaway container
+  (`node:24.14.0-bookworm-slim`, `node --test`, which prints the count)
 - **image build**: 1.38 GB, `chromium --version` answers
   `Chromium 153.0.8010.52` inside the built image, `chrome-devtools-mcp
   --version` answers `1.10.1`
