@@ -39,7 +39,12 @@ const PENDING_TTL_SECONDS = 600;
  * The key is the connecting socket address by default. See `trustProxy` below.
  */
 export const MAX_FAILURES = 8;
-const BLOCK_MS = 5 * 60 * 1000;
+/**
+ * How long one block lasts. The documentation quotes this bound, so it is
+ * exported: tests measure the duration the gateway applies instead of a copy of
+ * it, and a change here that is not also made to what is advertised fails.
+ */
+export const BLOCK_MS = 5 * 60 * 1000;
 
 /** Raised against a fixed origin to prove that a `next` value stays on it. */
 const NEXT_ORIGIN = "http://gateway.invalid";

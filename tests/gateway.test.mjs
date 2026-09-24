@@ -6,14 +6,20 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
+import { BLOCK_MS, createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
 import { totp } from "../gateway/lib/totp.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const USERNAME = "operator";
 const PASSWORD = "correct-horse-battery-staple";
-/** The bound the documentation advertises for one block, and therefore a contract. */
-const BLOCK_MS = 5 * 60 * 1000;
+/**
+ * The bound the documentation advertises for one block, and therefore a contract.
+ *
+ * It is read from the gateway rather than copied here: a copy would keep the old
+ * duration and the timing tests below would then measure a value the product no
+ * longer uses.
+ */
+const ADVERTISED_BLOCK_MS = 5 * 60 * 1000;
 
 /** Stub of the ZCode server: plain HTTP plus a WebSocket upgrade. */
 async function startUpstream() {
@@ -438,6 +444,36 @@ test("repeated wrong codes are refused with 429 instead of being tried forever",
     assert.equal(blocked.status, 429);
     assert.equal(cookieFrom(blocked, "zc_sess"), null);
   }));
+
+/**
+ * The duration of the block is a number the documentation quotes, so it is a
+ * contract and not an implementation detail. The timing below is deterministic:
+ * the clock is injected, so no test waits five real minutes for it.
+ */
+test("the block lifts exactly after the configured duration, and not before", () =>
+  withGateway(async ({ base, advance }) => {
+    await completeSetup(base);
+    const spent = await failPasswordTimes(base, MAX_FAILURES);
+    assert.deepEqual(spent, Array(MAX_FAILURES).fill(401));
+
+    // One millisecond short of the configured duration: still blocked, and the
+    // correct password is refused rather than honoured.
+    advance(BLOCK_MS - 1);
+    const justBefore = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(justBefore.status, 429, "the block must still hold one millisecond before the duration");
+
+    // One millisecond later the block is over, at the boundary itself.
+    advance(1);
+    const justAfter = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(justAfter.status, 303, "the block must lift at the duration it advertises");
+  }));
+
+test("the gateway applies the block duration the documentation advertises", () => {
+  // README.md and SECURITY.md both quote five minutes for one block. This pins the
+  // constant itself, so changing the duration without changing what is advertised
+  // fails here, and the timing test above keeps measuring the real value.
+  assert.equal(BLOCK_MS, ADVERTISED_BLOCK_MS, "the advertised block duration and the applied one must agree");
+});
 
 /**
  * The block is documented as bounded, so the budget behind it has to expire with
