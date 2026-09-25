@@ -11,14 +11,46 @@ monorepo for every version.
 
 ## Quick start
 
-```bash
-# 1. The image is private: authenticate once with GHCR.
-#    The token must carry the read:packages scope (classic PAT).
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u <your-user> --password-stdin
+No clone, no login: the image is public. Save this as `compose.yaml` in an
+empty directory:
 
-# 2. Fetch the compose file and start.
-git clone https://github.com/Sigma-GigaChad/z-cloudium.git
-cd z-cloudium
+```yaml
+services:
+  z-cloudium:
+    image: ghcr.io/sigma-gigachad/z-cloudium:latest
+    restart: unless-stopped
+    stop_grace_period: 20s
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:3030:3030"
+    volumes:
+      - z-cloudium-data:/data
+      - z-cloudium-workspace:/workspace
+    environment:
+      HOME: /data
+      ZCODE_DATA_BASE_DIR: /data
+      ZCODE_SERVER_WORKSPACE: /workspace
+      ZCLOUDIUM_AUTH: "on"
+      ZCLOUDIUM_BROWSER_MCP: "on"
+      ZCLOUDIUM_SESSION_TTL_HOURS: "12"
+      ZCODE_MODEL_TELEMETRY_ENABLED: "0"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+
+volumes:
+  z-cloudium-data:
+  z-cloudium-workspace:
+```
+
+```bash
 docker compose up -d
 ```
 
@@ -43,7 +75,7 @@ the session key and the API key are written into the volume, so they survive
 container recreations.
 
 To reach it from another machine of the private network, replace `127.0.0.1`
-with that machine's IP in the `ports` section of `compose.yml`.
+with that machine's IP in the `ports` section of the compose file above.
 
 ### Without compose
 
@@ -71,30 +103,11 @@ image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
 The available tags are `latest`, `<version>` (for example `3.14.3`) and
 `sha-<commit>`.
 
-### Package authentication
+### The image is public
 
-The GHCR package is **private** like the repository, and the `docker login`
-step is not optional: without it, `docker pull` answers `denied`.
-
-The token must carry the **`read:packages`** scope. A `gh` CLI OAuth token does
-not have it (its `repo` scope is not enough for packages). A **classic PAT**
-with `read:packages` is what is needed:
-
-```
-GitHub → Settings → Developer settings → Personal access tokens (classic)
-→ Generate new token → tick "read:packages"
-```
-
-Two ways to remove that step and make the start truly instant:
-
-- **Make the package public**: the visibility of a GHCR package is independent
-  of the repository. A package published from a private repository can be
-  public. Path: `GitHub → your organisation → Packages tab → z-cloudium →
-  Package settings → Change visibility → Public`.
-- Or build it locally (`./build.sh`): no registry in the loop at all.
-
-For your own use on a private VM, the `read:packages` PAT is the most
-conservative choice: nothing is exposed publicly.
+The GHCR package is public (the repository stays private), so `docker pull`
+works without any authentication. That was verified with an anonymous pull, and
+it is what makes the copy-paste quick start work as is.
 
 ### Working on real files
 
@@ -502,10 +515,17 @@ Tested by actually running things, not only written:
 - **restricted profile via compose**: `ReadonlyRootfs=true`, `CapDrop=[ALL]`,
   `no-new-privileges`, `User=1000:1000`, tmpfs `/tmp`, and the gateway answers
   while writing only into the `/data` volume
-- **CI**: `build` and `smoke` jobs green on the previous image (commit
-  `d6a7e61`). Three tags pushed, `latest`, `3.14.3` and `sha-d6a7e61`, under the
-  digest `sha256:83ae9903...`. The `smoke` job pulled the **published** image,
-  started it with the full hardening and checked that the interface answered.
+- **CI, real runs on GitHub runners** (merge `bd468a3`, tag `v3.14.3`):
+  `build-image` green in 3m01 (`build` plus `smoke`, which pulls the **published**
+  image, starts it with the full hardening and checks the gateway and the
+  interface), and `e2e` green in 6m25 (the 20 Playwright tests against the image
+  the workflow builds). Three tags pushed: `latest`, `3.14.3` and `sha-bd468a3`.
+- **public package**: `docker logout ghcr.io` then `docker pull
+  ghcr.io/sigma-gigachad/z-cloudium:latest` succeeds without any credential
+- **copy-paste quick start**: the `compose.yaml` from this README, saved in an
+  empty directory on a machine that never cloned anything, starts a `healthy`
+  container whose logs show the gateway on the published port and the runtime
+  confined to loopback, and `GET /` answers `302` to the sign in page
 
 ## Implementation details
 

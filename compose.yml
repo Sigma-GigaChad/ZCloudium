@@ -3,7 +3,7 @@
 # profile to prefer, and the one `docker compose up -d` starts as is.
 #
 # Defaults chosen so that it runs with no editing at all:
-#   - image pulled from GHCR (see README for the authentication, the package is private)
+#   - image pulled from GHCR (public: no authentication needed to pull it)
 #   - port published on 127.0.0.1 only: reachable from this machine
 #   - workspace in a named Docker volume, so the host needs no preparation
 #
