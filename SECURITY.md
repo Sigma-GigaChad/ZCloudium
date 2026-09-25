@@ -8,19 +8,26 @@ Nothing here can fix the behaviour of ZCode itself: that is third party code
 which does not depend on this project. Everything below is about the Docker
 wrapper and the gateway shipped with the image.
 
-## Two profiles
+## Three profiles
 
-| | `compose.yml` (restricted) | `compose.full-access.yml` (full access) |
-| --- | --- | --- |
-| User | `1000:1000` (unprivileged) | `root` |
-| Filesystem view | `/workspace` plus the `/data` volume | the whole VM mounted on `/host` |
-| Container rootfs | `read_only` plus tmpfs `/tmp` | writable (see below) |
-| Capabilities | none (`cap_drop: ALL`) | 7 administration capabilities |
-| Reach of a compromise | the workspace | the whole VM |
-| Authentication | on by default | on by default, and it matters most here |
+| | `compose.yml` (restricted) | `compose.full-access.yml` (full access) | `compose.unsafe.yml` (unsafe) |
+| --- | --- | --- | --- |
+| User | `1000:1000` (unprivileged) | `root` | `root` |
+| Filesystem view | `/workspace` plus the `/data` volume | the whole VM mounted on `/host` | the whole VM, plus its processes and Docker |
+| Container rootfs | `read_only` plus tmpfs `/tmp` | writable (see below) | writable (see below) |
+| Capabilities | none (`cap_drop: ALL`) | 7 administration capabilities | all of them (`privileged`) |
+| Machine namespaces | no (`pid` isolated) | no | shared (`pid: "host"`) |
+| Machine's Docker socket | no | commented out | mounted, active |
+| Reach of a compromise | the workspace | the whole VM | the whole machine, host included |
+| Authentication | on by default | on by default, and it matters most here | on by default, and it matters most here |
 
 The restricted profile is enough for most uses. Full access is a deliberate
-choice, with the consequences described further down.
+choice, with the consequences described further down. The unsafe profile
+removes the container boundary itself: `privileged` plus `pid: "host"` means
+the agent runs commands on the machine through `nsenter`, installs packages
+with the machine's package manager, and controls the machine's containers
+through the socket. On that profile there is nothing to elevate to: the agent
+already is root of the machine, and the gateway decides only who reaches it.
 
 ## What is hardened
 

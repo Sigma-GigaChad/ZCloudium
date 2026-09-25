@@ -1,0 +1,90 @@
+# UNSAFE profile: the agent gets the machine, not a container.
+#
+# What this adds over compose.full-access.yml:
+#   - privileged: true: every capability, every device, no seccomp filter. The
+#     container boundary stops being a boundary.
+#   - pid: "host": the agent sees and can signal the machine's processes, and
+#     nsenter -t 1 reaches the host namespaces.
+#   - /var/run/docker.sock: the agent controls the machine's Docker, including
+#     starting privileged containers on it.
+#   - / mounted on /host (kept from full access): the whole filesystem.
+#
+# What the agent can then do, concretely:
+#   - read and write every path of the machine (already true on full access)
+#   - run commands as the machine itself: nsenter -t 1 -m -u -i -n -p -- <cmd>
+#   - install packages with the machine's package manager, apt or pacman:
+#       nsenter -t 1 -m -u -i -n -p -- apt-get install -y <package>
+#   - control the machine's containers through the Docker socket
+#
+# There is nothing to elevate to: the agent already is root on the machine, so
+# sudo and polkit are no-ops. The authentication gateway in front of the port
+# still gates WHO reaches it; it does not limit WHAT the authenticated agent
+# can do, which is everything.
+#
+# Three values to adapt: the published port, and the two /host/home/<user>
+# paths (they must all three point at the same home).
+
+services:
+  z-cloudium:
+    image: ghcr.io/sigma-gigachad/z-cloudium:latest
+    container_name: z-cloudium
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+    ## Root in the container, and the machine underneath it.
+    user: root
+
+    ports:
+      # 127.0.0.1 by default. For the private network, replace with the
+      # machine's private IP. Never "3030:3030".
+      - "127.0.0.1:3030:3030"
+
+    volumes:
+      - /:/host
+      # The machine's Docker: the agent controls it, including starting
+      # privileged containers on the machine. Equivalent to root anyway, kept
+      # explicit because it is the practical path for nested work.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The agent's own state, outside /host.
+      - z-cloudium-data:/data
+
+    environment:
+      # The operator's real home on the machine: skills, memories, settings and
+      # commands are read from there (copy your ~/.zcode over first).
+      HOME: /host/home/delta
+      ZCODE_DATA_BASE_DIR: /host/home/delta
+      ZCODE_MODEL_TELEMETRY_ENABLED: "0"
+
+      # git refuses repositories owned by another uid ("dubious ownership").
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+
+    ## ---------- The point of this profile ----------
+    # Everything is granted on purpose. privileged covers capabilities,
+    # devices, cgroups and seccomp; pid: "host" exposes the machine's
+    # processes to nsenter. This is not a hardening mistake, it is the
+    # feature: read SECURITY.md before using it, and snapshot the machine
+    # before the first run.
+    privileged: true
+    pid: "host"
+
+    # Resource guards still apply through cgroups even when privileged: an
+    # agent that forks or allocates without limit still gets stopped.
+    pids_limit: 2048
+    mem_limit: 8g
+    cpus: 4
+
+    command:
+      - --web
+      - --host=0.0.0.0
+      - --port=3030
+      - --workspace=/host/home/delta
+      - --no-open
+      # The gateway (password plus TOTP) still gates the port. Removing
+      # --no-token instead would add a token on top, never remove the gateway
+      # here: on this profile an unauthenticated port is the machine.
+      - --no-token
+
+volumes:
+  z-cloudium-data:

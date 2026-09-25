@@ -333,6 +333,49 @@ left commented out.
 The authentication gateway is on by default in this profile, which is where it
 matters most: with a root agent, an open port would mean owning the machine.
 
+## The machine itself, no container boundary (unsafe)
+
+`compose.unsafe.yml` goes one step further than full access: the container is
+`privileged`, shares the machine's process namespace (`pid: "host"`), and holds
+the machine's Docker socket. Concretely, the agent can:
+
+- read and write every path of the machine, as full access;
+- run commands as the machine itself, inside its namespaces:
+  `nsenter -t 1 -m -u -i -n -p -- <command>`;
+- install packages with the machine's own package manager, apt, pacman or
+  whatever it runs, from inside the conversation:
+  `nsenter -t 1 -m -u -i -n -p -- apt-get install -y <pkg>`;
+- see and signal the machine's processes, and control the machine's containers
+  through the mounted Docker socket.
+
+There is nothing to elevate to: the agent already is root on the machine, so
+sudo and privilege requests are no-ops. Tell it once in a conversation that
+these paths exist (or add them to your `AGENTS.md` in the operator home), and it
+will use them directly.
+
+```bash
+./check-unsafe.sh                        # verifies all of it (throwaway container)
+cp compose.unsafe.yml compose.local.yml  # adapt the port and the home paths
+docker compose -f compose.local.yml up -d
+```
+
+The authentication gateway stays in front of the port on this profile too. It
+decides **who** reaches the agent; it does not limit **what** the authenticated
+agent can do, which is the machine, period.
+
+Two things to know:
+
+- **Snapshot the machine before the first run, and before every unsupervised
+  run.** On this profile a wrong command is a wrong command on your machine, and
+  `apt` or `pacman` installs are real installs.
+- **On a multi distribution WSL setup**, `pid: "host"` and the `/:/host` mount
+  resolve against the environment of the Docker daemon, which may be a different
+  distribution from the one your shell runs in (found while testing: the daemon
+  side ran Arch based CachyOS with pacman while `/host` carried Debian with
+  apt; both were usable, each through its own path). On the intended target, a
+  single distribution VM, the two are the same machine and this caveat does not
+  exist.
+
 ### Finding your existing ~/.zcode again
 
 Skills, commands and memories do not resolve through the data directory but
