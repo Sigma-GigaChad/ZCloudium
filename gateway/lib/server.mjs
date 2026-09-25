@@ -16,6 +16,7 @@ import {
   proxyAuthorityFor,
   rewriteDiscovery,
 } from "./browser.mjs";
+import { panelPage } from "./panel.mjs";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -520,10 +521,16 @@ export async function createGateway({
    * Whether this request may use the browser route. See isAcceptableOrigin: the
    * session says who the caller is, the origin says it is this gateway's own
    * frontend and not a page served by another service on the same machine.
+   *
+   * `trustProxy` is passed through because it is the flag that already means "a
+   * TLS terminating proxy I control is in front": it lets the https variant of
+   * the request's own authority pass, which is what makes the panel usable in the
+   * deployment README.md recommends. Nothing else about the check changes.
    */
   function originAcceptable(req) {
     return isAcceptableOrigin(req.headers.origin, req.headers.host, {
       secure: Boolean(req.socket.encrypted),
+      trustProxy,
     });
   }
 
@@ -534,6 +541,38 @@ export async function createGateway({
     );
     socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
     socket.destroy();
+  }
+
+  /**
+   * The operator panel, served by the gateway itself (issue #5, Phase 1).
+   *
+   * It lives at the browser prefix root because that is the one path of the two
+   * halves that must be ours: the panel is the page that owns the live view and
+   * the viewport control, while everything below the prefix goes to Chromium. It
+   * carries the same Origin rule as the proxy, because it is the page that opens
+   * the control channel, and the session is checked before this function is
+   * reached, like every other path.
+   *
+   * The page holds no secret: it is static HTML. What it reaches, once it is open
+   * in the operator's browser, is the agent's browser.
+   */
+  function servePanel(req, res, url) {
+    if (!originAcceptable(req)) {
+      logger(
+        `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
+          `for ${url.pathname}`,
+      );
+      res.writeHead(403, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Forbidden");
+      return;
+    }
+    const body = Buffer.from(panelPage(), "utf8");
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": body.length,
+      "cache-control": "no-store",
+    });
+    res.end(body);
   }
 
   /**
@@ -643,7 +682,15 @@ export async function createGateway({
     }
 
     const url = requestUrl(req);
-    const browserRoute = classifyRoute(url.pathname, { browserEnabled }) === "browser";
+    const route = classifyRoute(url.pathname, { browserEnabled });
+    if (route === "panel") {
+      // The panel is a page, not a socket: there is nothing at that path to
+      // upgrade to, and it must not fall through to the application either.
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const browserRoute = route === "browser";
     if (browserRoute && proxyAuthorityFor(req.headers.host) === null) {
       logger(`[auth] refusing a browser upgrade with an unusable Host header: ${JSON.stringify(req.headers.host)}`);
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -715,6 +762,10 @@ export async function createGateway({
       }
       if (!sessionOf(req)) {
         redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(req.url ?? "/")}`);
+        return;
+      }
+      if (route === "panel") {
+        servePanel(req, res, url);
         return;
       }
       if (route === "browser") {

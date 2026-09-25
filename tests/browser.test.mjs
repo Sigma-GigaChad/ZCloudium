@@ -257,6 +257,48 @@ test("an absent Origin is allowed, because only a browser context sends one", ()
   }
 });
 
+/**
+ * The TLS terminating proxy, which is a deployment README.md recommends.
+ *
+ * Behind that proxy the browser sends an `https` Origin while the gateway
+ * serializes `http`, so the check above refuses the panel in a setup this project
+ * documents as normal. The flag that already means "a proxy I control is in front"
+ * is the one that says so, and it only ever adds the `https` variant of the
+ * request's own authority: the authority must still match exactly.
+ */
+test("behind a trusted proxy an https Origin of this exact authority is accepted, and nothing else is", () => {
+  const host = "panel.example:3041";
+
+  // Off is the default, and off is exactly the behaviour before the flag existed.
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", host), false, "the flag is off unless it is asked for");
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", host, { trustProxy: false }), false);
+
+  // On, with the same authority: the proxy terminated TLS, so the page is https
+  // while the socket the gateway sees is not.
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", host, { trustProxy: true }), true);
+  // The port is part of the authority, so another port is another origin.
+  assert.equal(isAcceptableOrigin("https://panel.example:3042", host, { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example", host, { trustProxy: true }), false, "the default port is not this one");
+  assert.equal(isAcceptableOrigin("https://evil.example", host, { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://127.0.0.1:3041", host, { trustProxy: true }), false, "another name is another origin");
+
+  // The plain http path is unchanged, with the flag on or off.
+  assert.equal(isAcceptableOrigin("http://panel.example:3041", host, { trustProxy: true }), true);
+  assert.equal(isAcceptableOrigin("http://panel.example:3042", host, { trustProxy: true }), false);
+
+  // A socket that really is TLS already accepts https: the flag adds nothing there.
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", host, { secure: true, trustProxy: true }), true);
+  assert.equal(isAcceptableOrigin("http://panel.example:3041", host, { secure: true, trustProxy: true }), false, "a https socket is not this origin's http");
+
+  // Everything the check refused before it is still refused.
+  assert.equal(isAcceptableOrigin("null", host, { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example:3041/", host, { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", "host name", { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", undefined, { trustProxy: true }), false);
+  // And a client that is not a page still carries no Origin at all.
+  assert.equal(isAcceptableOrigin(undefined, host, { trustProxy: true }), true);
+});
+
 test("an Origin that is not a plain origin is refused, and a broken Host refuses everything", () => {
   const host = "127.0.0.1:3041";
   for (const odd of ["null", "http://127.0.0.1:3041/", "http://127.0.0.1:3041?x=1", "not an origin", "127.0.0.1:3041"]) {
@@ -333,11 +375,16 @@ test("the route classification keeps the three prefixes apart", () => {
   // prefix is ordinary application traffic: the off switch is total.
   assert.equal(classifyRoute("/_browser/json/version"), "app");
   assert.equal(classifyRoute("/_browser", { browserEnabled: false }), "app");
+  assert.equal(classifyRoute("/_browser/", { browserEnabled: false }), "app");
 
-  assert.equal(classifyRoute("/_browser", { browserEnabled: true }), "browser");
-  assert.equal(classifyRoute("/_browser/", { browserEnabled: true }), "browser");
+  // With it on, the prefix root is the panel page the gateway serves itself, and
+  // everything below it is proxied to the debug port.
+  assert.equal(classifyRoute("/_browser", { browserEnabled: true }), "panel");
+  assert.equal(classifyRoute("/_browser/", { browserEnabled: true }), "panel");
   assert.equal(classifyRoute("/_browser/json/version", { browserEnabled: true }), "browser");
+  assert.equal(classifyRoute("/_browser/json/list", { browserEnabled: true }), "browser");
   assert.equal(classifyRoute("/_browser/devtools/inspector.html", { browserEnabled: true }), "browser");
+  assert.equal(classifyRoute("/_browser/devtools/page/8B04", { browserEnabled: true }), "browser");
   // A path that merely starts with the same letters is not the prefix.
   assert.equal(classifyRoute("/_browsers", { browserEnabled: true }), "app");
   assert.equal(classifyRoute("/_browserish/x", { browserEnabled: true }), "app");

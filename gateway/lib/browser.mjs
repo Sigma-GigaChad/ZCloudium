@@ -24,6 +24,8 @@ import { readlink, rm } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
+import { PANEL_PREFIX } from "./panel.mjs";
+
 /** The Chromium installed in the image, the one the MCP server drives today. */
 export const BROWSER_EXECUTABLE = "/usr/bin/chromium";
 
@@ -275,6 +277,11 @@ export function stopBrowser(child, { graceMs = BROWSER_STOP_GRACE_MS, logger = (
  *
  * With the panel off there is no browser route at all: `/_browser/...` is
  * ordinary application traffic, which is what makes the off switch total.
+ *
+ * With the panel on, the prefix root is the operator panel, which the gateway
+ * serves itself (`panel.mjs`), and everything below it is proxied to the debug
+ * port. The panel is a browser route too: it is behind the session, it carries
+ * the same Origin rule, and it is the page that then opens the control channel.
  */
 export function classifyRoute(pathname, { browserEnabled = false } = {}) {
   if (pathname === "/_auth" || pathname.startsWith("/_auth/")) {
@@ -283,7 +290,10 @@ export function classifyRoute(pathname, { browserEnabled = false } = {}) {
   if (!browserEnabled) {
     return "app";
   }
-  if (pathname === BROWSER_PREFIX || pathname.startsWith(`${BROWSER_PREFIX}/`)) {
+  if (pathname === BROWSER_PREFIX || pathname === PANEL_PREFIX) {
+    return "panel";
+  }
+  if (pathname.startsWith(`${BROWSER_PREFIX}/`)) {
     return "browser";
   }
   return "app";
@@ -378,8 +388,17 @@ function strictOrigin(value) {
  *
  * A request with no Origin is a client that is not a browser page (the MCP
  * server, curl, the harness), and there is no page context to judge.
+ *
+ * `trustProxy` covers the deployment README.md recommends: a TLS terminating
+ * proxy in front, so the browser sends an `https` Origin while the socket the
+ * gateway sees is plain http, and its own origin is computed as `http`. The flag
+ * already means "a proxy I control is in front", which is exactly the condition
+ * under which the https variant of the request's own authority is trustworthy.
+ * It adds that one variant and nothing else: the authority is still compared
+ * character for character, and with the flag off the behaviour is the one before
+ * it existed.
  */
-export function isAcceptableOrigin(origin, host, { secure = false } = {}) {
+export function isAcceptableOrigin(origin, host, { secure = false, trustProxy = false } = {}) {
   if (origin === undefined || origin === null || String(origin).trim() === "") {
     return true;
   }
@@ -389,7 +408,12 @@ export function isAcceptableOrigin(origin, host, { secure = false } = {}) {
     // request that came from a page is refused rather than waved through.
     return false;
   }
-  const own = strictOrigin(`${secure ? "https" : "http"}://${authority}`);
   const theirs = strictOrigin(String(origin).trim());
-  return own !== null && theirs !== null && theirs === own;
+  if (theirs === null) {
+    return false;
+  }
+  if (theirs === strictOrigin(`${secure ? "https" : "http"}://${authority}`)) {
+    return true;
+  }
+  return trustProxy && theirs === strictOrigin(`https://${authority}`);
 }

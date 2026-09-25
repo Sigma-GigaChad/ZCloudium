@@ -306,7 +306,8 @@ export async function start({
     if (resolveBrowserMode({ panelEnabled: true, debugUrl, reachable: probe.reachable }) === "attach") {
       logger(
         `[start] browser panel: the agent attaches to ${debugUrl} (pid ${browser.pid}), profile ${profile}. ` +
-          `The DevTools frontend is on ${BROWSER_PREFIX}/ behind the session.`,
+          `The panel is on ${BROWSER_PREFIX}/ behind the session, and Chromium's own DevTools frontend on ` +
+          `${BROWSER_PREFIX}/devtools/inspector.html.`,
       );
     } else {
       // A browser that never opened its debug port is no use to anyone: the

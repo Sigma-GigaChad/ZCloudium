@@ -778,9 +778,59 @@ test("the frontend assets and the query string cross the proxy untouched", () =>
     assert.match(await response.text(), /DevTools/);
     const seen = debug.requests.at(-1);
     assert.equal(seen.path, "/devtools/inspector.html?ws=panel.example/_browser/devtools/page/8B04");
+  }));
 
-    const root = await fetch(`${base}/_browser/`, { headers: { cookie: session } });
-    assert.equal(root.status, 404, "the prefix root maps to the debug root, and nothing is invented for it");
+/**
+ * The panel itself, served by the gateway at the prefix root.
+ *
+ * This is the change Phase 1 makes to the route Phase 0 built: `/_browser/` used
+ * to map to the debug port's root (a 404, nothing is invented for it) and is now
+ * the operator panel. The debug port must not be reached for it, the page must
+ * carry nothing secret, and the same Origin rule applies, because the panel is
+ * the page that opens the control channel.
+ */
+test("the panel is served at the prefix root, with no session and no debug port involved", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    for (const path of ["/_browser", "/_browser/"]) {
+      const anonymous = await fetch(`${base}${path}`, { redirect: "manual" });
+      assert.equal(anonymous.status, 302, `${path} must not be served without a session`);
+      assert.equal(anonymous.headers.get("location"), `/_auth/login?next=${encodeURIComponent(path)}`, path);
+    }
+    assert.equal(debug.requests.length, 0, "the panel is the gateway's own page: nothing may reach the debug port for it");
+
+    const { session } = await completeSetup(base);
+    const response = await fetch(`${base}/_browser/`, { headers: { cookie: session } });
+    assert.equal(response.status, 200);
+    assert.match(String(response.headers.get("content-type")), /text\/html/);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = await response.text();
+    assert.match(body, /Page\.startScreencast/, "the live view is the screencast");
+    assert.match(body, /Emulation\.setDeviceMetricsOverride/, "the viewport control is the emulation override");
+    assert.match(body, /Shared with the agent/, "the indicator that the page is shared with the agent");
+    // The button's URL is built at runtime from the same prefix, so what can be
+    // asserted on the served page is the frontend path it points at.
+    assert.match(body, /devtools\/inspector\.html/, "the DevTools button points at the proxied frontend");
+    // The page holds no secret and no target id: it reads the target list from
+    // the proxied discovery document, behind the session, when it opens.
+    assert.equal(/webSocketDebuggerUrl|[0-9A-F]{32}/.test(body), false, "the panel must not carry a target id or a socket url");
+    assert.equal(debug.requests.length, 0, "serving the panel must not touch the debug port");
+
+    // The panel is a browser route, so the Origin rule applies to it too.
+    const foreign = await rawGet(port, "/_browser/", { host: `127.0.0.1:${port}`, origin: "http://127.0.0.1:3038", cookie: session });
+    assert.match(foreign.split("\r\n")[0], /403/, "another origin must not read the panel");
+    const own = await rawGet(port, "/_browser/", { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, cookie: session });
+    assert.match(own.split("\r\n")[0], /200/, "this origin serves its own panel");
+  }));
+
+test("an upgrade to the panel path is refused, and reaches neither the debug port nor the application", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    for (const path of ["/_browser", "/_browser/"]) {
+      const status = await wsStatusLine(port, path, session);
+      assert.notEqual(status, "TIMEOUT", `${path} must get an answer, not a hung socket`);
+      assert.match(status, /400/, `${path} is a page, not a socket, got "${status}"`);
+    }
+    assert.equal(debug.requests.length, 0, "the debug port must not be reached");
   }));
 
 test("a browser WebSocket upgrade without a session is refused", () =>
@@ -918,6 +968,49 @@ test("the gateway's own origin passes, and so does a request that carries none",
       "only the allowed handshake may reach the debug port",
     );
   }));
+
+/**
+ * The TLS terminating proxy, which is a deployment the README recommends.
+ *
+ * The proxy terminates TLS and forwards plain http, so the browser sends an
+ * `https` Origin while the gateway's own origin, as it computes it from the
+ * socket, is `http`. The checked case above would refuse the panel there.
+ * ZCLOUDIUM_TRUST_PROXY is the flag that already means "a proxy I control is in
+ * front", so it is the one that says the https variant of this exact authority
+ * may pass. The authority still has to match exactly, and the flag off path is
+ * unchanged, which the hostile origin test above pins.
+ */
+test("behind a trusted proxy, an https Origin of this exact authority is accepted", () =>
+  withPanelGateway(
+    async ({ base, port, debug }) => {
+      const { session } = await completeSetup(base);
+      const host = `panel.example:${port}`;
+
+      const accepted = await rawGet(port, "/_browser/json/version", { host, origin: `https://${host}`, cookie: session });
+      assert.match(accepted.split("\r\n")[0], /200/, "the https variant of this exact authority is this gateway's frontend");
+      assert.match(accepted, /ws:\/\/panel\.example:\d+\/_browser\/devtools\/browser/, "and the document is rewritten to the host the browser used");
+
+      // The authority is still compared character for character.
+      for (const foreign of ["https://panel.example:3042", "https://panel.example", "https://evil.example", "https://127.0.0.1:3041"]) {
+        const response = await rawGet(port, "/_browser/json/version", { host, origin: foreign, cookie: session });
+        assert.match(response.split("\r\n")[0], /403/, `${foreign} must be refused, got "${response.split("\r\n")[0]}"`);
+        assert.equal(response.includes("webSocketDebuggerUrl"), false, `${foreign} must leak nothing`);
+      }
+
+      // The upgrade is the path that matters: it carries the control channel, and
+      // it is the one the panel itself opens.
+      const upgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host, origin: `https://${host}` });
+      assert.match(upgrade, /101/, `the frontend's own handshake must be allowed, got "${upgrade}"`);
+      const refusedUpgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host, origin: "https://evil.example" });
+      assert.match(refusedUpgrade, /403/, `a foreign https origin must not upgrade, got "${refusedUpgrade}"`);
+      assert.equal(
+        debug.requests.filter((request) => request.method === "UPGRADE").length,
+        1,
+        "only the accepted handshake may reach the debug port",
+      );
+    },
+    { trustProxy: true },
+  ));
 
 test("the application route keeps its own model: the origin check is the browser route's", () =>
   withPanelGateway(async ({ base }) => {
