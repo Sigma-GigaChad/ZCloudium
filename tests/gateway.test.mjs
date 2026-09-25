@@ -628,3 +628,230 @@ test("a backslash in next cannot turn a successful sign in into an open redirect
       assert.equal(step2.headers.get("location"), "/", `next=${next} must land on the root of this origin`);
     }
   }));
+
+/**
+ * Phase 0 of issue #5: the debug port behind the gateway.
+ *
+ * The panel hypothesis is that an authenticated operator can open Chromium's own
+ * DevTools frontend against the agent's page, through the gateway, with no panel
+ * code. These tests cover the gateway's half of that: the route, the refusal
+ * without a session, the path mapping, and the discovery documents that would
+ * otherwise send the frontend to 127.0.0.1.
+ */
+
+/** Stub of the browser debug port: discovery JSON, frontend assets, one upgrade. */
+async function startDebugStub() {
+  const requests = [];
+  const sockets = new Set();
+  let port = 0;
+  const server = createServer((req, res) => {
+    requests.push({ method: req.method, path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
+    const authority = `127.0.0.1:${port}`;
+    if (req.url.startsWith("/json/version")) {
+      const body = JSON.stringify({
+        Browser: "Chrome/153.0.8010.52",
+        webSocketDebuggerUrl: `ws://${authority}/devtools/browser/b1d98492`,
+      });
+      res.writeHead(200, { "content-type": "application/json; charset=UTF-8", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    if (req.url.startsWith("/json/list")) {
+      const body = JSON.stringify([
+        { id: "8B04", type: "page", url: "about:blank", webSocketDebuggerUrl: `ws://${authority}/devtools/page/8B04` },
+      ]);
+      res.writeHead(200, { "content-type": "application/json; charset=UTF-8", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    if (req.url.startsWith("/devtools/")) {
+      const body = "<!DOCTYPE html><html><title>DevTools</title></html>";
+      res.writeHead(200, { "content-type": "text/html", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("debug: not found");
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  server.on("upgrade", (req, socket) => {
+    requests.push({ method: "UPGRADE", path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
+    const accept = createHash("sha1")
+      .update(String(req.headers["sec-websocket-key"]) + WS_GUID)
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  port = server.address().port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    authority: `127.0.0.1:${port}`,
+    requests,
+    destroy: () => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      sockets.clear();
+    },
+  };
+}
+
+/** A gateway with a debug port behind it: the panel switch on. */
+async function withPanelGateway(run, options = {}) {
+  const debug = await startDebugStub();
+  try {
+    await withGateway((context) => run({ ...context, debug }), { debugUrl: debug.url, ...options });
+  } finally {
+    debug.destroy();
+  }
+}
+
+test("with the panel off, /_browser is ordinary application traffic", () =>
+  withGateway(async ({ base }) => {
+    const anonymous = await fetch(`${base}/_browser/json/version`, { redirect: "manual" });
+    assert.equal(anonymous.status, 302, "no session, so the login page, exactly like any other path");
+    assert.match(String(anonymous.headers.get("location")), /^\/_auth\/login/);
+
+    const { session } = await completeSetup(base);
+    const proxied = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
+    assert.equal(await proxied.text(), "UPSTREAM /_browser/json/version", "with the panel off it reaches the application, untouched");
+  }));
+
+test("an unauthenticated /_browser request is refused exactly like the rest of the gateway", () =>
+  withPanelGateway(async ({ base }) => {
+    for (const path of ["/_browser", "/_browser/", "/_browser/json/version", "/_browser/json/list", "/_browser/devtools/inspector.html"]) {
+      const response = await fetch(`${base}${path}`, { redirect: "manual" });
+      assert.equal(response.status, 302, `${path} must not be served without a session`);
+      assert.equal(response.headers.get("location"), `/_auth/login?next=${encodeURIComponent(path)}`, path);
+      const body = await response.text();
+      assert.equal(/webSocketDebuggerUrl|DevTools/.test(body), false, `${path} must leak nothing before authentication`);
+    }
+  }));
+
+test("the debug port is proxied behind the session, and the discovery JSON points back at the gateway", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    const response = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
+    assert.equal(response.status, 200);
+    assert.match(String(response.headers.get("content-type")), /application\/json/);
+
+    const body = await response.json();
+    assert.equal(body.Browser, "Chrome/153.0.8010.52", "the debug document must arrive intact");
+    assert.equal(
+      body.webSocketDebuggerUrl,
+      `ws://127.0.0.1:${port}/_browser/devtools/browser/b1d98492`,
+      "the frontend must be told to reach the gateway, not the loopback debug port",
+    );
+    assert.equal(JSON.stringify(body).includes(debug.authority), false, "the loopback authority must not survive the rewrite");
+    assert.equal(response.headers.get("cache-control"), "no-store", "a rewritten document is per origin and must not be cached");
+
+    const list = await fetch(`${base}/_browser/json/list`, { headers: { cookie: session } });
+    const targets = await list.json();
+    assert.equal(targets[0].webSocketDebuggerUrl, `ws://127.0.0.1:${port}/_browser/devtools/page/8B04`);
+    assert.equal(targets[0].id, "8B04");
+  }));
+
+test("the debug port is asked with the loopback Host it insists on", () =>
+  withPanelGateway(async ({ base, debug }) => {
+    const { session } = await completeSetup(base);
+    await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
+    const seen = debug.requests.at(-1);
+    assert.equal(seen.path, "/json/version", "the proxy prefix must be stripped, the rest kept");
+    assert.equal(seen.host, debug.authority, "Chromium answers 500 to any other Host, so the proxy must rewrite it");
+  }));
+
+test("the frontend assets and the query string cross the proxy untouched", () =>
+  withPanelGateway(async ({ base, debug }) => {
+    const { session } = await completeSetup(base);
+    const response = await fetch(`${base}/_browser/devtools/inspector.html?ws=panel.example/_browser/devtools/page/8B04`, {
+      headers: { cookie: session },
+    });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /DevTools/);
+    const seen = debug.requests.at(-1);
+    assert.equal(seen.path, "/devtools/inspector.html?ws=panel.example/_browser/devtools/page/8B04");
+
+    const root = await fetch(`${base}/_browser/`, { headers: { cookie: session } });
+    assert.equal(root.status, 404, "the prefix root maps to the debug root, and nothing is invented for it");
+  }));
+
+test("a browser WebSocket upgrade without a session is refused", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    await completeSetup(base);
+    const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", null);
+    assert.equal(/101/.test(status), false, `expected no upgrade, got "${status}"`);
+    assert.equal(debug.requests.some((request) => request.method === "UPGRADE"), false, "the debug port must not be reached at all");
+  }));
+
+test("with a session, the browser upgrade is proxied, without the Origin Chromium would reject", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", session);
+    assert.match(status, /101/, `expected a 101, got "${status}"`);
+    const upgrade = debug.requests.find((request) => request.method === "UPGRADE");
+    assert.ok(upgrade, "the debug port must have received the upgrade");
+    assert.equal(upgrade.path, "/devtools/page/8B04");
+    assert.equal(upgrade.host, debug.authority);
+    // Chromium refuses a WebSocket handshake carrying a foreign Origin, which is
+    // its defence against a page controlling its own browser. The gateway is the
+    // authenticated way in, so it strips the header instead of loosening Chrome.
+    assert.equal(upgrade.origin, null, "the operator browser's Origin must not reach the debug port");
+  }));
+
+test("an unauthenticated browser upgrade is refused before the debug port is touched", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    await completeSetup(base);
+    for (const path of ["/_browser", "/_browser/json/version", "/_browser/devtools/page/8B04"]) {
+      const status = await wsStatusLine(port, path, null);
+      assert.equal(/101/.test(status), false, path);
+    }
+    assert.equal(debug.requests.length, 0, "nothing may reach the debug port without a session");
+  }));
+
+/** Raw HTTP/1.1 request: the only way to send a Host header of one's choosing. */
+function rawGet(port, path, { host, cookie } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1", () => {
+      socket.write(
+        [`GET ${path} HTTP/1.1`, `Host: ${host}`, "Connection: close", ...(cookie ? [`Cookie: ${cookie}`] : []), "", ""].join(
+          "\r\n",
+        ),
+      );
+    });
+    let received = "";
+    socket.on("data", (chunk) => {
+      received += chunk.toString("latin1");
+    });
+    socket.on("end", () => resolve(received));
+    socket.on("error", reject);
+    setTimeout(() => {
+      socket.destroy();
+      resolve(received);
+    }, 3000).unref();
+  });
+}
+
+test("a Host header that is not an authority is refused, never echoed into the discovery document", () =>
+  withPanelGateway(async ({ base, port }) => {
+    const { session } = await completeSetup(base);
+    for (const hostile of ["evil.example/../x", "user:pass@host", "host name", "evil.example"]) {
+      const response = await rawGet(port, "/_browser/json/version", { host: hostile, cookie: session });
+      const [status] = response.split("\r\n");
+      if (hostile === "evil.example") {
+        // A plain hostname is a valid authority: it is rewritten like any other,
+        // and the frontend it is served to is the one that asked for it.
+        assert.match(status, /200/, hostile);
+        assert.match(response, /ws:\/\/evil\.example\/_browser\/devtools\/browser/, hostile);
+        continue;
+      }
+      assert.match(status, /400/, `${hostile} must be refused, got "${status}"`);
+      assert.equal(response.includes("ws://"), false, `nothing may be rewritten from ${hostile}`);
+    }
+  }));

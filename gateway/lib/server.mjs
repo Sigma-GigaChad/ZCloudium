@@ -8,6 +8,13 @@
 
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
+import {
+  classifyRoute,
+  debugPathFor,
+  isDiscoveryPath,
+  proxyAuthorityFor,
+  rewriteDiscovery,
+} from "./browser.mjs";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -153,6 +160,17 @@ export async function createGateway({
   sessionTtlMs = DEFAULT_SESSION_TTL_MS,
   maxBodyBytes = 64 * 1024,
   /**
+   * The browser debug endpoint, when there is one (Phase 0 of issue #5).
+   *
+   * With it set, `/_browser/...` is proxied to that port behind the session, and
+   * the discovery documents are rewritten so the DevTools frontend connects back
+   * through the gateway. Without it, the gateway does not know the browser exists:
+   * `/_browser/...` is ordinary application traffic, which is what makes the off
+   * switch total. It is only ever set to a port that is bound to loopback inside
+   * the container, never one published to the host.
+   */
+  debugUrl = null,
+  /**
    * Whether the rate limit key may be read from the x-forwarded-for header.
    *
    * Off by default, and that is the safe direction: a header a client can set is
@@ -176,6 +194,8 @@ export async function createGateway({
 
   const key = await loadOrCreateSessionKey(sessionKeyPath(dataDir));
   const target = new URL(upstreamUrl);
+  const browserEnabled = typeof debugUrl === "string" && debugUrl.trim() !== "";
+  const debug = browserEnabled ? new URL(debugUrl) : null;
   const failures = new Map();
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
@@ -480,6 +500,83 @@ export async function createGateway({
     req.pipe(upstream);
   }
 
+  /**
+   * The debug port, behind the session (Phase 0 of issue #5).
+   *
+   * Two things have to change on the way through, and both are Chromium's own
+   * defences rather than ours:
+   *
+   * - the Host header becomes the loopback authority, because Chromium answers
+   *   500 to any Host that is not an IP address or localhost;
+   * - the Origin header is dropped, because Chromium refuses a WebSocket
+   *   handshake carrying an Origin it did not generate.
+   *
+   * The discovery documents are the reason a proxy is needed at all: they name
+   * `ws://127.0.0.1:9222/...`, which only resolves on the machine the container
+   * runs on. They are rewritten to point back at the gateway origin the frontend
+   * was served from, which its own `connect-src 'self'` then allows.
+   */
+  function proxyBrowser(req, res, url) {
+    const authority = proxyAuthorityFor(req.headers.host);
+    if (authority === null) {
+      // The Host header ends up inside the document the frontend reads, so a
+      // value that is not an authority is refused rather than echoed.
+      logger(`[auth] refusing a browser request with an unusable Host header: ${JSON.stringify(req.headers.host)}`);
+      res.writeHead(400, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Bad request");
+      return;
+    }
+
+    const debugPathname = debugPathFor(url.pathname);
+    const upstream = httpRequest(
+      {
+        protocol: debug.protocol,
+        hostname: debug.hostname,
+        port: debug.port || 80,
+        method: req.method,
+        path: `${debugPathname}${url.search}`,
+        headers: debugHeaders(req),
+      },
+      (response) => {
+        const encoding = response.headers["content-encoding"];
+        if (!isDiscoveryPath(debugPathname) || (encoding && encoding !== "identity")) {
+          res.writeHead(response.statusCode ?? 502, response.headers);
+          response.pipe(res);
+          return;
+        }
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const rewritten = rewriteDiscovery(Buffer.concat(chunks).toString("utf8"), {
+            authority: debug.host,
+            proxyAuthority: authority,
+          });
+          res.writeHead(response.statusCode ?? 502, {
+            ...response.headers,
+            "content-length": Buffer.byteLength(rewritten),
+            "cache-control": "no-store",
+          });
+          res.end(rewritten);
+        });
+      },
+    );
+    upstream.on("error", (error) => {
+      logger(`[auth] browser upstream error: ${error.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "text/plain", "cache-control": "no-store" });
+      }
+      res.end("Bad gateway");
+    });
+    req.pipe(upstream);
+  }
+
+  /** The headers the debug port is asked with: loopback Host, no Origin. */
+  function debugHeaders(req) {
+    const headers = { ...req.headers, host: debug.host };
+    delete headers.origin;
+    return headers;
+  }
+
   function handleUpgrade(req, socket, head) {
     if (!sessionOf(req)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -487,13 +584,25 @@ export async function createGateway({
       return;
     }
 
-    const headers = { ...req.headers, host: target.host };
+    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    const browserRoute = classifyRoute(url.pathname, { browserEnabled }) === "browser";
+    if (browserRoute && proxyAuthorityFor(req.headers.host) === null) {
+      logger(`[auth] refusing a browser upgrade with an unusable Host header: ${JSON.stringify(req.headers.host)}`);
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const upstreamUrl = browserRoute ? debug : target;
+    const headers = browserRoute
+      ? debugHeaders(req)
+      : { ...req.headers, host: target.host };
     const upstream = httpRequest({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || 80,
+      protocol: upstreamUrl.protocol,
+      hostname: upstreamUrl.hostname,
+      port: upstreamUrl.port || 80,
       method: "GET",
-      path: req.url,
+      path: browserRoute ? `${debugPathFor(url.pathname)}${url.search}` : req.url,
       headers,
     });
 
@@ -533,20 +642,30 @@ export async function createGateway({
   }
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // The Host header is attacker controlled and is only used to build a base for
+    // a relative path, so a value that cannot be an authority falls back to a
+    // fixed one instead of throwing out of the request handler.
+    const rawUrl = req.url ?? "/";
+    let url;
+    try {
+      url = new URL(rawUrl, `http://${req.headers.host ?? "localhost"}`);
+    } catch {
+      url = new URL(rawUrl.startsWith("/") ? rawUrl : "/", "http://localhost");
+    }
     const pathname = url.pathname;
 
     const run = async () => {
-      if (pathname === `${AUTH_PREFIX}/health`) {
-        await handleAuth(req, res, url);
-        return;
-      }
-      if (pathname === AUTH_PREFIX || pathname.startsWith(`${AUTH_PREFIX}/`)) {
+      const route = classifyRoute(pathname, { browserEnabled });
+      if (route === "auth") {
         await handleAuth(req, res, url);
         return;
       }
       if (!sessionOf(req)) {
         redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(req.url ?? "/")}`);
+        return;
+      }
+      if (route === "browser") {
+        proxyBrowser(req, res, url);
         return;
       }
       proxy(req, res);
