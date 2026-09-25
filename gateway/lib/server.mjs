@@ -26,9 +26,8 @@ import {
 import { findUser, hasUsers, readUsers, sessionKeyPath, writeUsers } from "./store.mjs";
 import * as pages from "./pages.mjs";
 
-export const AUTH_PREFIX = "/_auth";
-export const DEFAULT_UPSTREAM = "http://127.0.0.1:3131";
-export const ISSUER = "ZCloudium";
+const AUTH_PREFIX = "/_auth";
+const ISSUER = "ZCloudium";
 
 const PENDING_TTL_SECONDS = 600;
 /**
@@ -146,7 +145,7 @@ export function safeNext(value) {
 }
 
 export async function createGateway({
-  upstreamUrl = DEFAULT_UPSTREAM,
+  upstreamUrl,
   dataDir,
   host = "127.0.0.1",
   port = 0,
@@ -170,6 +169,9 @@ export async function createGateway({
 } = {}) {
   if (!dataDir) {
     throw new Error("createGateway requires a dataDir");
+  }
+  if (!upstreamUrl) {
+    throw new Error("createGateway requires an upstreamUrl");
   }
 
   const key = await loadOrCreateSessionKey(sessionKeyPath(dataDir));
