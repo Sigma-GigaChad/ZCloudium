@@ -744,22 +744,41 @@ export async function createGateway({
     });
 
     /**
-     * The upstream answered a plain HTTP response instead of upgrading, which is
-     * what the debug port does when the target is not there any more (a tab closed
-     * under the operator, a target id a browser kept in its history). Passing that
-     * answer on is the difference between an error the operator can read and a
-     * socket that hangs until the browser gives up, so the status line, the headers
-     * and the body all travel back and the socket is then closed.
+     * The debug port answered a plain HTTP response instead of upgrading, which is
+     * what it does when the target is not there any more (a tab closed under the
+     * operator, a target id a browser kept in its history). Passing that answer on
+     * is the difference between an error the operator can read and a socket that
+     * hangs until the browser gives up, so the status line, the headers and the body
+     * all travel back and the socket is then closed.
+     *
+     * Scoped to the browser route on purpose. The application's own upgrade path is
+     * not this gateway's to change: with the panel off, and on every path that is
+     * not `/_browser/...` with it on, an answer the runtime gives to an upgrade is
+     * left exactly where it was, which is what keeps "off means unchanged" true of
+     * the application's WebSocket.
      */
-    upstream.on("response", (response) => {
-      const lines = [`HTTP/1.1 ${response.statusCode} ${response.statusMessage ?? ""}`.trim()];
-      for (let index = 0; index < response.rawHeaders.length; index += 2) {
-        lines.push(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}`);
-      }
-      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-      response.pipe(socket);
-      response.on("end", () => socket.end());
-    });
+    if (browserRoute) {
+      upstream.on("response", (response) => {
+        const lines = [`HTTP/1.1 ${response.statusCode} ${response.statusMessage ?? ""}`.trim()];
+        for (let index = 0; index < response.rawHeaders.length; index += 2) {
+          lines.push(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}`);
+        }
+        socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+        // The same guard as the handshake path, and for the same reason: the
+        // operator can go away in the middle of the body, and an unhandled reset on
+        // either side of the relay is an uncaught error that would take the gateway
+        // down with it.
+        const drop = () => {
+          response.destroy();
+          socket.destroy();
+        };
+        socket.on("error", drop);
+        socket.on("close", drop);
+        response.on("error", drop);
+        response.pipe(socket);
+        response.on("end", () => socket.end());
+      });
+    }
 
     upstream.on("error", (error) => {
       logger(`[auth] upgrade error: ${error.message}`);
@@ -809,6 +828,23 @@ export async function createGateway({
 
   server.on("upgrade", handleUpgrade);
 
+  /**
+   * Every socket the server accepted, tracked here rather than trusted to Node.
+   *
+   * `server.closeAllConnections()` is not enough for this gateway: when a request
+   * is upgraded, Node stops tracking that socket as a connection, so a socket that
+   * was never read (an upgrade the gateway answers with nothing, which is what an
+   * application route does when the runtime answers with a page instead of a
+   * handshake) stays open, keeps `server.close()` from ever resolving, and would
+   * hold a container's graceful shutdown until the SIGKILL. Destroying what was
+   * accepted here covers it.
+   */
+  const connections = new Set();
+  server.on("connection", (socket) => {
+    connections.add(socket);
+    socket.on("close", () => connections.delete(socket));
+  });
+
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
@@ -828,6 +864,10 @@ export async function createGateway({
           socket.destroy();
         }
         upgradedSockets.clear();
+        for (const socket of connections) {
+          socket.destroy();
+        }
+        connections.clear();
         server.closeAllConnections?.();
         server.close(() => resolve());
       }),

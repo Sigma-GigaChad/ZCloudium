@@ -37,6 +37,13 @@ async function startUpstream() {
     socket.on("close", () => sockets.delete(socket));
   });
   server.on("upgrade", (req, socket) => {
+    if (req.url.includes("GONE")) {
+      // What an application runtime may answer to an upgrade: a plain HTTP
+      // response, no handshake.
+      const body = "the runtime answers this upgrade with a page";
+      socket.write(`HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: ${body.length}\r\n\r\n${body}`);
+      return;
+    }
     const accept = createHash("sha1")
       .update(String(req.headers["sec-websocket-key"]) + WS_GUID)
       .digest("base64");
@@ -677,6 +684,9 @@ async function startDebugStub() {
   server.on("connection", (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
+    // A test that provokes a reset mid-answer makes this side see the reset, which
+    // is the point of the test: the stub must not turn it into an uncaught error.
+    socket.on("error", () => sockets.delete(socket));
   });
   server.on("upgrade", (req, socket) => {
     requests.push({ method: "UPGRADE", path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
@@ -685,6 +695,13 @@ async function startDebugStub() {
       // plain HTTP answer instead of a handshake.
       const body = "no such target";
       socket.write(`HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: ${body.length}\r\n\r\n${body}`);
+      return;
+    }
+    if (req.url.includes("BIG")) {
+      // An answer whose body is still being written when the operator goes away.
+      const body = "x".repeat(64 * 1024);
+      socket.write(`HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: ${body.length * 4}\r\n\r\n`);
+      socket.write(body);
       return;
     }
     const accept = createHash("sha1")
@@ -1013,7 +1030,10 @@ test("behind a trusted proxy, an https Origin of this exact authority is accepte
       const proxiedUpgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host: "panel.example:443", origin: "https://panel.example" });
       assert.match(proxiedUpgrade, /101/, `the panel's own handshake must be allowed through that spelling too, got "${proxiedUpgrade}"`);
 
-      // The authority is still compared character for character.
+      // After normalisation the authority is still compared as a whole: the port
+      // matters when it is not the scheme's default, and the name always does. The
+      // first entry here is the trap the normalisation could have opened, since
+      // `panel.example:3042` and `panel.example:443` differ only in the port.
       for (const foreign of ["https://panel.example:3042", "https://panel.example", "https://evil.example", "https://127.0.0.1:3041"]) {
         const response = await rawGet(port, "/_browser/json/version", { host, origin: foreign, cookie: session });
         assert.match(response.split("\r\n")[0], /403/, `${foreign} must be refused, got "${response.split("\r\n")[0]}"`);
@@ -1050,6 +1070,69 @@ test("an upgrade the debug port answers with an HTTP response does not hang the 
       1,
       "the debug port must have been asked, and asked once",
     );
+  }));
+
+test("the application upgrade path is not the browser route, and its answer is not relayed", () =>
+  withPanelGateway(async ({ base, port }) => {
+    const { session } = await completeSetup(base);
+    // The panel is on, so a browser route exists, and `/ws/GONE` is not one: the
+    // runtime's answer to an upgrade must stay where it was, unrelayed, which is
+    // the behaviour before the panel existed and the one the switch must not
+    // change on any other path.
+    const status = await wsStatusLine(port, "/ws/GONE", session);
+    assert.equal(status, "TIMEOUT", `the application path must behave exactly as before, got "${status}"`);
+  }));
+
+test("with the panel off, an application upgrade is untouched", () =>
+  withGateway(async ({ base, port }) => {
+    const { session } = await completeSetup(base);
+    const status = await wsStatusLine(port, "/ws/GONE", session);
+    assert.equal(status, "TIMEOUT", `with the panel off nothing may change on an application path, got "${status}"`);
+  }));
+
+test("an operator that resets in the middle of a relayed answer does not take the gateway with it", () =>
+  withPanelGateway(async ({ base, port }) => {
+    const { session } = await completeSetup(base);
+    // The debug port is streaming a body, the operator's tab closes: the gateway
+    // must survive the reset and keep answering.
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      const client = connect(port, "127.0.0.1", () => {
+        client.write(
+          [
+            "GET /_browser/devtools/page/BIG HTTP/1.1",
+            `Host: 127.0.0.1:${port}`,
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version: 13",
+            `Cookie: ${session}`,
+            "",
+            "",
+          ].join("\r\n"),
+        );
+      });
+      // A reset after the client is gone is what this test provokes, so an error
+      // here is expected and not a failure.
+      client.on("error", finish);
+      client.on("data", () => {
+        client.destroy();
+        finish();
+      });
+      setTimeout(() => {
+        client.destroy();
+        finish();
+      }, 5000).unref();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const health = await fetch(`${base}/_auth/health`);
+    assert.equal(health.status, 200, "the gateway must still answer after an operator reset mid-answer");
   }));
 
 test("the application route keeps its own model: the origin check is the browser route's", () =>
