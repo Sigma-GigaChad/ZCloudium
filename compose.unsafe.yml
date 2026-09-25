@@ -21,8 +21,17 @@
 # still gates WHO reaches it; it does not limit WHAT the authenticated agent
 # can do, which is everything.
 #
-# Three values to adapt: the published port, and the two /host/home/<user>
-# paths (they must all three point at the same home).
+# Three values to adapt: the published port, the user name in the /host/home
+# paths, and the same workspace path. The path appears three times in the
+# environment block below (HOME, ZCODE_DATA_BASE_DIR, ZCODE_SERVER_WORKSPACE)
+# and they must agree: HOME is where the agent finds your ~/.zcode, and
+# ZCODE_SERVER_WORKSPACE is the directory the agent works in.
+#
+# The workspace is not a command line argument any more: the image entrypoint
+# builds the runtime arguments from these variables, so an old `command:` block
+# copied from a previous version is ignored (and on this profile it would leave
+# the agent in /workspace, which is not mounted here and dies with the
+# container).
 
 services:
   z-cloudium:
@@ -53,6 +62,12 @@ services:
       # commands are read from there (copy your ~/.zcode over first).
       HOME: /host/home/delta
       ZCODE_DATA_BASE_DIR: /host/home/delta
+      # The directory the agent works in, which is the point of this profile: the
+      # machine's home, not a path inside the container. Without this line the
+      # image default (/workspace) would win, and /workspace is not mounted here,
+      # so the agent's work would land in the container's own filesystem and die
+      # with it.
+      ZCODE_SERVER_WORKSPACE: /host/home/delta
       ZCODE_MODEL_TELEMETRY_ENABLED: "0"
 
       # git refuses repositories owned by another uid ("dubious ownership").
@@ -75,16 +90,13 @@ services:
     mem_limit: 8g
     cpus: 4
 
-    command:
-      - --web
-      - --host=0.0.0.0
-      - --port=3030
-      - --workspace=/host/home/delta
-      - --no-open
-      # The gateway (password plus TOTP) still gates the port. Removing
-      # --no-token instead would add a token on top, never remove the gateway
-      # here: on this profile an unauthenticated port is the machine.
-      - --no-token
+    # No `command:` block, deliberately. The entrypoint builds the runtime
+    # arguments itself (loopback, --no-open, --no-token) from the addresses and
+    # the workspace it is given through the environment above, and it logs a
+    # warning and ignores anything a command block would append. The gateway
+    # (password plus TOTP) gates the published port whatever the runtime is
+    # asked to do, so ZCLOUDIUM_AUTH=off is the only thing that would remove it,
+    # and on this profile an unauthenticated port is the machine.
 
 volumes:
   z-cloudium-data:
