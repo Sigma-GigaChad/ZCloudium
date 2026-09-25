@@ -97,3 +97,72 @@ jobs:
         if: always()
         working-directory: e2e/scripts
         run: bash ./stop-container.sh "$PREFIX"
+
+  # The same suite again, against a container started with the browser panel on.
+  #
+  # The panel is off by default, and the run above is the proof that off means
+  # unchanged. This job is the other half: the panel specs of the suite skip when
+  # the container has no browser, so without a job like this one the panel wiring
+  # at the image level (Chromium launched on loopback, the agent attached to it,
+  # `/_browser/` served behind the session, the viewport control, and the
+  # detach and reattach continuity check) would be covered by nothing but a
+  # report. It runs in parallel with the job above, on its own runner, so the
+  # wall clock does not double.
+  playwright-panel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PORT: "3033"
+      PREFIX: zcloudium-e2e-ci-panel
+      E2E_PANEL: "on"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install the suite
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install the browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Start the container with the panel on
+        working-directory: e2e/scripts
+        run: bash ./start-container.sh "$IMAGE" "$PORT" "$PREFIX"
+
+      - name: Run the suite against the panel container
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://127.0.0.1:${{ env.PORT }}
+        run: npx playwright test
+
+      - name: Upload the report and the traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-panel
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7
+
+      - name: Stop the container
+        if: always()
+        working-directory: e2e/scripts
+        run: bash ./stop-container.sh "$PREFIX"

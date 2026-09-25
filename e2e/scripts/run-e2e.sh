@@ -10,6 +10,14 @@
 # KEEP=1 leaves the container running after the suite, which is what to use when
 # a failure needs looking at by hand: the report says which port it is on.
 #
+# E2E_PANEL=on starts the container with ZCLOUDIUM_BROWSER_PANEL=on, which is what
+# the panel specs of the suite need; without it they skip with a reason. Run the
+# suite twice to cover both positions of the switch, with two ports and two
+# prefixes:
+#
+#   ./run-e2e.sh zcloudium:latest 3032 zcloudium-e2e-pw
+#   E2E_PANEL=on ./run-e2e.sh zcloudium:latest 3033 zcloudium-e2e-pw-panel
+#
 # The suite is not installed by this script: run `npm ci` in e2e/ first, and
 # `npx playwright install --with-deps chromium` once per machine.
 
