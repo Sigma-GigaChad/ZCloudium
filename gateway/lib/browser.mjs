@@ -20,6 +20,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { readlink, rm } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 
 /** The Chromium installed in the image, the one the MCP server drives today. */
@@ -155,6 +157,64 @@ export async function waitForBrowser({
   return { reachable: false, attempts };
 }
 
+/**
+ * Chromium's profile lock, which is a symlink named `<hostname>-<pid>`, plus the
+ * two files it creates next to it.
+ */
+export const SINGLETON_FILES = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+
+/**
+ * Whether a `SingletonLock` was left by another container.
+ *
+ * Chromium refuses to start when the lock names a machine it is not, because it
+ * cannot check whether that process is alive. A container that was killed rather
+ * than stopped leaves exactly that in the data volume, and the next start then
+ * falls back to the browser the agent launches itself, with the panel silently
+ * off. When the lock names this machine, Chromium can check for itself and is
+ * left to do it.
+ */
+export function isStaleSingletonLock(linkTarget, { hostname: current = hostname() } = {}) {
+  if (typeof linkTarget !== "string") {
+    return false;
+  }
+  const match = linkTarget.match(/^(.*)-(\d+)$/);
+  if (!match) {
+    return false;
+  }
+  return match[1] !== current;
+}
+
+/**
+ * Releases a stale profile lock before the browser starts.
+ *
+ * Only the three files Chromium itself names are ever removed, and only when the
+ * lock points at another machine. The profile content, which holds the agent's
+ * logins, is untouched.
+ */
+export async function prepareBrowserProfile(
+  userDataDir,
+  { hostname: current = hostname(), readlinkFn = readlink, removeFn = (path) => rm(path, { force: true }), logger = () => {} } = {},
+) {
+  let target;
+  try {
+    target = await readlinkFn(join(userDataDir, "SingletonLock"));
+  } catch {
+    // Nothing locked, no profile yet, or something that is not a symlink: none of
+    // those is ours to clean up.
+    return { status: "no-lock" };
+  }
+  if (!isStaleSingletonLock(target, { hostname: current })) {
+    return { status: "kept", target };
+  }
+  for (const name of SINGLETON_FILES) {
+    await removeFn(join(userDataDir, name));
+  }
+  logger(
+    `[start] unlocked the browser profile: ${join(userDataDir, "SingletonLock")} was left by another container (${target})`,
+  );
+  return { status: "unlocked", target };
+}
+
 /** Spawns Chromium and reports its exit, so the entrypoint can say so in the logs. */
 export function launchBrowser({
   args,
@@ -266,8 +326,8 @@ export function rewriteDiscovery(body, { authority, proxyAuthority } = {}) {
   return body.split(authority).join(proxyAuthority);
 }
 
-/** The Host header, as an authority a URL may be built from, or null. */
-export function proxyAuthorityFor(host, prefix = BROWSER_PREFIX) {
+/** The Host header as an authority a URL may be built from, or null. */
+export function hostAuthority(host) {
   if (typeof host !== "string") {
     return null;
   }
@@ -278,5 +338,58 @@ export function proxyAuthorityFor(host, prefix = BROWSER_PREFIX) {
   if (!/^[A-Za-z0-9._-]+(:\d+)?$/.test(value) && !/^\[[0-9A-Fa-f:]+\](:\d+)?$/.test(value)) {
     return null;
   }
-  return `${value}${prefix}`;
+  return value;
+}
+
+/** The gateway's own host and path, as it appears inside the rewritten documents. */
+export function proxyAuthorityFor(host, prefix = BROWSER_PREFIX) {
+  const authority = hostAuthority(host);
+  return authority === null ? null : `${authority}${prefix}`;
+}
+
+/** A string that is exactly an origin, or null. Anything with a path is not one. */
+function strictOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === value ? parsed.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a request that a browser context made may use the browser route.
+ *
+ * Why the gateway carries this check, and not Chromium. The debug port is a
+ * control channel for a browser that holds the agent's sessions, so "this request
+ * has a session cookie" is not enough to open it: every other service on the
+ * operator's loopback is same-site, so a page served by one of them arrives with
+ * that cookie attached (SameSite=Lax counts loopback to loopback as same-site).
+ * If the gateway then passed the request on and deleted the Origin, the browser
+ * would have nothing left to refuse it with, and that page would own the agent's
+ * browser. So the check lives here, at the authenticated boundary.
+ *
+ * Upstream, the Origin is still removed, because Chromium refuses any origin it
+ * did not generate and the request by then comes from the gateway, not from the
+ * page. The alternative, `--remote-allow-origins`, is the wrong layer: it would
+ * name trusted origins inside the browser and leave every page of those origins
+ * able to reach the debug port, while this check only lets through what arrived
+ * at this gateway as its own frontend.
+ *
+ * A request with no Origin is a client that is not a browser page (the MCP
+ * server, curl, the harness), and there is no page context to judge.
+ */
+export function isAcceptableOrigin(origin, host, { secure = false } = {}) {
+  if (origin === undefined || origin === null || String(origin).trim() === "") {
+    return true;
+  }
+  const authority = hostAuthority(host);
+  if (authority === null) {
+    // Without a usable host there is no own origin to compare against, so a
+    // request that came from a page is refused rather than waved through.
+    return false;
+  }
+  const own = strictOrigin(`${secure ? "https" : "http"}://${authority}`);
+  const theirs = strictOrigin(String(origin).trim());
+  return own !== null && theirs !== null && theirs === own;
 }

@@ -15,6 +15,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   BROWSER_DEBUG_ADDRESS,
   BROWSER_DEBUG_PORT,
@@ -27,10 +30,13 @@ import {
   classifyRoute,
   debugAuthority,
   debugPathFor,
+  isAcceptableOrigin,
   isDiscoveryPath,
+  isStaleSingletonLock,
   launchBrowser,
   parseBrowserDebugPort,
   parseBrowserPanel,
+  prepareBrowserProfile,
   proxyAuthorityFor,
   resolveBrowserMode,
   rewriteDiscovery,
@@ -221,6 +227,97 @@ test("the proxied authority comes from the Host header, and nothing else", () =>
   // newline, a userinfo section or a scheme to the document the frontend reads.
   for (const hostile of [undefined, null, "", "   ", "evil.example/../x", "evil.example x", "user:pass@host", "host\nSet-Cookie: x", "host/", "http://host"]) {
     assert.equal(proxyAuthorityFor(hostile), null, JSON.stringify(hostile));
+  }
+});
+
+/**
+ * The Origin check for the browser route.
+ *
+ * The debug port is a control channel for a browser that holds the agent's
+ * sessions. A session cookie is not enough to open it: any other service on the
+ * operator's loopback is same-site, so its cookies are attached, and without an
+ * Origin check a page served by one of those services could take the browser
+ * over. The check is therefore on the gateway, and the browser's own guard stays
+ * closed behind it.
+ */
+test("a request from another origin is refused, and one from this origin is not", () => {
+  const host = "127.0.0.1:3041";
+  assert.equal(isAcceptableOrigin("http://127.0.0.1:3041", host), true, "the frontend served here is this origin");
+  assert.equal(isAcceptableOrigin("http://127.0.0.1:3041", "panel.example:3041"), false, "another name is another origin");
+  assert.equal(isAcceptableOrigin("http://127.0.0.1:3038", host), false, "another service on loopback is another origin");
+  assert.equal(isAcceptableOrigin("https://127.0.0.1:3041", host), false, "another scheme is another origin");
+  assert.equal(isAcceptableOrigin("https://127.0.0.1:3041", host, { secure: true }), true);
+  assert.equal(isAcceptableOrigin("http://127.0.0.1:3041", host, { secure: true }), false);
+  assert.equal(isAcceptableOrigin("http://evil.example", host), false);
+});
+
+test("an absent Origin is allowed, because only a browser context sends one", () => {
+  for (const absent of [undefined, null, "", "   "]) {
+    assert.equal(isAcceptableOrigin(absent, "127.0.0.1:3041"), true, JSON.stringify(absent));
+  }
+});
+
+test("an Origin that is not a plain origin is refused, and a broken Host refuses everything", () => {
+  const host = "127.0.0.1:3041";
+  for (const odd of ["null", "http://127.0.0.1:3041/", "http://127.0.0.1:3041?x=1", "not an origin", "127.0.0.1:3041"]) {
+    assert.equal(isAcceptableOrigin(odd, host), false, odd);
+  }
+  for (const brokenHost of [undefined, null, "", "   ", "host name", "user:pass@host"]) {
+    assert.equal(isAcceptableOrigin("http://127.0.0.1:3041", brokenHost), false, `host ${JSON.stringify(brokenHost)}`);
+    assert.equal(isAcceptableOrigin(undefined, brokenHost), true, "with no Origin there is no browser context to judge");
+  }
+});
+
+/**
+ * The profile lock Chromium leaves behind.
+ *
+ * Chromium refuses to start on a profile whose `SingletonLock` names another
+ * machine: that is what a container that was removed while running leaves in the
+ * data volume, and it made the panel fall back to the launch shape on the next
+ * start until the lock was removed by hand. The lock is a symlink named
+ * `<hostname>-<pid>`, so a lock from another container is stale by construction.
+ */
+test("a profile lock left by another container is recognised as stale", () => {
+  assert.equal(isStaleSingletonLock("6a9023f985d6-14", { hostname: "6a9023f985d6" }), false, "our own browser");
+  assert.equal(isStaleSingletonLock("ee00d4e93237-14", { hostname: "6a9023f985d6" }), true, "a previous container");
+  assert.equal(isStaleSingletonLock(`${hostname()}-1234`), false, "the default hostname is this one");
+  assert.equal(isStaleSingletonLock("ee00d4e93237-14"), true);
+  for (const odd of [undefined, null, "", "no-pid", "host-not-a-number", "/tmp/org.chromium.Chromium/SingletonSocket", 42]) {
+    assert.equal(isStaleSingletonLock(odd, { hostname: "6a9023f985d6" }), false, `${JSON.stringify(odd)} must be left alone`);
+  }
+});
+
+test("a stale lock is released, our own is left alone, and the profile content survives", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zcloudium-profile-"));
+  const profile = join(root, "browser-profile");
+  try {
+    await mkdir(profile);
+    await writeFile(join(profile, "Preferences"), "the operator's cookies live around here");
+    for (const name of ["SingletonSocket", "SingletonCookie"]) {
+      await writeFile(join(profile, name), "");
+    }
+    await symlink("ee00d4e93237-14", join(profile, "SingletonLock"));
+
+    const logs = [];
+    const released = await prepareBrowserProfile(profile, { hostname: "6a9023f985d6", logger: (line) => logs.push(line) });
+    assert.equal(released.status, "unlocked");
+    assert.equal(released.target, "ee00d4e93237-14");
+    assert.deepEqual((await readdir(profile)).sort(), ["Preferences"], "only the lock files may go");
+    assert.equal(logs.some((line) => /ee00d4e93237-14/.test(line)), true, "the unlock must be reported");
+
+    await symlink("6a9023f985d6-14", join(profile, "SingletonLock"));
+    const kept = await prepareBrowserProfile(profile, { hostname: "6a9023f985d6" });
+    assert.equal(kept.status, "kept", "a lock naming this container may be a browser that is still running");
+    assert.equal((await readdir(profile)).includes("SingletonLock"), true);
+
+    // Nothing to unlock, and nothing that is not a symlink is ever removed.
+    await rm(join(profile, "SingletonLock"));
+    assert.equal((await prepareBrowserProfile(profile, { hostname: "6a9023f985d6" })).status, "no-lock");
+    await writeFile(join(profile, "SingletonLock"), "not a symlink");
+    assert.equal((await prepareBrowserProfile(profile, { hostname: "6a9023f985d6" })).status, "no-lock");
+    assert.equal((await readdir(profile)).includes("SingletonLock"), true, "an unknown file is never deleted");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

@@ -352,17 +352,18 @@ test("the requested path survives the login round trip", () =>
   }));
 
 /** Performs the raw WebSocket handshake and returns the status line. */
-function wsStatusLine(port, path, cookie) {
+function wsStatusLine(port, path, cookie, { host, origin } = {}) {
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1", () => {
       const key = randomBytes(16).toString("base64");
       const request = [
         `GET ${path} HTTP/1.1`,
-        `Host: 127.0.0.1:${port}`,
+        `Host: ${host ?? `127.0.0.1:${port}`}`,
         "Upgrade: websocket",
         "Connection: Upgrade",
         `Sec-WebSocket-Key: ${key}`,
         "Sec-WebSocket-Version: 13",
+        ...(origin === undefined ? [] : [`Origin: ${origin}`]),
         ...(cookie ? [`Cookie: ${cookie}`] : []),
         "",
         "",
@@ -815,14 +816,20 @@ test("an unauthenticated browser upgrade is refused before the debug port is tou
     assert.equal(debug.requests.length, 0, "nothing may reach the debug port without a session");
   }));
 
-/** Raw HTTP/1.1 request: the only way to send a Host header of one's choosing. */
-function rawGet(port, path, { host, cookie } = {}) {
+/** Raw HTTP/1.1 request: the only way to send a Host or an Origin of one's choosing. */
+function rawGet(port, path, { host, cookie, origin } = {}) {
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1", () => {
       socket.write(
-        [`GET ${path} HTTP/1.1`, `Host: ${host}`, "Connection: close", ...(cookie ? [`Cookie: ${cookie}`] : []), "", ""].join(
-          "\r\n",
-        ),
+        [
+          `GET ${path} HTTP/1.1`,
+          `Host: ${host}`,
+          "Connection: close",
+          ...(origin === undefined ? [] : [`Origin: ${origin}`]),
+          ...(cookie ? [`Cookie: ${cookie}`] : []),
+          "",
+          "",
+        ].join("\r\n"),
       );
     });
     let received = "";
@@ -854,4 +861,84 @@ test("a Host header that is not an authority is refused, never echoed into the d
       assert.match(status, /400/, `${hostile} must be refused, got "${status}"`);
       assert.equal(response.includes("ws://"), false, `nothing may be rewritten from ${hostile}`);
     }
+  }));
+
+/**
+ * The Origin check, which is the difference between "a session is required" and
+ * "a session is enough".
+ *
+ * Any other service on the operator's loopback is same-site, so a page served by
+ * one of them arrives with the gateway session cookie attached. Without this
+ * check that page could open the browser route, and the gateway would then delete
+ * the Origin that Chromium uses to refuse a handshake it did not generate, which
+ * is what hands the whole browser over. The check belongs to the gateway because
+ * the gateway is the authenticated boundary; the strip upstream stays, because
+ * Chromium refuses any origin at all on that hop.
+ */
+test("a hostile Origin is refused on the browser route, with a session", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+
+    // The session is checked first, as on every other path: without one there is
+    // no browser route, whatever the Origin says.
+    const anonymous = await rawGet(port, "/_browser/json/version", { host: `127.0.0.1:${port}`, origin: "http://127.0.0.1:3038" });
+    assert.match(anonymous.split("\r\n")[0], /302/, "no session means the sign in page, before any origin rule");
+
+    for (const hostile of ["http://127.0.0.1:3038", "http://127.0.0.1:3030", "http://evil.example", `https://127.0.0.1:${port}`, "null"]) {
+      for (const path of ["/_browser", "/_browser/json/version", "/_browser/json/list", "/_browser/devtools/inspector.html"]) {
+        const response = await rawGet(port, path, { host: `127.0.0.1:${port}`, origin: hostile, cookie: session });
+        assert.match(response.split("\r\n")[0], /403/, `${path} from ${hostile} must be refused, got "${response.split("\r\n")[0]}"`);
+        assert.equal(response.includes("webSocketDebuggerUrl"), false, `${path} from ${hostile} must leak nothing`);
+      }
+    }
+    assert.equal(debug.requests.length, 0, "the debug port must not be reached at all");
+  }));
+
+test("the gateway's own origin passes, and so does a request that carries none", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    const own = await rawGet(port, "/_browser/json/version", { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, cookie: session });
+    assert.match(own.split("\r\n")[0], /200/, "the frontend served by this gateway is this origin");
+    assert.match(own, /ws:\/\/127\.0\.0\.1:\d+\/_browser\/devtools\/browser/, "and the document is still rewritten");
+
+    const absent = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
+    assert.equal(absent.status, 200, "a client that is not a page sends no Origin, and keeps working");
+
+    // A real browser sends an Origin on a WebSocket handshake, so the upgrade is
+    // checked too: this one is refused, the one below is not.
+    const refused = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { origin: `http://127.0.0.1:3038` });
+    assert.equal(/101/.test(refused), false, `a foreign origin must not upgrade, got "${refused}"`);
+    assert.match(refused, /403/);
+
+    const allowed = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { origin: `http://127.0.0.1:${port}` });
+    assert.match(allowed, /101/, `this origin must upgrade, got "${allowed}"`);
+    assert.equal(
+      debug.requests.filter((request) => request.method === "UPGRADE").length,
+      1,
+      "only the allowed handshake may reach the debug port",
+    );
+  }));
+
+test("the application route keeps its own model: the origin check is the browser route's", () =>
+  withPanelGateway(async ({ base }) => {
+    const { session } = await completeSetup(base);
+    // Deliberate scope. The application's upstream decides what it accepts, and
+    // with the switch off the gateway must behave exactly as it did before the
+    // panel existed, so no Origin rule is imposed on the application path here.
+    const response = await fetch(`${base}/api/server-info`, {
+      headers: { cookie: session, origin: "http://evil.example" },
+    });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /^UPSTREAM \/api\/server-info$/);
+  }));
+
+test("a browser upgrade with an unusable Host is refused, not thrown out of the listener", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    for (const hostile of ["", "   ", "host name", "user:pass@host", "evil.example/../x"]) {
+      const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host: hostile, origin: `http://127.0.0.1:${port}` });
+      assert.notEqual(status, "TIMEOUT", `${JSON.stringify(hostile)} must get an answer, not a hung socket`);
+      assert.match(status, /400/, `${JSON.stringify(hostile)} must be refused, got "${status}"`);
+    }
+    assert.equal(debug.requests.length, 0, "the debug port must not be reached");
   }));

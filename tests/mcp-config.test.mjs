@@ -13,11 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BROWSER_EXECUTABLE } from "../gateway/lib/browser.mjs";
 import {
-  BROWSER_MCP_ARGS,
   BROWSER_MCP_COMMAND,
   BROWSER_MCP_EXECUTABLE,
   BROWSER_MCP_PACKAGE,
-  BROWSER_MCP_TIMEOUT_MS,
   BROWSER_MCP_VERSION,
   BROWSER_SERVER_NAME,
   applyBrowserMcp,
@@ -95,29 +93,33 @@ test("the attach shape connects to the running browser instead of launching one"
   assert.equal(entry.type, "stdio");
   assert.equal(entry.command, BROWSER_MCP_COMMAND);
   assert.equal(entry.enabled, true);
-  assert.equal(entry.args.includes("--browserUrl"), true);
-  assert.equal(entry.args[entry.args.indexOf("--browserUrl") + 1], "http://127.0.0.1:9222");
-  // Attaching means the browser is not ours to launch: none of the launch
-  // arguments may survive, or the server would start a second browser and the
-  // agent would drive a page nobody is watching.
-  assert.equal(entry.args.includes("--executablePath"), false, "attaching must not name a browser to launch");
-  assert.equal(entry.args.includes("--isolated"), false, "attaching must not create a throwaway profile");
-  assert.equal(entry.args.includes("--headless"), false, "the browser's mode is the launcher's decision, not the attacher's");
-  assert.equal(JSON.stringify(entry).includes("--no-sandbox"), false, "no browser is launched, so there is nothing to pass it to");
-  assert.equal(entry.args.includes("--no-usage-statistics"), true, "no telemetry in either shape");
-  assert.equal(entry.args.includes("--no-performance-crux"), true, "no telemetry in either shape");
+  assert.equal(entry.timeoutMs, 60_000);
+  // Literals, not the module's own constants: this list is what the agent runs
+  // when the panel is on, and a test built from the same constants would follow
+  // them anywhere.
+  assert.deepEqual(entry.args, ["--browserUrl", "http://127.0.0.1:9222", "--no-usage-statistics", "--no-performance-crux"]);
 });
 
 test("without a browser url the entry is exactly the one the image shipped before", () => {
   for (const empty of [undefined, null, "", "   "]) {
     assert.deepEqual(browserServerEntry({ browserUrl: empty }), browserServerEntry(), `browserUrl=${JSON.stringify(empty)}`);
   }
+  // The launch shape, as literals, for the same reason: every claim that the
+  // switch being off changes nothing observable rests on this exact list.
   assert.deepEqual(browserServerEntry(), {
     type: "stdio",
-    command: BROWSER_MCP_COMMAND,
-    args: [...BROWSER_MCP_ARGS],
+    command: "/usr/local/bin/chrome-devtools-mcp",
+    args: [
+      "--headless",
+      "--isolated",
+      "--executablePath",
+      "/usr/bin/chromium",
+      "--chromeArg=--no-sandbox",
+      "--no-usage-statistics",
+      "--no-performance-crux",
+    ],
     enabled: true,
-    timeoutMs: BROWSER_MCP_TIMEOUT_MS,
+    timeoutMs: 60_000,
   });
 });
 

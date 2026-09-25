@@ -23,6 +23,7 @@ import {
   launchBrowser,
   parseBrowserDebugPort,
   parseBrowserPanel,
+  prepareBrowserProfile,
   resolveBrowserMode,
   stopBrowser,
   waitForBrowser,
@@ -192,6 +193,7 @@ export async function start({
   launchBrowserFn = launchBrowser,
   probeBrowserFn = waitForBrowser,
   stopBrowserFn = stopBrowser,
+  prepareProfileFn = prepareBrowserProfile,
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
@@ -278,6 +280,18 @@ export async function start({
     );
   } else if (config.browserPanel) {
     const profile = browserProfileDir(config.dataDir);
+    // Before the browser starts: a container that was killed rather than stopped
+    // leaves a lock naming another machine, and Chromium refuses to start on it.
+    // Failing to unlock is reported and the browser is still launched, so the
+    // fallback covers it.
+    try {
+      const prepared = await prepareProfileFn(profile, { logger });
+      if (prepared.status === "unlocked") {
+        logger(`[start] browser profile prepared: released a lock from ${prepared.target}`);
+      }
+    } catch (error) {
+      logger(`[start] the browser profile could not be prepared: ${error.message}`);
+    }
     browser = launchBrowserFn({
       args: browserArgs({ port: config.browserDebugPort, userDataDir: profile }),
       env,

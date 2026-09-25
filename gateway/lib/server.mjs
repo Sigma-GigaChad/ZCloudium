@@ -11,6 +11,7 @@ import { request as httpRequest } from "node:http";
 import {
   classifyRoute,
   debugPathFor,
+  isAcceptableOrigin,
   isDiscoveryPath,
   proxyAuthorityFor,
   rewriteDiscovery,
@@ -501,6 +502,41 @@ export async function createGateway({
   }
 
   /**
+   * The request target, resolved against a Host header that may be anything at
+   * all. It is attacker controlled and is only used to build a base for a
+   * relative path, so a value that cannot be an authority falls back to a fixed
+   * one instead of throwing out of a listener.
+   */
+  function requestUrl(req) {
+    const raw = req.url ?? "/";
+    try {
+      return new URL(raw, `http://${req.headers.host ?? "localhost"}`);
+    } catch {
+      return new URL(raw.startsWith("/") ? raw : "/", "http://localhost");
+    }
+  }
+
+  /**
+   * Whether this request may use the browser route. See isAcceptableOrigin: the
+   * session says who the caller is, the origin says it is this gateway's own
+   * frontend and not a page served by another service on the same machine.
+   */
+  function originAcceptable(req) {
+    return isAcceptableOrigin(req.headers.origin, req.headers.host, {
+      secure: Boolean(req.socket.encrypted),
+    });
+  }
+
+  function refuseForeignOrigin(req, socket, path) {
+    logger(
+      `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
+        `for ${path} (the gateway serves its own frontend on ${JSON.stringify(req.headers.host)})`,
+    );
+    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+  }
+
+  /**
    * The debug port, behind the session (Phase 0 of issue #5).
    *
    * Two things have to change on the way through, and both are Chromium's own
@@ -511,12 +547,27 @@ export async function createGateway({
    * - the Origin header is dropped, because Chromium refuses a WebSocket
    *   handshake carrying an Origin it did not generate.
    *
+   * The security check on the Origin is not the deletion, it is `originAcceptable`
+   * above: only a request that arrived as this gateway's own frontend gets this
+   * far, so deleting the header on the last hop removes nothing that was still
+   * protecting anything.
+   *
    * The discovery documents are the reason a proxy is needed at all: they name
    * `ws://127.0.0.1:9222/...`, which only resolves on the machine the container
    * runs on. They are rewritten to point back at the gateway origin the frontend
    * was served from, which its own `connect-src 'self'` then allows.
    */
   function proxyBrowser(req, res, url) {
+    if (!originAcceptable(req)) {
+      logger(
+        `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
+          `for ${url.pathname}`,
+      );
+      res.writeHead(403, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Forbidden");
+      return;
+    }
+
     const authority = proxyAuthorityFor(req.headers.host);
     if (authority === null) {
       // The Host header ends up inside the document the frontend reads, so a
@@ -570,7 +621,14 @@ export async function createGateway({
     req.pipe(upstream);
   }
 
-  /** The headers the debug port is asked with: loopback Host, no Origin. */
+  /**
+   * The headers the debug port is asked with: the loopback Host, and no Origin.
+   *
+   * The removal is interoperability, not the security check: Chromium refuses a
+   * handshake carrying an Origin it did not generate, and by this point the
+   * request comes from the gateway. What keeps a foreign page out is
+   * `originAcceptable` in proxyBrowser and handleUpgrade.
+   */
   function debugHeaders(req) {
     const headers = { ...req.headers, host: debug.host };
     delete headers.origin;
@@ -584,12 +642,16 @@ export async function createGateway({
       return;
     }
 
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    const url = requestUrl(req);
     const browserRoute = classifyRoute(url.pathname, { browserEnabled }) === "browser";
     if (browserRoute && proxyAuthorityFor(req.headers.host) === null) {
       logger(`[auth] refusing a browser upgrade with an unusable Host header: ${JSON.stringify(req.headers.host)}`);
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       socket.destroy();
+      return;
+    }
+    if (browserRoute && !originAcceptable(req)) {
+      refuseForeignOrigin(req, socket, url.pathname);
       return;
     }
 
@@ -642,16 +704,7 @@ export async function createGateway({
   }
 
   const server = createServer((req, res) => {
-    // The Host header is attacker controlled and is only used to build a base for
-    // a relative path, so a value that cannot be an authority falls back to a
-    // fixed one instead of throwing out of the request handler.
-    const rawUrl = req.url ?? "/";
-    let url;
-    try {
-      url = new URL(rawUrl, `http://${req.headers.host ?? "localhost"}`);
-    } catch {
-      url = new URL(rawUrl.startsWith("/") ? rawUrl : "/", "http://localhost");
-    }
+    const url = requestUrl(req);
     const pathname = url.pathname;
 
     const run = async () => {

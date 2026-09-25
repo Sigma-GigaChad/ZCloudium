@@ -253,12 +253,14 @@ async function runStart(
     argv = ["node", "/opt/cloudium/gateway/start.mjs"],
     browser = null,
     probe = async () => ({ reachable: true, version: { Browser: "Chrome/153.0.8010.52" } }),
+    prepare = async () => ({ status: "no-lock" }),
   } = {},
 ) {
   const child = fakeChild();
   const spawns = [];
   const browserSpawns = [];
   const browserStops = [];
+  const profilePreparations = [];
   const probes = [];
   const signals = fakeProcess();
   const exits = [];
@@ -289,6 +291,10 @@ async function runStart(
       mcpCalls.push(options);
       return mcp(options);
     },
+    prepareProfileFn: async (dir, options) => {
+      profilePreparations.push({ dir, options });
+      return prepare(dir, options);
+    },
     launchBrowserFn: (options) => {
       browserSpawns.push(options);
       if (!browser) {
@@ -307,7 +313,20 @@ async function runStart(
     onExit: (code) => exits.push(code),
   });
 
-  return { result, child, spawns, signals, exits, gatewayCalls, mcpCalls, logs, browserSpawns, browserStops, probes };
+  return {
+    result,
+    child,
+    spawns,
+    signals,
+    exits,
+    gatewayCalls,
+    mcpCalls,
+    logs,
+    browserSpawns,
+    browserStops,
+    profilePreparations,
+    probes,
+  };
 }
 
 /** A fake Chromium process: the entrypoint only kills it and waits for the exit. */
@@ -611,6 +630,36 @@ test("a shutdown signal stops the browser as well as the runtime", async () => {
   await tick();
   assert.deepEqual(child.killed, ["SIGTERM"], "the runtime is forwarded the signal as before");
   assert.equal(browserStops.length, 1, "the browser is asked to stop on the same signal");
+});
+
+test("the browser profile is unlocked before the browser is launched", async () => {
+  const browser = fakeBrowser();
+  const { profilePreparations, browserSpawns } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    { browser, prepare: async () => ({ status: "unlocked", target: "other-container-14" }) },
+  );
+  assert.deepEqual(profilePreparations.map((entry) => entry.dir), ["/data/browser-profile"]);
+  assert.equal(browserSpawns.length, 1, "the browser is launched after the profile is prepared");
+});
+
+test("a profile that cannot be unlocked is reported and does not stop the panel", async () => {
+  const browser = fakeBrowser();
+  const { browserSpawns, probes, logs } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    {
+      browser,
+      prepare: async () => {
+        throw new Error("read-only profile");
+      },
+    },
+  );
+  assert.equal(browserSpawns.length, 1, "the browser is still launched, and Chromium decides");
+  assert.equal(probes.length, 1);
+  assert.equal(
+    logs.some((line) => /read-only profile/.test(line)),
+    true,
+    `the failure must be reported, got ${JSON.stringify(logs)}`,
+  );
 });
 
 test("with the browser MCP off there is nothing for the panel to attach to, so no browser starts", async () => {
