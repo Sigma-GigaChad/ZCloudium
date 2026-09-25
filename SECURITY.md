@@ -238,6 +238,74 @@ profile already grants that level of power to the agent, so the browser does not
 change the class of risk: it adds a path that a web page, not a prompt, can
 exercise. Keep that machine disposable.
 
+## The browser panel
+
+`ZCLOUDIUM_BROWSER_PANEL=on` serves `/_browser/` behind the session: a live view of
+the browser the agent drives, a viewport control, and the keyboard and the mouse.
+Stated plainly, without softening it:
+
+**It hands the agent's browser, with its logged in sessions, to whoever holds a
+session.** Not a picture of it: the page itself, its cookies, its open
+authenticated tabs, and the ability to type into them. If that browser is signed
+into something important, then so is anyone who can sign in to this container. On
+the full access and unsafe profiles the session cookie is already worth root, so
+the browser adds no new class of power there; on the restricted profile it is the
+first capability that reaches outwards with the agent's own credentials rather
+than through a shell the agent would have to be asked to run.
+
+**Off by default, and off means unchanged.** No browser is started for the panel,
+`/_browser/...` is ordinary application traffic, and the build refuses nothing:
+the same image carries the same Chromium and the same gateway either way. The
+switch decides whether the entrypoint starts a browser, whether the agent's MCP
+entry attaches to it instead of launching its own, and whether the gateway knows
+the route exists. Enabling it does not add a port: the debug endpoint is bound to
+loopback inside the container, and the gateway is the only way in.
+
+### The Origin rule, exactly
+
+The panel is a browser route, so two checks stand in front of it: the session (302
+to the sign in page for HTTP, 401 before any upgrade for the WebSocket) and the
+Origin.
+
+1. **A request with no `Origin` header is allowed.** Only a browser context sends
+   one, and the clients that must keep working send none: the MCP server, the
+   automation harness, curl. Refusing them would break the agent, so their absence
+   is not treated as a browser that failed to identify itself.
+2. **A request that carries one must name exactly the origin of the gateway it
+   arrived at**: the scheme comes from the socket, the authority from the `Host`
+   header, and both are compared as strings. Another port, another name, another
+   scheme, a path, or the literal `null` of an opaque origin are refused with 403.
+   The reason this check exists at all: every other service on the operator's
+   loopback is same-site, so its pages arrive with the session cookie attached
+   (`SameSite=Lax` counts loopback to loopback as same-site), and without a check
+   one of those pages could open a control channel into the browser that holds the
+   agent's sessions.
+3. **Behind a TLS terminating proxy, `ZCLOUDIUM_TRUST_PROXY=on` also accepts the
+   `https` variant of the request's own authority.** The proxy speaks TLS to the
+   browser and plain HTTP to the container, so the browser sends `https` while the
+   gateway serializes `http`, and without the flag the panel would refuse its own
+   frontend in the deployment the README recommends. The flag already means "a
+   proxy I control is in front", and it widens nothing else: the authority still
+   has to match character for character, and a different name, port or scheme is
+   still refused. With the flag off, the behaviour is exactly the one before it
+   existed.
+
+**Why the check lives in the gateway and not inside Chromium.** Chromium has its
+own defence, and it stays fully closed behind the gateway: it refuses any Origin
+it did not generate, which is why the gateway strips the header on the last hop,
+where the request comes from the gateway rather than from a page.
+`--remote-allow-origins` would be the wrong layer: it names trusted origins
+*inside* the browser, so every page served from those origins, including a
+compromised one, would reach the debug port directly. The gateway check only lets
+through what arrived as its own frontend.
+
+**What the panel does not change.** It does not patch the application, does not
+add a dependency, and does not widen the container's reach: it uses the same
+Chromium, the same uid and the same volumes as the rest of the agent's work. The
+one thing it adds to the filesystem is the browser profile (see the README for
+where that lands per profile), and the one thing it removes on startup is
+Chromium's own `SingletonLock` when it names another machine.
+
 ## Residual risks
 
 Read this before launching the full access profile.
@@ -294,6 +362,13 @@ Read this before launching the full access profile.
    pinned version), driven by the agent over stdio. It shares the container with
    the agent, and therefore has the same rights. Its published defaults that send
    usage statistics and performance data to Google are disabled at launch.
+10. **With the browser panel on, a session is the agent's browser.** The panel is
+   off by default; turned on, it gives `/_browser/` to anyone who signs in, and
+   through it the live page, the cookies and the logged in sessions of the browser
+   the agent drives. The Origin rule above keeps other services on the same
+   loopback from reaching it, but it does not change what a session is worth: see
+   the panel section for the exact boundary and for the one file it removes on
+   startup (Chromium's `SingletonLock`, only when it names another machine).
 
 ## Recommendations
 
@@ -312,6 +387,10 @@ Read this before launching the full access profile.
 - Leave `ZCLOUDIUM_TRUST_PROXY` off unless a reverse proxy you control overwrites
   `x-forwarded-for`, and remember that with it off every client behind the same
   last hop shares one block.
+- Turn `ZCLOUDIUM_BROWSER_PANEL` on only where the session is as protected as the
+  browser it exposes: it makes a stolen cookie worth the agent's logged in
+  sessions, and behind a TLS terminating proxy it needs
+  `ZCLOUDIUM_TRUST_PROXY=on` to accept the panel's own frontend.
 - Mount `docker.sock` only if the agent must drive containers, and knowing that
   it is equivalent to root on the host.
 - Put TLS in front of the port if the network is not fully trusted: the gateway

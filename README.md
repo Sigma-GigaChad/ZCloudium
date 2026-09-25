@@ -285,6 +285,107 @@ your own MCP servers. Tested on that profile: the entry is added, `context7`
 and the provider section are intact, and the backup holds the previous file byte
 for byte.
 
+## The browser panel (live view and viewport control)
+
+The agent drives a headless browser inside the container. The panel puts that same
+page on screen, next to the conversation, with the controls the picture needs: it
+is what makes the web build usable for the workflows that need a human in the
+loop, and it is the one thing a screen stream could not give (a viewport control
+without giving up the view, see below).
+
+`ZCLOUDIUM_BROWSER_PANEL=on` (off by default) makes the entrypoint start one
+Chromium in the container, attach the agent's MCP server to it, and serve the
+panel from the gateway. Both sides then drive **one single page**: your clicks and
+its actions land in the same browser, and neither blocks the other. With the
+switch off nothing observable changes: no browser is started, the MCP entry keeps
+the shape the image shipped before, and `/_browser/...` is ordinary application
+traffic.
+
+Open `http://<host>:3030/_browser/` after signing in. It is behind the same
+session as everything else, and the WebSocket it opens is refused without one.
+
+| Part | What it is |
+| --- | --- |
+| live view | `Page.startScreencast` frames painted into a canvas, scaled to fit the window |
+| viewport | a width and a height field, `320x320` up to `3840x2160`, plus a fit-to-window option, applied with `Emulation.setDeviceMetricsOverride` |
+| interaction | mouse move, press, release, wheel and drag, and the keyboard, through the CDP input events. Click the picture once to give it the keyboard |
+| indicator | the page is shared with the agent, and the strip shows the address the page is at right now |
+| DevTools | a button that opens Chromium's own DevTools frontend through the gateway, on the same page: Elements, Network, Console, Sources, Performance |
+
+The panel needs the browser MCP server, which is on by default: with
+`ZCLOUDIUM_BROWSER_MCP=off` no browser is started and the logs say so, because a
+browser nobody drives would be a stray process.
+
+### Why a panel exists when Chromium serves its own DevTools
+
+Chromium serves its DevTools frontend over HTTP as soon as remote debugging is on,
+and through the gateway it gives live view, live DOM, element picking, the console
+and the network waterfall at no cost. It cannot give the live view **and** the
+viewport control at once: `/_browser/devtools/inspector.html` renders the page and
+has no device toolbar, and the same frontend with `can_dock=true` has the toolbar
+and renders no page into your tab. Measured, twice. The panel owns the view and
+the controls together, and the DevTools button covers the depth. The element
+picker therefore stays with DevTools (its highlight is the real one,
+`Overlay.setInspectMode`), and `Ctrl+Shift+C` there still yields a selector you can
+paste into the conversation.
+
+The button builds its URL itself and does not use the `devtoolsFrontendUrl` field
+of the discovery documents: Chromium writes a
+`chrome-devtools-frontend.appspot.com` URL there, which an offline deployment
+cannot reach. The path that works is
+`/_browser/devtools/inspector.html?ws=<host>/_browser/devtools/page/<id>`, and it
+is what the button opens.
+
+### The picture is a frame stream, not video
+
+Frames arrive when the page produces one, and they are painted as they arrive.
+Measured on the container browser: 8 to 20 ms after a visible change, and never
+for a change nobody can see (a text node updated while it was scrolled out of the
+viewport produced no frame at all in 2.5 s). There is no encoder, no ffmpeg and no
+video protocol, and the rate follows the page rather than a clock: a page that
+animates streams, a still page sends nothing. So: supervision, not video. The
+footer says how many frames arrived and how old the last one is, which is what
+tells you the picture is fresh rather than frozen. Drag and drop through the
+browser's own HTML5 API (dropping a file onto a page) is the one gesture the panel
+does not do.
+
+### Where the browser profile lives
+
+The profile, with the agent's cookies and logins, is written to
+`<ZCODE_DATA_BASE_DIR>/browser-profile`, which means:
+
+- restricted profile (`compose.yml`): `/data/browser-profile`, on the data volume,
+  and nothing is written to the read-only root filesystem;
+- full access and unsafe profiles: `HOME` **and** `ZCODE_DATA_BASE_DIR` are your
+  real home, so the profile lands in **your own `~/browser-profile`** (inside the
+  container, `/host/home/<user>/browser-profile`). It is the same directory the
+  agent's browser uses when the panel is off, so the logins accumulated there are
+  the ones the panel shows.
+
+A container that was killed rather than stopped leaves Chromium's `SingletonLock`
+in that directory, pointing at the old machine name, and Chromium then refuses to
+start. The entrypoint releases only that lock (three files, and only when it names
+another machine) before launching, and says so in the logs.
+
+### Behind a TLS terminating proxy
+
+Set `ZCLOUDIUM_TRUST_PROXY=on` there. The proxy speaks TLS to your browser and
+plain HTTP to the container, so the browser sends an `https` Origin while the
+gateway serializes `http`, and the panel's own origin check would refuse its own
+frontend. The flag already means "a proxy I control is in front", and it accepts
+exactly the `https` variant of the request's own authority, nothing else. See
+SECURITY.md for the rule in full.
+
+### The panel and the agent see the same page
+
+The viewport control changes the layout the page reports, not only the picture:
+asked for `640x480`, a page with a `(max-width: 700px)` rule flipped its media
+query, and the agent's own screenshots followed the new size. Closing the panel
+disturbs nothing, and reopening it finds the same document, the same typed text
+and the same emulated viewport: the browser is the agent's, and the panel is a
+viewer plus a control surface on it. The suite covers this end to end, against a
+container started with the panel on.
+
 ## The host filesystem, with full access (root)
 
 `compose.full-access.yml` runs the agent as root with the whole filesystem of
@@ -569,6 +670,42 @@ Tested by actually running things, not only written:
   empty directory on a machine that never cloned anything, starts a `healthy`
   container whose logs show the gateway on the published port and the runtime
   confined to loopback, and `GET /` answers `302` to the sign in page
+- **browser panel, in a real browser, against a real container**
+  (`ZCLOUDIUM_BROWSER_PANEL=on`, hardening on, read-only root filesystem): the
+  panel is served at `/_browser/` behind the session; it painted a first frame
+  about 900 ms after opening and adopted the size the page was already at; the
+  viewport fields applied `640x480` and the page itself reported
+  `640x480 dpr=1` with `(max-width: 700px)` flipped, while the frame bitmap became
+  `640x480`; a click on the picture focused the page's own input, typing through
+  the panel landed `Hi there 42` in it with every key reported to the page's
+  keydown listener, a click on a button fired its click handler once, and a wheel
+  moved the page from `scrollY 0` to `300`; a still page produced no new frames
+  (two canvas digests 1.5 s apart were identical); the DevTools button opened
+  Chromium's own frontend through the gateway, which showed the fixture's real DOM
+  in its Elements panel
+- **browser panel continuity**: with the viewer closed, a real key press and a
+  real DOM change were made through CDP, and reopening the panel found the same
+  `performance.timeOrigin` (no reload), the same typed text, the same emulated
+  viewport, the fields adopted from the page, and a picture that showed the change
+  made while nobody was watching. Opening the panel disturbed nothing, and a
+  navigation made by the agent while the panel was open appeared in it (the
+  address line and the picture followed)
+- **browser panel, offline and unauthenticated**: without a session, `/_browser/`,
+  `/_browser/json/list` and `/_browser/devtools/inspector.html` answer `302` to the
+  sign in page and the WebSocket upgrade answers `401` before any upgrade; a
+  document that names another host cannot point the panel's socket anywhere but
+  its own gateway (unit tested on the URL builder)
+- **TLS terminating proxy**: with `ZCLOUDIUM_TRUST_PROXY=on`, an `https` Origin
+  whose authority is exactly the request's own is accepted on the browser route
+  and on its upgrade, and a different authority, name or port is still refused
+  with 403; with the flag off the `https` Origin is refused, which is the
+  behaviour before this change
+- **end to end, both positions of the panel switch**, against the image: the suite
+  passes with the panel off (21 passed, the 4 panel specs skipped with a reason)
+  and with the panel on (25 passed, including the four panel specs: the session
+  requirement including the upgrade, the viewport control measured from the page,
+  the detach and reattach continuity, and the DevTools button). CI runs both, in
+  parallel jobs
 
 ## Implementation details
 
@@ -629,4 +766,5 @@ Dockerfile and should produce that `dist`, but it has not been tested.
 Web mode does not allow connecting to a remote project from the interface
 (`connectRemote` answers *not supported in Web mode yet*): the workspace is the
 server directory mounted on `/workspace`. Distinctly, browser automation is now
-available through the baked MCP server described above.
+available through the baked MCP server described above, and its browser can be
+watched and driven by hand from the browser panel.
