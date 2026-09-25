@@ -1,13 +1,15 @@
 name: build-image
 
-# Construit l'image et la publie sur GHCR.
+# Builds the image and publishes it to GHCR.
 #
-# Pas de step « build » séparé pour vérifier : le Dockerfile vérifie lui-même
-# l'intégrité du runtime (sha256 épinglé) et refuse de construire si le tarball
-# tiers contient un binaire setuid. Un build qui passe est donc déjà un contrôle.
+# There is no separate "build" step to check anything: the Dockerfile verifies
+# the integrity of the runtime itself (sha256 pinned in the repository, setuid
+# scan) and refuses to build on a mismatch. A build that passes has therefore
+# already been checked.
 #
-# Un job `smoke` tire ensuite l'image publiée dans un conteneur réel et vérifie
-# que l'interface répond : on ne livre pas une image qu'on n'a pas démarrée.
+# A `smoke` job then pulls the published image into a real container and checks
+# that the gateway answers and that the browser MCP server was configured: an
+# image is not shipped without having been started.
 
 on:
   push:
@@ -33,24 +35,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Lire la version épinglée
+      - name: Read the pinned version
         id: version
         run: |
           tag="$(tr -d '[:space:]' < zcode.version)"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "Version épinglée : ${tag}"
+          echo "Pinned version: ${tag}"
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Connexion à GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build et push
+      - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -66,43 +68,61 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Connexion à GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Démarrer l'image publiée
+      # The volume on /data is required: the gateway writes its session key and
+      # its accounts there, and the container root filesystem is read-only.
+      - name: Start the published image
         run: |
           docker run -d --name smoke \
             -p 127.0.0.1:3030:3030 \
-            --read-only --tmpfs /tmp:size=128m \
+            -v smoke-data:/data \
+            --read-only --tmpfs /tmp:size=512m \
             --security-opt no-new-privileges:true \
             --cap-drop ALL \
             "${{ env.IMAGE }}:${{ needs.build.outputs.version }}"
 
-      - name: Attendre que le serveur réponde
+      - name: Wait for the gateway to answer
         run: |
           for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null http://127.0.0.1:3030/api/server-info; then
-              echo "Le serveur répond après ${i} tentatives."
-              curl -s http://127.0.0.1:3030/api/server-info
+            if curl -fsS -o /dev/null http://127.0.0.1:3030/_auth/health; then
+              echo "The gateway answers after ${i} attempts."
               exit 0
             fi
             sleep 2
           done
-          echo "Le serveur n'a jamais répondu." >&2
+          echo "The gateway never answered." >&2
           docker logs smoke >&2
           exit 1
 
-      - name: Vérifier que l'interface est bien servie
+      - name: Check that the interface sits behind the gateway
         run: |
-          code="$(curl -s -o /tmp/index.html -w '%{http_code}' http://127.0.0.1:3030/)"
-          echo "GET / -> ${code}"
-          grep -q "<title>" /tmp/index.html
-          test "$code" = "200"
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3030/)"
+          location="$(curl -s -o /dev/null -D - http://127.0.0.1:3030/ | tr -d '\r' | grep -i '^location:')"
+          echo "GET / -> ${code} ${location}"
+          test "$code" = "302"
+          echo "$location" | grep -q '/_auth/login'
 
-      - name: Nettoyage
+      - name: Check the browser automation baked into the image
+        run: |
+          docker exec smoke chromium --version
+          docker exec smoke /usr/local/bin/chrome-devtools-mcp --version
+          docker exec smoke node -e '
+            const config = JSON.parse(require("node:fs").readFileSync("/data/.zcode/cli/config.json", "utf8"));
+            const entry = config.mcp.servers["chrome-devtools"];
+            if (!entry) {
+              throw new Error("the chrome-devtools server is missing from the agent configuration");
+            }
+            console.log("browser MCP configured:", entry.command, entry.args.join(" "));
+          '
+
+      - name: Cleanup
         if: always()
-        run: docker rm -f smoke || true
+        run: |
+          docker rm -f smoke || true
+          docker volume rm smoke-data || true

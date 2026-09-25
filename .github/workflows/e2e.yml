@@ -1,0 +1,99 @@
+name: e2e
+
+# Drives the real interface in a real browser, against a real container started
+# from the image built from this commit.
+#
+# The build workflow's smoke job proves that the gateway answers and that the
+# browser automation is in the image. It cannot see a broken wizard, a session
+# cookie that authorises nothing, or an upgrade proxy that lets an anonymous
+# client through, because none of those are visible to a plain HTTP probe. This
+# workflow is the one that would catch them.
+#
+# It builds its own image rather than pulling one: the point is to test the code
+# in the commit being pushed. The build arguments are the ones build.yml passes,
+# which is none: the Dockerfile carries the runtime version, its URL and its
+# sha256 as defaults, and refuses to build on a mismatch.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: z-cloudium-e2e:local
+  PORT: "3032"
+  # Names the container and its two volumes, so a run never touches another
+  # container on the runner.
+  PREFIX: zcloudium-e2e-ci
+
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the pinned version
+        run: |
+          tag="$(tr -d '[:space:]' < zcode.version)"
+          echo "Runtime: ${tag}"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install the suite
+        working-directory: e2e
+        run: npm ci
+
+      # Chromium only: the suite runs on it, and nothing else is needed.
+      - name: Install the browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      # Starts a container from the image just built, with a clean data volume
+      # (the wizard runs once per volume, so a clean one is what makes the first
+      # connection testable) and the same hardening flags as the compose files.
+      # Through bash, so the step does not depend on the checkout preserving the
+      # executable bit of the script.
+      - name: Start the container
+        working-directory: e2e/scripts
+        run: bash ./start-container.sh "$IMAGE" "$PORT" "$PREFIX"
+
+      - name: Run the suite
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://127.0.0.1:${{ env.PORT }}
+        run: npx playwright test
+
+      # The report on its own answers "what failed"; the screenshots, videos and
+      # traces of the failed tests answer "why".
+      - name: Upload the report and the traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7
+
+      - name: Stop the container
+        if: always()
+        working-directory: e2e/scripts
+        run: bash ./stop-container.sh "$PREFIX"

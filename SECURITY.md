@@ -1,130 +1,335 @@
-# Sécurité
+# Security
 
-Ce document décrit ce qui est durci, ce qui ne l'est pas, et pourquoi. Il
-distingue deux choses que l'on confond facilement : **l'image** (ce que l'agent
-embarque) et **le conteneur** (les droits qu'on lui donne au lancement).
+This document describes what is hardened, what is not, and why. It separates two
+things that are easily confused: **the image** (what the agent carries) and
+**the container** (the rights it is given at launch).
 
-Rien ici ne peut corriger le comportement de ZCode lui-même : c'est du code tiers
-qui ne dépend pas de nous. Tout ce qui suit porte sur l'enveloppe Docker.
+Nothing here can fix the behaviour of ZCode itself: that is third party code
+which does not depend on this project. Everything below is about the Docker
+wrapper and the gateway shipped with the image.
 
-## Deux profils
+## Two profiles
 
-| | `compose.yml` (restreint) | `compose.full-access.yml` (accès total) |
+| | `compose.yml` (restricted) | `compose.full-access.yml` (full access) |
 | --- | --- | --- |
-| Utilisateur | `1000:1000` (non privilégié) | `root` |
-| Vue du FS | `/workspace` + volume `/data` | toute la VM montée sur `/host` |
-| Rootfs conteneur | `read_only` + tmpfs `/tmp` | inscriptible (voir plus bas) |
-| Capacités | aucune (`cap_drop: ALL`) | 7 capacités d'administration |
-| Portée d'une compromission | le workspace | toute la VM |
+| User | `1000:1000` (unprivileged) | `root` |
+| Filesystem view | `/workspace` plus the `/data` volume | the whole VM mounted on `/host` |
+| Container rootfs | `read_only` plus tmpfs `/tmp` | writable (see below) |
+| Capabilities | none (`cap_drop: ALL`) | 7 administration capabilities |
+| Reach of a compromise | the workspace | the whole VM |
+| Authentication | on by default | on by default, and it matters most here |
 
-Le profil restreint suffit pour la plupart des usages. L'accès total est un choix
-délibéré, avec les conséquences décrites plus bas.
+The restricted profile is enough for most uses. Full access is a deliberate
+choice, with the consequences described further down.
 
-## Ce qui est durci
+## What is hardened
 
-### Dans l'image (`Dockerfile`)
+### In the image (`Dockerfile`)
 
-- **Image de base épinglée par digest** : `node:24.14.0-bookworm-slim@sha256:d8e448a5…`.
-  Un tag republié ne peut pas modifier silencieusement le contenu du build.
-- **Runtime vérifié par sha256 épinglé dans le repo** (`zcode.sha256`). Une release
-  amont modifiée après coup fait échouer le build au lieu de passer inaperçue.
-- **Refus de construire si le runtime tiers contient un binaire setuid/setgid.**
-  Le tarball est du code tiers : un setuid y serait un vecteur d'élévation, le
-  build s'arrête si `find … -perm -4000 -o -perm -2000` remonte quelque chose.
-- **Aucune toolchain de build** dans l'image finale : ni pnpm, ni compilateur, ni
-  Electron. Moins de surface, moins de CVE à suivre.
-- **Utilisateur non privilégié `node` par défaut.** Le profil accès total le
-  remplace explicitement par root : c'est une décision de lancement, pas un défaut
-  hérité de l'image.
-- `APT` sans recommandations, listes supprimées, `pipefail` actif dans le shell de
-  build.
+- **Base image pinned by digest**: `node:24.14.0-bookworm-slim@sha256:d8e448a5...`.
+  A republished tag cannot silently change the content of the build.
+- **Runtime verified against the sha256 pinned in this repository**
+  (`zcode.sha256`). An upstream release modified after the fact fails the build
+  instead of going unnoticed.
+- **Build refused if the third party runtime carries a setuid/setgid binary.**
+  The tarball is third party code: a setuid there would be an elevation vector,
+  so the build stops when `find ... -perm -4000 -o -perm -2000` reports
+  something. The scan covers the runtime directory on purpose: Chromium's setuid
+  helper is distribution packaged, and `no-new-privileges` neutralises it anyway.
+- **No build toolchain** in the final image: no pnpm, no compiler, no Electron.
+  Less surface, fewer CVEs to follow. The browser MCP server is installed at
+  build time, so no package manager is needed at runtime either.
+- **Unprivileged `node` user by default.** The full access profile replaces it
+  with root explicitly: that is a launch decision, not a default inherited from
+  the image.
+- **Authentication gateway in front of the published port.** Not an
+  application change: a separate process, which owns `/_auth/*`, requires a
+  password plus a TOTP code, and proxies everything else. The runtime is bound
+  to loopback inside the container, so the gateway is the only way in.
+- **Telemetry forced off** (`ZCODE_MODEL_TELEMETRY_ENABLED=0`), and the browser
+  MCP server is started with `--no-usage-statistics --no-performance-crux`,
+  which disables the upstream defaults that would send data to Google.
+- `APT` without recommendations, lists removed, `pipefail` active in the build
+  shell.
 
-### Dans le conteneur (les deux profils)
+### In the container (both profiles)
 
-- **`no-new-privileges:true`** : interdit toute élévation par binaire setuid ou
-  fichier-capability, y compris depuis le FS monté.
-- **`cap_drop: [ALL]`** puis ajout explicite du minimum. Docker accorde par défaut
-  des capacités inutiles ici ; sont désormais absentes : `NET_RAW` (forge de
-  paquets), `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `MKNOD`, `SETFCAP`,
+- **`no-new-privileges:true`**: forbids any elevation through a setuid binary or
+  a file capability, including from the mounted filesystem.
+- **`cap_drop: [ALL]`** then explicit addition of the minimum. Docker grants
+  useless capabilities by default; the following are now absent: `NET_RAW`
+  (packet forgery), `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `MKNOD`, `SETFCAP`,
   `AUDIT_WRITE`, `SYS_CHROOT`.
-- **Limites de ressources** : `pids_limit` (anti fork-bomb), `mem_limit`, `cpus`.
-  Un agent qui s'emballe ne doit pas faire tomber la VM.
-- **Pas de `privileged`, pas de socket Docker par défaut.** Le socket est
-  commenté : le monter équivaut à root sur l'hôte.
-- **Port publié sur une seule interface privée.** Jamais `3030:3030`.
-- **Télémétrie forcée à l'arrêt** (`ZCODE_MODEL_TELEMETRY_ENABLED=0`), alors que
-  l'exporter OTLP amont est de toute façon inactif sans endpoint configuré.
+- **Resource limits**: `pids_limit` (anti fork bomb), `mem_limit`, `cpus`. An
+  agent that runs away must not take the VM down. Browser automation adds a
+  handful of Chromium processes and its own memory: raise these two when a heavy
+  page reaches them.
+- **No `privileged`, no Docker socket by default.** The socket is commented out:
+  mounting it is equivalent to root on the host.
+- **Port published on a single private interface.** Never `3030:3030`.
 
-### Ce qui est délibérément *non* appliqué
+### What is deliberately *not* applied
 
-- **`read_only` sur le profil accès total.** Avec root sur `/host`, un attaquant
-  persiste de toute façon dans `/etc` de la VM (unités systemd, cron,
-  `authorized_keys`). Le `read_only` n'empêcherait rien et casserait l'usage
-  légitime — `apt install` dans le conteneur, notamment. L'appliquer là serait du
-  durcissement de façade. Le profil restreint l'applique, lui, sans coût.
-- **Capacités réduites au point de rendre root inopérant.** Retirer `DAC_OVERRIDE`
-  ou `CHOWN` ferait échouer un `apt install` ou un `chown` ordinaire : on
-  dégraderait l'outil sans contenir quoi que ce soit, puisque le FS de la VM reste
-  monté.
+- **`read_only` on the full access profile.** With root on `/host`, an attacker
+  persists in the VM's `/etc` anyway (systemd units, cron, `authorized_keys`).
+  `read_only` would prevent nothing and would break legitimate use, `apt install`
+  inside the container in particular. Applying it there would be cosmetic
+  hardening. The restricted profile applies it, and it costs nothing there.
+- **Capabilities reduced to the point of making root inoperative.** Removing
+  `DAC_OVERRIDE` or `CHOWN` would break an ordinary `apt install` or `chown`:
+  the tool would be degraded without containing anything, since the VM
+  filesystem stays mounted.
 
-## Risques résiduels
+## The gateway, honestly
 
-À lire avant de lancer le profil accès total.
+What it does: it authenticates a browser session (password plus TOTP), it keeps
+the runtime off every published interface, and it owns the session cookies.
 
-1. **Le port est la seule barrière.** `--no-token` + root : quiconque atteint le
-   port 3030 obtient un accès root à la VM. Binder sur l'IP privée suppose que le
-   réseau privé est réellement de confiance (VLAN dédié, WireGuard, Tailscale).
-   Les capacités réduites n'y changent rien : root sur un FS monté suffit.
-2. **La VM doit être jetable.** Traite cette VM comme une machine compromise par
-   conception : pas de credentials d'infrastructure, pas d'accès au reste du parc,
-   pas de clés SSH réutilisées ailleurs. Si elle tombe, rien d'autre ne tombe.
-3. **Fichiers appartenant à root dans ton home.** Constaté en test : lancé en root,
-   l'agent crée des fichiers root dans `$HOME/.zcode` (`v2/provider_config.json`,
-   bases sqlite, certificats…). Ton utilisateur de VM ne pourra plus les modifier
-   sans `sudo`. C'est le prix de l'uid 0, pas un bug.
-4. **Sortie réseau non filtrée.** L'agent peut atteindre tout ce que la VM atteint.
-   Le contrôle qui compte vraiment contre l'exfiltration est au niveau du réseau
-   (VLAN, règles firewall en sortie), pas dans le conteneur.
-5. **Le runtime vient d'un tiers** (fork ZCodium). L'intégrité est vérifiée par
-   hash épinglé, la présence de setuid est contrôlée, mais le code n'a pas été
-   audité. Si cela n'est pas acceptable, `Dockerfile.from-source` compile l'amont
-   d'origine — chemin non validé à ce jour.
-6. **La clé API vit dans le volume** (`/data` ou `$HOME/.zcode`), en clair, et le
-   conteneur peut la lire. C'est inhérent à un outil qui doit s'en servir.
-7. **Le mode Web n'a pas de gestion multi-utilisateurs** : pas de comptes, pas de
-   journal d'audit des actions de l'agent.
+**The one window where it protects nothing: before the wizard is finished.** With
+no `/data/auth/users.json`, `POST /_auth/setup` needs no session at all, because
+that is what creates the first account. Between the moment the container starts
+and the moment somebody completes the wizard, the published port is genuinely
+unauthenticated: **whoever connects first creates the account, and therefore owns
+the instance**. On the full access profile, that first visitor creates an account
+that has root on the host machine. This is not a theoretical window: a container
+restarted with an empty or lost data volume, or a first deployment left running
+before its wizard was completed, is in exactly that state. What the operator must
+do about it:
 
-## Recommandations
+- complete the wizard immediately after the first start, before exposing the port
+  to anything, and treat an unfinished wizard as "the service is open";
+- keep the port on loopback, or on a private interface, until the wizard is done;
+- check that `/data/auth/users.json` exists on a running deployment: it is the
+  only sign that an account was created. If it is missing while the port is
+  reachable, the instance is claimable by anyone who reaches it;
+- remember that deleting `/data/auth` reopens the window, and that a container
+  created without the `/data` volume reopens it on every start.
 
-- **Snapshot Proxmox avant la première utilisation** et avant de laisser l'agent
-  travailler sans surveillance.
-- Commencer par le profil restreint ; ne passer à l'accès total qu'en cas de besoin
-  réel.
-- VM dédiée, sur un VLAN isolé, sans credentials vers le reste de l'infra.
-- Ne monter `docker.sock` que si l'agent doit piloter des conteneurs — et en
-  sachant que c'est équivalent à root sur l'hôte.
-- Si le réseau privé n'est pas totalement de confiance, retirer `--no-token` : le
-  serveur génère un token et l'affiche dans `docker compose logs`.
+What it does not do:
 
-## Vérifications reproductibles
+- it is not a sandbox: once you are authenticated, you get exactly what the
+  runtime offers, including a shell through the agent;
+- it is not a multi-user system: one instance, one account. There is no account
+  management interface, no password reset, no audit log of what the agent does;
+- it only speaks HTTP over a plain socket. **Put TLS in front of it** if the port
+  is reachable from a network you do not fully trust (a reverse proxy, a
+  WireGuard or Tailscale interface); otherwise the password and the TOTP code
+  travel in clear text;
+- its accounts live in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
+  mode 0600) and its signing key in `/data/auth/secret.key`. Anyone who can read
+  the volume can run the instance, and can also add an account;
+- the failure counter is in memory: restarting the container resets it.
 
-```bash
-./check-full-access.sh    # uid 0, /etc/shadow, écriture FS, $HOME/.zcode, git
-./check-upstream.sh       # version épinglée vs dernière release
+Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
+to change it, a positive number of hours, anything else is refused and replaced
+by 12 with a log line), a TOTP code that cannot be replayed (the last accepted
+step is stored), and a `next` parameter restricted to a same origin path.
+
+### The failure block, and what it is keyed on
+
+Eight failed attempts from one key block that key for five minutes. The block is
+checked on all three steps that can be attacked, so it applies to the password,
+to the six digit code and to the TOTP enrolment of the first connection. Without
+that, a known password would leave the second factor open to be walked through,
+six digits at a time.
+
+The five minutes are a bound on the block, and the failure budget expires with
+it: the first failure after a block ends starts a fresh count of one, so eight
+new failures are needed before the key is blocked again. A key whose count
+survived its block would stay at the threshold, and one failure every five
+minutes would then keep every client, the operator included, out of the sign in
+page for good. What the bound guarantees is that a block always ends and that
+the window that follows can be used to sign in, not that nobody can trigger
+another one: an attacker who keeps failing can keep re-blocking, as the bullet
+below on the global block explains.
+
+**The key is the connecting socket address by default, not a header.** That is
+the safe direction and it has a cost:
+
+- a client that could choose its key would have no rate limit at all, since
+  changing a header is enough to start again from zero. The gateway therefore
+  ignores `x-forwarded-for` unless it is told otherwise, and the file that
+  documents `ZCLOUDIUM_TRUST_PROXY=on` is the only place it is read from;
+- behind the Docker port mapping, and behind any NAT or reverse proxy that does
+  not rewrite the header, every client shares the socket address of the last hop.
+  The block is then global: eight failed attempts from anyone lock every user out
+  for five minutes. That is a denial of service a stranger can trigger, and it is
+  the price of not trusting a header. It is bounded, and the bound is the whole
+  of it: five minutes, after which the budget behind the key starts again, so a
+  key is never blocked for more than five minutes at a time. It is visible in the
+  logs (`[auth] too many failures from <address>`, then one line per refused
+  attempt on the code and enrolment steps), and it can be avoided by binding the
+  port to loopback and reaching it through a proxy that sets the header, with
+  `ZCLOUDIUM_TRUST_PROXY=on`;
+- turning `ZCLOUDIUM_TRUST_PROXY=on` means the header decides who is blocked. It
+  is only correct when the proxy in front **overwrites** the header with the
+  address it saw: if it appends to a client supplied value, an attacker keeps
+  choosing the first element of the list, which is the key again.
+
+The `next` parameter is refused unless it is a same origin path: it is rejected
+when it carries a backslash (raw or percent encoded), an encoded slash or any
+whitespace, and then resolved against a fixed origin, so `/\evil.com` or
+`/<tab>/evil.com` cannot become a protocol relative URL. The redirect the gateway
+sends is the resolved path, never the value it was given. Dot segment
+normalisation gets its own test, because resolving can turn a single leading
+slash into two while the origin stays the fixed one: `/..//evil.com` resolves to
+`//evil.com`, which a browser reads as another host. A resolved path that starts
+with `//` is therefore refused as well.
+
+The session lifetime is what a stolen cookie is worth. Twelve hours is a
+deliberate compromise between usability and exposure; on the full access profile
+that cookie is worth root on the machine, so raising the value raises the window
+during which a cookie taken from a browser, a proxy or a log stays usable.
+Restarting the container does not end a session, since the signing key lives in
+the volume: delete `/data/auth/secret.key` to invalidate all of them at once
+(the next start creates a new key), or `/data/auth` to reset the account as well
+and bring the setup wizard back (and reopen the window described above).
+
+`ZCLOUDIUM_AUTH=off` removes the gateway entirely: the runtime is published
+directly, with `--no-token`, so **anyone who reaches the port gets a shell on
+the container**, as root in the full access profile. It exists so that the
+behaviour of the previous image can be restored with one variable, without
+rebuilding anything. On a trusted network, with a restrictive bind address, it
+is a reasonable choice. Anywhere else, it is not.
+
+## Browser automation: the sandbox is weakened, and here is the price
+
+Inside the container, Chromium is started with `--no-sandbox`. That is not a
+preference, it is the consequence of the hardening applied above, verified in
+the built image:
+
+```
+$ chromium --headless --screenshot=... about:blank
+[...] No usable sandbox! If this is a Debian system, please install the
+chromium-sandbox package to solve this problem. [...]
 ```
 
-Le durcissement des deux profils a été vérifié par exécution :
+- capabilities are dropped (`cap_drop: ALL`), so the setuid helper cannot gain
+  anything;
+- `no-new-privileges` disables the setuid transition and the namespace sandbox
+  route, even if a helper is present;
+- with the sandbox on, Chromium simply refuses to start, so without
+  `--no-sandbox` there is no browser at all.
 
-| Contrôle | Restreint | Accès total |
+**What that costs**: a malicious page can escape the renderer and run code as
+the container user, without passing through Chromium's own sandbox.
+
+**Why it is nonetheless contained**: that code lands as uid 1000, with no
+capability, no-new-privileges, a read-only root filesystem in the restricted
+profile, and a writable area limited to `/data`, `/workspace` and `/tmp`. In
+other words, exactly the rights the agent already has through its own shell
+tool: the browser does not grant new reach. What changes is that a page becomes
+as dangerous as a command, so the rule to keep is simple: **do not point the
+browser at untrusted pages**, and keep network egress under control (the real
+exfiltration control is the network: VLAN, firewall rules), because the browser
+and the agent can both reach everything the machine reaches.
+
+In the full access profile the calculus is different and worse: code that escapes
+the renderer runs as root, with the machine's filesystem mounted on `/host`. The
+escape itself is harder to reach through a browser than a shell command, but the
+profile already grants that level of power to the agent, so the browser does not
+change the class of risk: it adds a path that a web page, not a prompt, can
+exercise. Keep that machine disposable.
+
+## Residual risks
+
+Read this before launching the full access profile.
+
+1. **The window before the wizard is finished is unauthenticated, and it is the
+   biggest of these risks.** A container whose `/data/auth/users.json` does not
+   exist yet answers the setup wizard without any credential: the first visitor
+   creates the account and owns the instance. On this profile, that account has
+   root on the machine. An empty, lost or freshly recreated data volume puts a
+   running container back into that state, and so does deleting `/data/auth`.
+   Complete the wizard immediately after the first start, keep the port off every
+   untrusted network until it is done, and verify that `users.json` exists on a
+   deployment that is exposed. See "The one window where it protects nothing" in
+   the gateway section above.
+2. **A full access container is a root session with a web interface.** The
+   gateway is the barrier on the port; the private interface is the second layer.
+   Binding on the private IP assumes that the private network is genuinely
+   trusted (dedicated VLAN, WireGuard, Tailscale). Dropped capabilities change
+   nothing there: root on a mounted filesystem is enough.
+3. **The failure block is keyed on the connecting socket, so behind NAT it is
+   global.** Eight failed attempts from anyone block every client for five
+   minutes: a stranger can deny the sign in page, not the data. Each block ends
+   after those five minutes and the budget starts again, so the denial is
+   repeatable but never permanent: an attacker who keeps failing can keep
+   re-blocking, and the window between two blocks is when the operator can sign
+   in. The alternative, trusting `x-forwarded-for`, hands the choice of the key
+   back to the client and removes the limit. The section above spells out both
+   directions.
+4. **The VM must be disposable.** Treat it as a machine compromised by design:
+   no infrastructure credentials, no access to the rest of the fleet, no SSH keys
+   reused elsewhere. If it falls, nothing else does.
+5. **Files owned by root in your home.** Verified in testing: run as root, the
+   agent creates root owned files in `$HOME/.zcode`
+   (`v2/provider_config.json`, sqlite databases, certificates), and the entrypoint
+   merges the browser MCP entry into `$HOME/.zcode/cli/config.json` (keeping a
+   `config.json.zcloudium-backup` copy of the previous file). Your VM user will
+   no longer be able to modify them without `sudo`. That is the price of uid 0,
+   not a bug.
+6. **Network egress is not filtered.** The agent can reach everything the VM
+   reaches. The control that really counts against exfiltration is at the network
+   level (VLAN, outbound firewall rules), not inside the container.
+7. **The runtime comes from a third party** (the ZCodium fork). Integrity is
+   verified by a pinned hash, the presence of setuid binaries is checked, but the
+   code has not been audited. If that is not acceptable, `Dockerfile.from-source`
+   compiles the original upstream, a path that is not validated to this day.
+8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
+   text, and the container can read it. That is inherent to a tool that must use
+   it.
+9. **Web mode has no multi-user management**: no accounts beyond the single
+   gateway account, no audit log of the agent's actions, no per-user isolation.
+8. **The browser sandbox is off** (see the previous section). Point the browser
+   at pages you trust, or do not enable it.
+9. **The baked browser MCP server is third party code** (`chrome-devtools-mcp`,
+   pinned version), driven by the agent over stdio. It shares the container with
+   the agent, and therefore has the same rights. Its published defaults that send
+   usage statistics and performance data to Google are disabled at launch.
+
+## Recommendations
+
+- **Finish the wizard before anything can reach the port.** On a first start,
+  open it from the machine itself (or over a tunnel), create the account, and
+  only then expose the port to the private network. An instance with the wizard
+  still open is an instance anyone can claim.
+- **Snapshot the VM before the first use** and before letting the agent work
+  unsupervised.
+- Start with the restricted profile; move to full access only for a real need.
+- Dedicated VM, on an isolated VLAN, without credentials to the rest of the
+  infrastructure.
+- Keep `ZCLOUDIUM_AUTH=on`. If you must turn it off, publish the port on
+  loopback only, and remember that the container healthcheck then probes the web
+  app instead of the gateway.
+- Leave `ZCLOUDIUM_TRUST_PROXY` off unless a reverse proxy you control overwrites
+  `x-forwarded-for`, and remember that with it off every client behind the same
+  last hop shares one block.
+- Mount `docker.sock` only if the agent must drive containers, and knowing that
+  it is equivalent to root on the host.
+- Put TLS in front of the port if the network is not fully trusted: the gateway
+  has no TLS of its own.
+
+## Reproducible checks
+
+```bash
+./check-full-access.sh    # uid 0, /etc/shadow, filesystem write, $HOME/.zcode, git
+./check-upstream.sh       # pinned version against the latest release
+```
+
+The hardening of both profiles has been verified by running them:
+
+| Check | Restricted | Full access |
 | --- | --- | --- |
-| Réponse HTTP de l'UI | 200 | 200 |
+| HTTP response of the interface | 302 to the login page | 302 to the login page |
+| `GET /_auth/health` | 200 `ok` | 200 `ok` |
 | `Config.User` | `1000:1000` | `root` |
-| `ReadonlyRootfs` | `true` | `false` (délibéré) |
+| `ReadonlyRootfs` | `true` | `false` (deliberate) |
 | `CapDrop` | `[ALL]` | `[ALL]` |
-| `CapAdd` | — | 7 capacités d'administration |
+| `CapAdd` | none | 7 administration capabilities |
 | `SecurityOpt` | `no-new-privileges:true` | `no-new-privileges:true` |
 | `PidsLimit` | 512 | 1024 |
-| Lecture `/etc/shadow` | — | OK |
-| Écriture sur le FS monté | — | OK |
-| Écriture dans le volume `/data` | OK | OK |
-| Skills visibles via `$HOME/.zcode` | — | OK |
+| Reading `/etc/shadow` | not reachable | OK |
+| Writing on the mounted filesystem | not reachable | OK |
+| Writing in the `/data` volume | OK (session key, accounts) | OK |
+| Skills visible through `$HOME/.zcode` | volume | OK |

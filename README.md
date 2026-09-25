@@ -1,37 +1,51 @@
 # z-cloudium
 
-**ZCode Web dans un conteneur, prêt à lancer.** Une image durcie, versionnée et
-publiée, sans toolchain à installer : pas de pnpm, pas de Node, pas de compilation.
+**ZCode Web in a container, ready to run.** A hardened, versioned and published
+image, behind a password plus a TOTP code, with no toolchain to install: no
+pnpm, no Node, no compilation.
 
-Le nom est un jeu de mots — ZCodium (le fork d'où vient le runtime) + cloud. Le
-projet existe parce que l'amont `zai-org/ZCode` **ne publie aucun binaire serveur**
-(seulement des installeurs desktop), ce qui obligerait sinon à compiler tout le
-monorepo à chaque version.
+The name is a pun: ZCodium (the fork the runtime comes from) plus cloud. The
+project exists because upstream `zai-org/ZCode` **publishes no server binary**
+(desktop installers only), which would otherwise mean compiling the whole
+monorepo for every version.
 
-## Démarrage rapide
+## Quick start
 
 ```bash
-# 1. L'image est privée : s'authentifier une fois auprès de GHCR.
-#    Le token doit porter le scope read:packages (PAT classique).
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u <ton-user> --password-stdin
+# 1. The image is private: authenticate once with GHCR.
+#    The token must carry the read:packages scope (classic PAT).
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u <your-user> --password-stdin
 
-# 2. Récupérer le compose et lancer.
+# 2. Fetch the compose file and start.
 git clone https://github.com/Sigma-GigaChad/z-cloudium.git
 cd z-cloudium
 docker compose up -d
 ```
 
-Interface : **http://127.0.0.1:3030**
+Interface: **http://127.0.0.1:3030**. The first connection runs the setup
+wizard: choose a username, a password, then enrol the TOTP code in your
+authenticator application. After that, the port asks for the password and the
+code before it serves anything.
 
-C'est tout. Le compose par défaut ne demande **aucune édition** : port sur
-localhost, workspace dans un volume Docker, durcissement actif. Au premier accès,
-l'interface demande une clé API Z.ai — elle est écrite dans le volume, donc elle
-survit aux recréations du conteneur.
+> **Finish the wizard before the port is reachable by anyone else.** As long as no
+> account exists, the setup wizard answers without any credential: whoever
+> connects first creates the account, and that account owns the instance. On the
+> full access profile, that account has root on the machine. So start the
+> container, open the interface from the machine itself, complete the wizard, and
+> only then publish the port to a private network. An instance left with its
+> wizard unfinished, a container whose `/data` volume was recreated, or a
+> deployment where `/data/auth` was deleted, is open to whoever reaches it. See
+> [SECURITY.md](SECURITY.md).
 
-Pour y accéder depuis une autre machine du réseau privé, remplacer `127.0.0.1`
-par l'IP dans la section `ports` de `compose.yml`.
+That is all. The default compose file needs **no editing**: port on localhost,
+workspace in a Docker volume, hardening active, authentication on. The account,
+the session key and the API key are written into the volume, so they survive
+container recreations.
 
-### Sans compose
+To reach it from another machine of the private network, replace `127.0.0.1`
+with that machine's IP in the `ports` section of `compose.yml`.
+
+### Without compose
 
 ```bash
 docker run -d --name z-cloudium \
@@ -43,144 +57,274 @@ docker run -d --name z-cloudium \
   ghcr.io/sigma-gigachad/z-cloudium:latest
 ```
 
-### Épingler une version
+The `--read-only` flag works because the gateway writes only into the `/data`
+volume: that is verified before every release, not assumed.
 
-`latest` suit la dernière release. Pour figer :
+### Pin a version
+
+`latest` follows the latest release. To freeze it:
 
 ```yaml
 image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
 ```
 
-Les tags disponibles sont `latest`, `<version>` (ex. `3.14.3`) et `sha-<commit>`.
+The available tags are `latest`, `<version>` (for example `3.14.3`) and
+`sha-<commit>`.
 
-### Authentification du paquet
+### Package authentication
 
-Le paquet GHCR est **privé** comme le repo, et l'étape `docker login` n'est pas
-optionnelle : sans elle, `docker pull` répond `denied`.
+The GHCR package is **private** like the repository, and the `docker login`
+step is not optional: without it, `docker pull` answers `denied`.
 
-Le token doit porter le scope **`read:packages`** — un token OAuth de la CLI `gh`
-ne l'a pas (son scope `repo` ne suffit pas pour les paquets). Il faut donc un
-**PAT classique** avec `read:packages` :
+The token must carry the **`read:packages`** scope. A `gh` CLI OAuth token does
+not have it (its `repo` scope is not enough for packages). A **classic PAT**
+with `read:packages` is what is needed:
 
 ```
 GitHub → Settings → Developer settings → Personal access tokens (classic)
-→ Generate new token → cocher « read:packages »
+→ Generate new token → tick "read:packages"
 ```
 
-Deux façons de supprimer cette étape pour rendre le lancement réellement clé en
-main :
+Two ways to remove that step and make the start truly instant:
 
-- **Rendre le paquet public** : la visibilité d'un paquet GHCR est indépendante de
-  celle du repo. Un paquet publié depuis un repo privé peut être public.
-  Chemin : `GitHub → ton organisation → onglet Packages → z-cloudium →
+- **Make the package public**: the visibility of a GHCR package is independent
+  of the repository. A package published from a private repository can be
+  public. Path: `GitHub → your organisation → Packages tab → z-cloudium →
   Package settings → Change visibility → Public`.
-- Ou faire builder chacun depuis les sources (`./build.sh`, quinze secondes) : plus
-  aucun registry dans la boucle.
+- Or build it locally (`./build.sh`): no registry in the loop at all.
 
-Pour ton propre usage sur une VM privée, le PAT `read:packages` est le choix le plus
-conservateur : rien n'est exposé publiquement.
+For your own use on a private VM, the `read:packages` PAT is the most
+conservative choice: nothing is exposed publicly.
 
-### Travailler sur de vrais fichiers
+### Working on real files
 
-Par défaut le workspace est un volume Docker, pour que `docker compose up -d`
-fonctionne sans préparation. Pour donner accès à un dossier de la machine,
-commenter le volume `z-cloudium-workspace` dans `compose.yml` et le remplacer par
-un montage de dossier — après un `chown 1000:1000` côté hôte, le conteneur
-tournant en uid 1000 :
+By default the workspace is a Docker volume, so that `docker compose up -d`
+works with no preparation. To give the agent access to a directory of the
+machine, comment the `z-cloudium-workspace` volume out of `compose.yml` and
+replace it with a bind mount, after a `chown 1000:1000` on the host (the
+container runs as uid 1000):
 
 ```yaml
 - /srv/z-cloudium/workspace:/workspace
 ```
 
-## Le modèle de versioning
+## Authentication
 
-Deux fichiers, une seule vérité :
+The published port is served by an authentication gateway, which comes with the
+image. The runtime itself is bound to `127.0.0.1:3131` inside the container and
+is reachable only through that gateway.
 
-| Fichier | Contenu |
-| --- | --- |
-| `zcode.version` | le tag de release amont épinglé (ex. `v3.14.3`) |
-| `zcode.sha256` | le sha256 du tarball de cette release |
+- **First connection**: the setup wizard asks for a username, a password (at
+  least 12 characters), then the enrolment of a TOTP code (RFC 6238), displayed
+  as a QR code and as an `otpauth://` URI for your authenticator application.
+- **Later connections**: username and password, then the six digit code. A code
+  cannot be replayed: the last accepted step is stored server side.
+- **Sessions**: an HMAC signed cookie, **12 hours by default**. The lifetime is
+  the window during which a stolen cookie stays usable, so it is short on
+  purpose, and on the full access profile that cookie is worth root on the
+  machine. Change it with `ZCLOUDIUM_SESSION_TTL_HOURS` (a positive number of
+  hours, fractional allowed); any value that is not a positive number is refused
+  and replaced by 12, with a line in the logs saying so. Closing the browser does
+  not end the session, and neither does restarting the container: delete
+  `/data/auth/secret.key` to invalidate every session at once (the next start
+  creates a new signing key, so every existing cookie stops verifying), or
+  `/data/auth` to reset the account and the sessions together, which brings the
+  setup wizard back. There is no password change route: resetting the account is
+  how you rotate the credentials.
+- **Failures**: eight failed attempts from the same key block that key for five
+  minutes, and the limit applies to all three steps (the password, the six digit
+  code, and the TOTP enrolment of the first connection), so a known password does
+  not leave the code open to be walked through. The block is a real bound: the
+  failure budget expires with it, so the first failure after a block ends starts
+  a fresh count and eight new failures are needed before the key is blocked
+  again. A failed attempt every five minutes therefore cannot keep a key blocked
+  for good. The key is the connecting socket address: the `x-forwarded-for`
+  header is ignored unless you set `ZCLOUDIUM_TRUST_PROXY=on`, which is only
+  correct behind a proxy that overwrites that header. Behind the Docker port
+  mapping every client shares one socket address, so the block is global: eight
+  failures from anyone lock everybody out for five minutes. That is a denial of
+  service, bounded to one block of five minutes at a time and visible in the
+  logs, and it is the price of not letting a client choose its own key. Details
+  in [SECURITY.md](SECURITY.md).
+- **Health**: `GET /_auth/health` answers `ok` without a session, which is what
+  the container healthcheck uses. With `ZCLOUDIUM_AUTH=off` there is no gateway
+  and that path falls through to the web app, which answers 200 with the
+  interface shell: the container still reports healthy, but the probe no longer
+  tests the gateway (both compose files carry a commented override that probes
+  `/api/server-info` instead).
+- **Accounts**: stored in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
+  mode 0600). The session signing key is `/data/auth/secret.key`. Removing
+  `/data/auth` resets the whole thing and the wizard runs again, which reopens
+  the first connection window: until the wizard is finished again, anyone can
+  claim the instance.
 
-Un tag d'image par release, le sha256 inscrit dans un label
-(`org.opencontainers.image.revision`), et une veille automatique :
+### Turning authentication off
 
-```bash
-./check-upstream.sh              # à jour ? (exit 0) ou nouvelle release ? (exit 1)
-./check-upstream.sh --bump       # met à jour zcode.version + zcode.sha256
-./check-upstream.sh --build      # bump puis rebuild local
-REPO=zai-org/ZCode ./check-upstream.sh   # surveiller l'amont d'origine à la place
+`ZCLOUDIUM_AUTH=off` restores the previous behaviour of the image: the runtime
+is published directly on port 3030, with `--no-token`, and **no
+authentication**. It is useful for a first look and for the full access profile
+on a trusted network, and it is a one variable decision:
+
+```yaml
+environment:
+  ZCLOUDIUM_AUTH: "off"
 ```
 
-Le workflow `upstream-check` fait cette veille chaque semaine et **ouvre un
-ticket** quand une release sort — il ne modifie rien tout seul, le bump reste une
-décision explicite.
+Anyone who reaches the port then gets a shell on the container, as root in the
+full access profile. Keep it on a private network, or turn it back on.
 
-## Construire l'image soi-même
+### Upgrading from a version that carried a `command:` block
 
-```bash
-./build.sh                # -> ghcr.io/sigma-gigachad/z-cloudium:{3.14.3,latest}
-./build.sh --push         # idem, puis push vers le registry
+Before the gateway, both compose files ended with a `command:` list holding the
+runtime arguments (`--web --host=0.0.0.0 --port=3030 --workspace=... --no-open
+--no-token`), and the README invited you to copy that file to
+`compose.local.yml` and adapt it. The entrypoint now builds those arguments
+itself, so a `command:` block kept from that version is **appended to
+`start.mjs` and ignored**: the container starts, uses the environment instead,
+and logs one line saying so:
+
+```
+[start] ignoring the extra command line arguments (--web --host=0.0.0.0 ...): the workspace, the addresses and the data directory come from the environment.
 ```
 
-Le build prend une quinzaine de secondes : il télécharge le tarball amont (81 Mo),
-vérifie son sha256 et l'extrait. Un build local satisfait directement les fichiers
-compose, qui référencent la même image.
+What to do, in your `compose.local.yml`:
 
-La CI (`.github/workflows/build.yml`) reconstruit et publie à chaque push sur
-`main`, puis un job `smoke` **démarre l'image publiée** et vérifie que l'interface
-répond — une image n'est pas livrée sans avoir été lancée.
+1. delete the whole `command:` block;
+2. if it carried a workspace other than `/workspace`, set
+   `ZCODE_SERVER_WORKSPACE` to that path instead;
+3. if it carried a different loopback port, nothing needs migrating: the
+   entrypoint picks the addresses, the gateway keeps publishing 3030;
+4. if it carried `--no-token`, nothing to do either: the entrypoint passes it to
+   the runtime on loopback, and `ZCLOUDIUM_AUTH` decides whether the gateway is
+   in front.
 
-## Durcissement
+In the full access profile there is one more consequence: the workspace is no
+longer a command line argument but `ZCODE_SERVER_WORKSPACE`, which that file now
+sets to `/host/home/<user>`. Without it the image default `/workspace` wins, and
+the agent works in a throwaway path inside the container instead of your home on
+the machine.
 
-Le détail complet — ce qui est appliqué, ce qui est délibérément écarté et les
-risques résiduels — est dans [SECURITY.md](SECURITY.md). En résumé :
+## Browser automation for the agent
 
-**Dans l'image** : base épinglée par digest, tarball runtime vérifié par le sha256
-épinglé dans ce repo, refus de construire si le runtime tiers contient un binaire
-setuid/setgid, aucune toolchain de build, utilisateur non privilégié par défaut.
+ZCode has a built-in Browser Use, but in web mode it cannot start: its headless
+backend is only instantiated by the one-shot `--prompt` path and by the TUI, and
+`--browser-use=headless` is rejected in every other mode. Patching the
+application is out of scope here, so the capability is provided through MCP
+instead, which is **additive**: nothing of the application is modified.
 
-**Dans les conteneurs** : `no-new-privileges`, `cap_drop: [ALL]` puis ajout
-explicite du minimum, limites `pids`/`mem`/`cpus`, pas de socket Docker par défaut,
-port lié à une seule interface, télémétrie forcée à l'arrêt.
+The image ships:
 
-Le profil restreint (`compose.yml`) ajoute le rootfs en lecture seule avec un tmpfs
-`/tmp`. Le profil accès total ne l'applique pas, volontairement : avec root sur
-`/host` cela n'empêcherait aucune persistance tout en cassant `apt install`.
+| Component | Version | Why |
+| --- | --- | --- |
+| `chrome-devtools-mcp` | `1.10.1` | maintained browser MCP server (Google), driven over stdio |
+| `chromium` | Debian bookworm package, `153.0.8010.52` | the browser it drives, through `--executablePath /usr/bin/chromium` |
 
-## Accès total au FS de la machine (root)
+Both are installed **at build time**: no package manager is needed at runtime,
+and two containers started from the same image run the same browser server.
 
-`compose.full-access.yml` fait tourner l'agent en root avec tout le FS de la
-machine monté sur `/host` : il peut lire et écrire n'importe où, y compris `/etc`,
-`/var` et `/root`.
+On startup, the entrypoint merges this entry into the agent configuration,
+`<home>/.zcode/cli/config.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "chrome-devtools": {
+        "type": "stdio",
+        "command": "/usr/local/bin/chrome-devtools-mcp",
+        "args": [
+          "--headless",
+          "--isolated",
+          "--executablePath",
+          "/usr/bin/chromium",
+          "--chromeArg=--no-sandbox",
+          "--no-usage-statistics",
+          "--no-performance-crux"
+        ],
+        "enabled": true,
+        "timeoutMs": 60000
+      }
+    }
+  }
+}
+```
+
+What the merge guarantees, and what it refuses to do:
+
+- every other key and every other MCP server in the file is preserved;
+- it is idempotent: running it twice changes nothing the second time;
+- an entry that is already present and identical leaves the file **untouched**;
+- before the first modification, the previous file is kept next to it, as
+  `config.json.zcloudium-backup`;
+- a malformed file is **refused, not repaired**: a syntax error, an `mcp` field
+  that is not an object, or an `mcp.servers` that is not an object, and the
+  container starts without the browser server, logging why. Your provider keys
+  are never rewritten from a guess;
+- the file is written atomically (temporary file plus rename) and keeps its
+  permissions, or gets `0600` if it is created.
+
+Set `ZCLOUDIUM_BROWSER_MCP=off` to leave the configuration alone entirely.
+
+In the restricted profile the home is `/data`, so the file lives in the volume.
+In the full access profile the home is the **real home of the machine**: this is
+where the backup matters, since the file typically holds your provider keys and
+your own MCP servers. Tested on that profile: the entry is added, `context7`
+and the provider section are intact, and the backup holds the previous file byte
+for byte.
+
+## The host filesystem, with full access (root)
+
+`compose.full-access.yml` runs the agent as root with the whole filesystem of
+the machine mounted on `/host`: it can read and write anywhere, including
+`/etc`, `/var` and `/root`.
 
 ```bash
-./check-full-access.sh                        # vérifie les mécanismes (image jetable)
-cp compose.full-access.yml compose.local.yml  # adapter le port et les chemins
+./check-full-access.sh                        # checks the mechanisms (throwaway image)
+cp compose.full-access.yml compose.local.yml  # adapt the port and the paths
 docker compose -f compose.local.yml up -d
 ```
 
-**Le point à comprendre : « sudo » n'est pas le mécanisme.** Installer sudo dans
-l'image ne donnerait aucun droit de plus — sudo ne fait que re-rootiser *à
-l'intérieur* du conteneur, alors que les droits réels sont décidés par les options
-de lancement. Ce qui donne l'accès root à la machine, ce sont exactement ces deux
-lignes :
+**What that means concretely**, since it is a use case this project supports on
+purpose:
+
+- the agent edits any file of the machine, including the kernel configuration,
+  the package database, systemd units and `/root`;
+- `apt install`, `git` on any repository of the machine, `docker` commands
+  through the (optional) socket, all work as root;
+- it can therefore break the system with a wrong path, and nothing inside the
+  container prevents that. The container stops being a boundary: the boundary
+  becomes the machine;
+- it sees your real `~/.zcode` (skills, commands, memories, configuration), so
+  the setup is your personal environment, and files created there belong to
+  root: your user will need `sudo` to change or delete them.
+
+**What it costs**, in the same terms: snapshots before every unsupervised run,
+no infrastructure credentials on that machine, no access to the rest of the
+fleet, and an isolated VLAN. Treat it as compromised by design.
+
+**The point to understand: "sudo" is not the mechanism.** Installing sudo in the
+image would grant no additional right: sudo only re-roots *inside* the
+container, while the real rights are decided by the launch options. What gives
+root on the machine is exactly these two lines:
 
 ```yaml
-user: root          # uid 0 dans le conteneur = uid 0 sur le FS monté
+user: root          # uid 0 in the container equals uid 0 on the mounted filesystem
 volumes:
-  - /:/host         # tout le FS de la machine
+  - /:/host         # the whole filesystem of the machine
 ```
 
-`--privileged` n'est **pas** nécessaire pour ça (il n'ajoute que l'accès aux
-périphériques). `docker.sock` est une option distincte, également équivalente à
-root sur l'hôte, laissée commentée.
+`--privileged` is **not** required for that (it only adds access to devices).
+`docker.sock` is a separate option, equally equivalent to root on the host, and
+left commented out.
 
-### Retrouver ton ~/.zcode existant
+The authentication gateway is on by default in this profile, which is where it
+matters most: with a root agent, an open port would mean owning the machine.
 
-Les skills, commandes et mémoires ne se résolvent pas via le data dir mais via
-`$HOME/.zcode` (`packages/services/src/skills/skillsService.ts` et
-`.../memory/memoryService.ts`). D'où le réglage des deux variables vers ton vrai
-home :
+### Finding your existing ~/.zcode again
+
+Skills, commands and memories do not resolve through the data directory but
+through `$HOME/.zcode` (`packages/services/src/skills/skillsService.ts` and
+`.../memory/memoryService.ts`). Hence both variables point at your real home:
 
 ```yaml
 environment:
@@ -188,15 +332,15 @@ environment:
   ZCODE_DATA_BASE_DIR: /host/home/<user>
 ```
 
-L'agent voit alors `~/.zcode/skills`, `~/.zcode/cli` (commandes, mémoires) et
-`~/.zcode/v2` (configuration). Copie ton `~/.zcode` de poste vers cette machine
-pour partir de ton environnement existant.
+The agent then sees `~/.zcode/skills`, `~/.zcode/cli` (commands, memories,
+`config.json`) and `~/.zcode/v2` (configuration). Copy your workstation
+`~/.zcode` to that machine to start from your existing environment.
 
-### Protection git à lever
+### Git protection to lift
 
-En root, git refuse d'opérer sur un dépôt appartenant à un autre uid
-(`detected dubious ownership in repository`). Le compose lève la protection pour
-ce process uniquement, sans toucher à la config git de la machine :
+As root, git refuses to work on a repository owned by another uid (`detected
+dubious ownership in repository`). The compose file lifts the protection for
+this process only, without touching the machine's git configuration:
 
 ```yaml
 GIT_CONFIG_COUNT: "1"
@@ -204,120 +348,222 @@ GIT_CONFIG_KEY_0: safe.directory
 GIT_CONFIG_VALUE_0: "*"
 ```
 
-### Effet de bord à connaître
+### Known side effect
 
-Lancé en root, l'agent crée des fichiers **appartenant à root** dans le
-`$HOME/.zcode` de la machine (`v2/provider_config.json`, bases sqlite,
-certificats). L'utilisateur devra passer par `sudo` pour les modifier ou les
-supprimer. C'est la conséquence de l'uid 0, pas un bug.
+Run as root, the agent creates files **owned by root** in the machine's
+`$HOME/.zcode` (`v2/provider_config.json`, sqlite databases, certificates) and
+in `$HOME/.zcode/cli/config.json`, which the entrypoint also touches. Your VM
+user will need `sudo` to modify or delete them. That is the consequence of uid
+0, not a bug.
 
-### Risque
+## Authentication of a compromise: what the gateway does and does not do
 
-Root sur toute la machine **plus** `--no-token` : quiconque atteint le port 3030
-devient root sur le système. Le bind sur une IP privée est alors la seule barrière.
-Prends un snapshot de la machine avant la première utilisation — un agent qui se
-trompe de chemin peut casser le système — et traite cette machine comme
-compromise par conception : pas de credentials d'infrastructure, pas d'accès au
-reste du parc.
+It decides who may talk to the runtime, nothing more. It does not sandbox the
+agent, does not filter the network, and does not add a multi-user model: one
+instance, one account. See [SECURITY.md](SECURITY.md) for the full reasoning.
 
-## Configurer le modèle
+## The versioning model
 
-Aucun tunnel vers z.ai n'est nécessaire : client web, backend et agent tournent
-dans le conteneur. Seuls les appels au LLM sortent.
+Two files, one single truth:
 
-Au premier accès, l'interface affiche directement l'écran d'accueil **API Key**
-(provider `Z.ai`, champ de clé, bouton Continue). La clé est écrite côté serveur
-dans `provider_config.json` du volume `/data` : elle survit aux recréations de
-conteneur. Le `baseUrl` étant configurable, un endpoint compatible
-OpenAI/Anthropic local fonctionne aussi.
+| File | Content |
+| --- | --- |
+| `zcode.version` | the pinned upstream release tag (for example `v3.14.3`) |
+| `zcode.sha256` | the sha256 of that release tarball |
 
-À noter : avec `--no-token`, le serveur n'enregistre pas
-`IProviderProvisioningTargetService` (canal qui permet à un client desktop distant
-de pousser ses credentials). Le passage par les réglages de l'interface n'est pas
-affecté ; c'est simplement le seul chemin disponible.
+One image tag per release, the sha256 written into a label
+(`org.opencontainers.image.revision`), and an automatic watch:
 
-## Avertissement de sécurité
+```bash
+./check-upstream.sh              # up to date? (exit 0) or new release? (exit 1)
+./check-upstream.sh --bump       # updates zcode.version + zcode.sha256
+./check-upstream.sh --build      # bump, then rebuild locally
+REPO=zai-org/ZCode ./check-upstream.sh   # watch the original upstream instead
+```
 
-L'image tourne **sans authentification** (`--no-token`). Quiconque atteint le port
-peut faire exécuter des commandes shell par l'agent, en tant qu'utilisateur `node`
-dans le profil restreint, en tant que **root** dans le profil accès total.
+The `upstream-check` workflow does that watch every week and **opens an issue**
+when a release comes out. It never modifies anything by itself: the bump stays
+an explicit decision.
 
-Le défaut est donc `127.0.0.1` : joignable depuis la machine hôte uniquement.
-Pour l'ouvrir au réseau, deux options :
+## Building the image yourself
 
-- publier le port sur l'IP privée (`ports: "10.x.x.x:3030:3030"`), jamais
-  `3030:3030`
-- ou retirer `--no-token` : le serveur génère un token et l'affiche dans
-  `docker compose logs`, à utiliser via `?token=...`
+```bash
+./build.sh                # -> ghcr.io/sigma-gigachad/z-cloudium:{3.14.3,latest}
+./build.sh --push         # same, then push to the registry
+```
 
-## Ce qui a été vérifié
+A build without any cache (`docker build --no-cache`, measured at 39 seconds on
+the development machine) installs Chromium and its fonts (342 MB), installs the
+pinned browser MCP server, downloads the 81 MB upstream tarball, verifies its
+sha256 and extracts it. A rebuild with a warm cache takes a few seconds. A local
+build satisfies the compose files directly, since they reference the same image
+name.
 
-Testé par exécution réelle, pas seulement écrit :
+The CI (`.github/workflows/build.yml`) rebuilds and publishes on every push to
+`main`, then a `smoke` job **starts the published image**, checks that the
+gateway answers, that the interface sits behind it, and that Chromium and the
+browser MCP server are in place. An image is not shipped without having been
+started.
 
-- build de l'image : ~13 s, sha256 du tarball vérifié pendant le build
-- taille de l'image : 680 Mo
-- conteneur : `healthy`, `GET /` répond 200, `/api/server-info` renvoie
-  `{"version":"3.14.0","authRequired":false,"workspaces":[{"path":"/workspace"}]}`
-- UI : la page se monte et affiche l'onboarding « API Key » (provider Z.ai)
-- **profil restreint durci** : HTTP 200, `User=1000:1000`, `ReadonlyRootfs=true`,
-  `CapDrop=[ALL]`, `no-new-privileges`, écriture dans le volume `/data` OK
-- **profil accès total durci** : HTTP 200, `User=root`, `CapAdd` limité aux 7
-  capacités d'administration, lecture de `/etc/shadow` OK, écriture sur le FS monté
-  OK, skills visibles via `$HOME/.zcode`
-- `check-full-access.sh` valide les 5 mécanismes du profil accès total
-- **CI** : jobs `build` et `smoke` verts au premier passage (commit `d6a7e61`).
-  Trois tags poussés — `latest`, `3.14.3`, `sha-d6a7e61` — sous le digest
-  `sha256:83ae9903…`. Le job `smoke` a tiré l'image **publiée**, l'a démarrée avec
-  le durcissement complet et a vérifié que l'interface répond.
+## Hardening
 
-## Détails d'implémentation
+The complete detail (what is applied, what is deliberately left out, and the
+residual risks) is in [SECURITY.md](SECURITY.md). In summary:
 
-- **Base glibc obligatoire** (`node:24.14.0-bookworm`) et non Alpine : le paquet
-  runtime embarque les binaires précompilés `node-pty`
-  (`@lydell/node-pty-linux-x64`) et aucune variante musl n'est fournie.
-- **Node 24.14.0** est la version épinglée par le projet (`mise.toml`) et
-  nécessaire au runtime, pas seulement au build.
-- **Recherche de fichiers** : ripgrep, bfs et ugrep sont embarqués dans le paquet
-  runtime, inutile de les installer dans l'image.
-- **Volumes** : `/data` (état, clé API, sessions, skills) et `/workspace` sont les
-  deux seuls points à persister. Sur un montage de dossier, pense à
-  `chown 1000:1000` côté hôte.
-- `server-info` annonce `3.14.0` alors que le tag de release est `v3.14.3` : c'est
-  le tag d'image qui fait foi.
+**In the image**: base pinned by digest, runtime verified against the sha256
+pinned in this repository, build refused if the third party runtime carries a
+setuid/setgid binary, no build toolchain, unprivileged user by default, gateway
+in front of the published port.
 
-## Pourquoi ce fork plutôt que l'amont
+**In the containers**: `no-new-privileges`, `cap_drop: [ALL]` then explicit
+addition of the minimum, `pids`/`mem`/`cpus` limits, no Docker socket by
+default, port bound to a single interface, telemetry forced off.
 
-Amont (`zai-org/ZCode`) ne publie que des installeurs desktop (dmg / exe) : utiliser
-l'amont imposerait de compiler le monorepo à chaque version, soit 15 à 30 minutes
-de build sur une machine équipée. ZCodium publie, à chaque release, le tarball du
-runtime serveur avec son `sha256.txt` — d'où un build de quinze secondes ici.
+The restricted profile (`compose.yml`) adds the read-only root filesystem with a
+tmpfs `/tmp`. The full access profile does not apply it, deliberately: with root
+on `/host` it would prevent no persistence while breaking `apt install`.
 
-Ce fork annonce retirer la télémétrie et les remontées de l'amont, et synchroniser
-les commits amont un par un. **Ce point n'est pas vérifié** : c'est une affirmation
-de tiers, sur du code de tiers. Deux garde-fous limitent le risque : le sha256 est
-épinglé dans ce repo (une release modifiée fait échouer le build), et l'image force
-`ZCODE_MODEL_TELEMETRY_ENABLED=0` (l'export OTLP amont est de toute façon inactif
-sans `OTEL_EXPORTER_OTLP_ENDPOINT` configuré).
+**Chromium weakens its own sandbox, and that is stated plainly**: inside the
+container the browser is started with `--no-sandbox`, because capabilities are
+dropped and `no-new-privileges` is set, which makes the setuid helper and the
+namespace sandbox unusable (`No usable sandbox!` is what Chromium answers
+without it). What contains it is the container itself (uid 1000, read-only root
+filesystem, no capability, no-new-privileges) plus the rule that matters: the
+browser must not be pointed at untrusted pages. See SECURITY.md.
 
-Si tu ne veux dépendre que de l'éditeur d'origine, `Dockerfile.from-source` compile
-l'amont toi-même — au prix du build long, et il n'est pas encore validé (voir plus
-bas).
+## What has been verified
 
-## Dockerfile.from-source (non validé)
+Tested by actually running things, not only written:
 
-Compile l'amont `zai-org/ZCode` à la place du runtime précompilé.
+- **test suite**: all green, in a throwaway container
+  (`node:24.14.0-bookworm-slim`, `node --test`, which prints the count)
+- **image build**: 1.38 GB, `chromium --version` answers
+  `Chromium 153.0.8010.52` inside the built image, `chrome-devtools-mcp
+  --version` answers `1.10.1`
+- **container start** (restricted profile, all hardening on): the entrypoint
+  logs `gateway listening on 0.0.0.0:3030 (authentication on), runtime confined
+  to 127.0.0.1:3131`, container `healthy`
+- **health endpoint**: `GET /_auth/health` returns `200 ok` without a session
+- **redirect**: `GET /` returns `302` to `/_auth/login?next=%2F`, and
+  `/api/server-info` is not proxied without a session
+- **full login**: setup wizard, TOTP enrolment, session cookie, then
+  `GET /api/server-info` returns `200` with
+  `{"version":"3.14.0","workspaces":[{"path":"/workspace"}]}` and `GET /`
+  returns the application shell
+- **session lifetime**: the session cookie issued by the wizard carries
+  `Max-Age=43200` (12 hours) by default, `Max-Age=3600` with
+  `ZCLOUDIUM_SESSION_TTL_HOURS=1`, and an unusable value
+  (`ZCLOUDIUM_SESSION_TTL_HOURS=forever`) falls back to 43200 with a line in the
+  logs saying so. The default is pinned by a test, so the code and this
+  documentation cannot drift apart
+- **full access workspace**: with the full access profile the runtime reports
+  `workspaces[].path` as the mounted operator home (measured on a throwaway home
+  in the test), not the image default `/workspace`: the workspace comes from
+  `ZCODE_SERVER_WORKSPACE`
+- **leftover `command:` block**: a container started with the old argument list
+  appended logs `ignoring the extra command line arguments (...)` and still runs
+  with the loopback arguments built from the environment
+- **failure block**: from inside a container, eight wrong passwords each carrying
+  a different `x-forwarded-for` are all answered `401` and attributed to the
+  socket address in the logs, and the correct password that follows is answered
+  `429` (before this was keyed on the socket, that same sequence ended on `303`,
+  so the header was enough to start over). Eight wrong codes at the second factor
+  followed by a genuinely valid code are answered `429` with no session, where
+  the second factor used to accept the valid code after eight failures
+- **failure block, and the end of it**: the same container, measured before and
+  after the fix: eight wrong passwords are answered `401` and the ninth `429` in
+  both. Once the five minutes are over, the gateway before the fix answered the
+  next wrong password `401` and the one after it `429`, so one attempt every five
+  minutes kept the sign in page refused indefinitely. It now answers `401` to
+  eight fresh wrong passwords and only the ninth is `429`, which is the budget
+  starting again
+- **open redirect**: a sign in whose `next` is `/\evil.com`, `/%5Cevil.com`,
+  `//evil.com` or `/\/evil.com` ends on `/`, the root of this origin, instead of
+  redirecting to the host the value names. The value the sign in page renders in
+  its hidden field is the sanitised one, and that is where a path that dot
+  segment normalisation turns into a protocol relative one was visible:
+  `next=/..//evil.com`, `/.//evil.com`, `/%2e%2e//evil.com` and `/a/..//evil.com`
+  render as `/` (the gateway before the fix rendered `value="//evil.com"` for
+  each of them), while a legitimate `/settings?tab=model` still renders in full
+- **browser MCP server**: handshake over stdio as uid 1000 under the same
+  hardening, 30 tools listed, `navigate_page` on a `data:` URL succeeded,
+  `evaluate_script` returned the page title and the user agent
+  (`HeadlessChrome/153.0.0.0`), `take_screenshot` returned a PNG (93612 base64
+  characters, about 70 KB): the browser really renders
+- **agent configuration merge**: created on first start, then
+  `already configured` on restart with the file untouched; on the full access
+  profile the entry is added to the mounted operator home, `context7` and the
+  provider section are intact, and the backup holds the original file byte for
+  byte
+- **`ZCLOUDIUM_AUTH=off`**: the runtime answers on the published port with no
+  authentication, `GET /api/server-info` returns `200`
+- **`ZCLOUDIUM_BROWSER_MCP=off`**: the configuration file is byte for byte
+  identical after the start, no backup created
+- **restricted profile via compose**: `ReadonlyRootfs=true`, `CapDrop=[ALL]`,
+  `no-new-privileges`, `User=1000:1000`, tmpfs `/tmp`, and the gateway answers
+  while writing only into the `/data` volume
+- **CI**: `build` and `smoke` jobs green on the previous image (commit
+  `d6a7e61`). Three tags pushed, `latest`, `3.14.3` and `sha-d6a7e61`, under the
+  digest `sha256:83ae9903...`. The `smoke` job pulled the **published** image,
+  started it with the full hardening and checked that the interface answered.
 
-**Ce chemin ne fonctionne pas encore tel quel.** Constat du 2026-09-24 :
-`pnpm build:zcode` échoue sur `Missing @zcode/shared dist files`, car
-`packages/shared` n'a pas de script de build et n'est jamais compilé par
-`build:zcode`, alors que le collecteur d'assets SEA
-(`sea-runtime-package-resolution.mjs`) exige `packages/shared/dist/index.js`. La
-séquence officielle du projet (`scripts/bootstrap.mjs` → `pnpm run build:bootstrap`)
-a été ajoutée dans ce Dockerfile et devrait produire ce `dist`, mais elle n'a pas
-été testée.
+## Implementation details
 
-## Limites du mode Web
+- **glibc base is mandatory** (`node:24.14.0-bookworm`), not Alpine: the runtime
+  package embeds precompiled `node-pty` binaries
+  (`@lydell/node-pty-linux-x64`) and no musl variant is published.
+- **Node 24.14.0** is the version the project pins (`mise.toml`) and that the
+  runtime needs, not only the build.
+- **File search**: ripgrep, bfs and ugrep are embedded in the runtime package,
+  there is no need to install them in the image.
+- **Fonts**: `fonts-dejavu-core`, `fonts-liberation` and
+  `fonts-noto-color-emoji` are installed, because `--no-install-recommends`
+  installs no font at all and Chromium would then render pages with empty boxes.
+  CJK fonts are left out on purpose (tens of megabytes): add `fonts-noto-cjk` in
+  a derived image if you need them.
+- **Volumes**: `/data` (authentication, session key, API key, settings, skills,
+  agent configuration) and `/workspace` are the only two paths to persist. On a
+  bind mount, remember `chown 1000:1000` on the host.
+- **`server-info` announces `3.14.0`** while the release tag is `v3.14.3`: the
+  image tag is what counts.
+- **Gateway files** live in `/opt/cloudium/gateway`, outside `/opt/zcodium`, so
+  the third party runtime directory stays exactly as it was extracted. The
+  gateway imports no application code: it is an additive layer, and an upstream
+  update cannot break it.
 
-Le mode Web ne permet pas de se connecter à un projet distant depuis l'interface
-(`connectRemote` répond *not supported in Web mode yet*) : le workspace est le
-dossier serveur monté sur `/workspace`.
+## Why this fork rather than upstream
+
+Upstream (`zai-org/ZCode`) publishes desktop installers only (dmg / exe): using
+it would mean compiling the monorepo at every version, that is 15 to 30 minutes
+of build on a capable machine. ZCodium publishes the server runtime tarball with
+its `sha256.txt` at every release, hence a build measured in minutes here.
+
+This fork claims to remove upstream telemetry and reporting, and to synchronise
+upstream commits one by one. **That is not verified**: it is a third party
+claim about third party code. Two safeguards limit the risk: the sha256 is
+pinned in this repository (a modified release fails the build), and the image
+forces `ZCODE_MODEL_TELEMETRY_ENABLED=0` (the upstream OTLP exporter is inactive
+anyway without `OTEL_EXPORTER_OTLP_ENDPOINT`).
+
+If you want to depend only on the original vendor, `Dockerfile.from-source`
+compiles upstream yourself, at the price of a long build, and it is not
+validated yet (see below).
+
+## Dockerfile.from-source (not validated)
+
+Compiles upstream `zai-org/ZCode` instead of using the precompiled runtime.
+
+**That path does not work as is yet.** Finding of 2026-09-24: `pnpm build:zcode`
+fails on `Missing @zcode/shared dist files`, because `packages/shared` has no
+build script and is never compiled by `build:zcode`, while the SEA asset
+collector (`sea-runtime-package-resolution.mjs`) requires
+`packages/shared/dist/index.js`. The official sequence of the project
+(`scripts/bootstrap.mjs` then `pnpm run build:bootstrap`) was added to that
+Dockerfile and should produce that `dist`, but it has not been tested.
+
+## Limits of web mode
+
+Web mode does not allow connecting to a remote project from the interface
+(`connectRemote` answers *not supported in Web mode yet*): the workspace is the
+server directory mounted on `/workspace`. Distinctly, browser automation is now
+available through the baked MCP server described above.

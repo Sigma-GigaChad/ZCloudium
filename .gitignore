@@ -1,11 +1,11 @@
-# Déclinaisons locales des fichiers compose : contiennent l'IP privée de la VM
-# et les chemins du home, donc propres à chaque machine.
+# Local variants of the compose files: they hold the private IP of the VM and
+# the home paths, so they are specific to each machine.
 compose.local.yml
 compose.*.local.yml
 
-# Scripts de test jetables
-.test-*.sh
+# Throwaway test scripts
+.test-*
 
-# Divers
+# Miscellaneous
 *.log
 .DS_Store

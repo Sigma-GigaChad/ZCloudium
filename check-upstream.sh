@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Compare la version épinglée (zcode.version) avec la dernière release publiée,
-# et signale les mises à jour disponibles.
+# Compares the pinned version (zcode.version) with the latest published release
+# and reports available updates.
 #
-#   ./check-upstream.sh            -> à jour ? (exit 0) ou mise à jour dispo ? (exit 1)
-#   ./check-upstream.sh --bump     -> met à jour zcode.version + zcode.sha256, sans builder
-#   ./check-upstream.sh --build    -> --bump puis ./build.sh
-#   REPO=zai-org/ZCode ./check-upstream.sh    -> surveiller l'amont d'origine à la place
+#   ./check-upstream.sh            -> up to date? (exit 0) or update available? (exit 1)
+#   ./check-upstream.sh --bump     -> updates zcode.version + zcode.sha256, without building
+#   ./check-upstream.sh --build    -> --bump, then ./build.sh
+#   REPO=zai-org/ZCode ./check-upstream.sh    -> watch the original upstream instead
 #
-# Aucune dépendance (ni jq, ni node) : curl, grep, cut et sed suffisent.
-# Pensé pour un cron.
+# No dependency (no jq, no node): curl, grep, cut and sed are enough. Meant for
+# a cron job.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,7 +22,7 @@ for arg in "$@"; do
     --bump) MODE="bump" ;;
     --build) MODE="build" ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "Option inconnue : $arg" >&2; exit 2 ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 
@@ -31,29 +31,29 @@ RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest
 LATEST="$(printf '%s' "$RELEASE_JSON" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d '"' -f 4)"
 
 if [ -z "$LATEST" ]; then
-  echo "Impossible de lire la dernière release de $REPO." >&2
+  echo "Cannot read the latest release of $REPO." >&2
   exit 2
 fi
 
 if [ "$CURRENT" = "$LATEST" ]; then
-  echo "À jour : $CURRENT ($REPO)"
+  echo "Up to date: $CURRENT ($REPO)"
   exit 0
 fi
 
-echo "Mise à jour disponible sur $REPO : $CURRENT -> $LATEST"
+echo "Update available on $REPO: $CURRENT -> $LATEST"
 
 if [ "$MODE" = "check" ]; then
-  echo "Pour bumper : ./check-upstream.sh --bump"
+  echo "To bump: ./check-upstream.sh --bump"
   exit 1
 fi
 
-## Récupère le sha256 officiel de la release et l'épingle dans le repo.
+## Fetches the official sha256 of the release and pins it in the repository.
 TARBALL="zcodium-${LATEST#v}.tar.gz"
 SHA_URL="https://github.com/${REPO}/releases/download/${LATEST}/sha256.txt"
 SHA="$(curl -fsSL "$SHA_URL" | grep -F "$TARBALL" | awk '{print $1}' | head -n 1)"
 
 if [ -z "$SHA" ]; then
-  echo "sha256 introuvable pour $TARBALL dans $SHA_URL" >&2
+  echo "no sha256 found for $TARBALL in $SHA_URL" >&2
   exit 2
 fi
 

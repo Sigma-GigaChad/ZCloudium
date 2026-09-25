@@ -1,4 +1,7 @@
-# Le contexte de build ne sert qu'au Dockerfile : les sources amont sont clonées
-# dans le builder. Garder le contexte minimal évite d'envoyer le repo local.
+# The build context only serves the Dockerfile and the gateway sources, which
+# are copied into the image. Keeping the context minimal avoids sending the
+# whole repository to the daemon.
 *
 !Dockerfile
+!gateway
+!gateway/**

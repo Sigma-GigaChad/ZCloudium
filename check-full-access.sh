@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Vérifie qu'un conteneur lancé en accès total voit réellement tout le FS de la
-# VM et s'y comporte en root. À lancer SUR LA VM (ou via `wsl -e bash`).
+# Checks that a container started with full access really sees the whole
+# filesystem of the VM and behaves as root inside it. Run it ON the VM (or
+# through `wsl -e bash`).
 #
 #   ./check-full-access.sh
 #
-# Le conteneur de test est jetable (--rm) et n'est jamais exposé sur le réseau :
-# l'entrypoint est remplacé par bash, donc aucun serveur web n'est démarré.
+# The test container is disposable (--rm) and is never exposed on the network:
+# the entrypoint is replaced by bash, so no web server is started.
 
 set -euo pipefail
 
@@ -14,15 +15,15 @@ IMAGE="${IMAGE:-ghcr.io/sigma-gigachad/z-cloudium:latest}"
 FAKE_HOME="/tmp/zcode-access-check-home"
 TEST_REPO="/tmp/zcode-access-check-repo"
 
-## Décor : un faux $HOME contenant un .zcode, et un dépôt git appartenant à un
-## autre uid que root (pour déclencher la protection « dubious ownership » de git).
+## Setup: a fake $HOME holding a .zcode, and a git repository owned by a uid
+## other than root (to trigger the "dubious ownership" protection of git).
 mkdir -p "${FAKE_HOME}/.zcode/skills/demo"
-echo "skill de test" > "${FAKE_HOME}/.zcode/skills/demo/SKILL.md"
+echo "test skill" > "${FAKE_HOME}/.zcode/skills/demo/SKILL.md"
 mkdir -p "$TEST_REPO"
 git -C "$TEST_REPO" init -q 2>/dev/null || true
 chown -R 1234:1234 "$TEST_REPO" 2>/dev/null || true
 
-echo "==> Test de l'image $IMAGE (user=root, / monté sur /host)"
+echo "==> Testing image $IMAGE (user=root, / mounted on /host)"
 echo
 
 docker run --rm \
@@ -33,41 +34,41 @@ docker run --rm \
   -e "REPO=/host${TEST_REPO}" \
   --entrypoint bash \
   "$IMAGE" -c '
-    echo "uid dans le conteneur : $(id -u) ($(id -un))"
+    echo "uid in the container: $(id -u) ($(id -un))"
 
-    echo -n "lecture de /host/etc/shadow (root seul) : "
+    echo -n "reading /host/etc/shadow (root only): "
     if head -c 12 /host/etc/shadow >/dev/null 2>&1; then
-      echo "OK (root confirme)"
+      echo "OK (root confirmed)"
     else
-      echo "REFUSE"
+      echo "REFUSED"
     fi
 
-    echo -n "ecriture dans /host/tmp : "
+    echo -n "writing into /host/tmp: "
     if touch /host/tmp/zcode-write-check && rm -f /host/tmp/zcode-write-check; then
       echo "OK"
     else
-      echo "REFUSE"
+      echo "REFUSED"
     fi
 
-    echo -n "HOME/.zcode visible (skills) : "
+    echo -n "HOME/.zcode visible (skills): "
     ls "$HOME/.zcode/skills" 2>/dev/null | tr "\n" " "
     echo
 
-    echo -n "git sans correctif : "
+    echo -n "git without the workaround: "
     if git -C "$REPO" status >/dev/null 2>&1; then
-      echo "passe (aucun conflit de proprietaire)"
+      echo "passes (no owner conflict)"
     else
-      echo "ECHOUE (protection dubious ownership)"
+      echo "FAILS (dubious ownership protection)"
     fi
 
-    echo -n "git avec GIT_CONFIG_* : "
+    echo -n "git with GIT_CONFIG_*: "
     if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*" \
        git -C "$REPO" status >/dev/null 2>&1; then
       echo "OK"
     else
-      echo "ECHOUE"
+      echo "FAILS"
     fi
   '
 
-## Nettoyage du décor de test.
+## Cleanup of the test setup.
 rm -rf "$FAKE_HOME" "$TEST_REPO"

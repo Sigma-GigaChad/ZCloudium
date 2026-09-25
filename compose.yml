@@ -1,83 +1,113 @@
-# Profil restreint : l'agent travaille dans /workspace, en utilisateur non
-# privilégié (uid 1000), avec le rootfs du conteneur en lecture seule.
-# C'est le profil à préférer, et celui que `docker compose up -d` lance tel quel.
+# Restricted profile: the agent works in /workspace as an unprivileged user
+# (uid 1000), with the container root filesystem mounted read-only. This is the
+# profile to prefer, and the one `docker compose up -d` starts as is.
 #
-# Défauts choisis pour fonctionner sans aucune édition :
-#   - image tirée de GHCR (voir README pour l'authentification, le paquet est privé)
-#   - port exposé sur 127.0.0.1 uniquement : accessible depuis cette machine
-#   - workspace dans un volume Docker nommé, donc aucun droit à préparer sur l'hôte
+# Defaults chosen so that it runs with no editing at all:
+#   - image pulled from GHCR (see README for the authentication, the package is private)
+#   - port published on 127.0.0.1 only: reachable from this machine
+#   - workspace in a named Docker volume, so the host needs no preparation
 #
-# Durcissement : rootfs read-only + tmpfs, no-new-privileges, cap_drop ALL,
-# limites de ressources, utilisateur non-root. Détail dans SECURITY.md.
+# Hardening: read-only rootfs plus tmpfs, no-new-privileges, cap_drop ALL,
+# resource limits, non-root user. Details in SECURITY.md.
+#
+# There is no `command:` block any more. The image entrypoint
+# (/opt/cloudium/gateway/start.mjs) starts the runtime on 127.0.0.1:3131 with
+# --no-token, merges the browser MCP server into the agent configuration, and
+# serves the published port 3030 through the authentication gateway.
 
 services:
   z-cloudium:
     image: ghcr.io/sigma-gigachad/z-cloudium:latest
-    # Pour épingler une version au lieu de suivre `latest` :
+    # To pin a version instead of following `latest`:
     # image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
     container_name: z-cloudium
     restart: unless-stopped
     stop_grace_period: 20s
 
-    ## Utilisateur non privilégié, comme dans l'image. Redondant volontairement.
+    ## Unprivileged user, as in the image. Deliberately redundant.
     user: "1000:1000"
 
     ports:
-      # 127.0.0.1 = joignable depuis cette machine seulement. Pour y accéder depuis
-      # une autre machine du réseau privé, remplacer par l'IP de la machine :
+      # 127.0.0.1 = reachable from this machine only. To reach it from another
+      # machine of the private network, replace it with that machine's IP:
       #   "10.10.100.50:3030:3030"
-      # Ne jamais écrire "3030:3030" (toutes les interfaces, sans authentification).
+      # Never write "3030:3030" (every interface).
       - "127.0.0.1:3030:3030"
 
     volumes:
-      # /data : clé API, réglages, sessions, skills. Sans ce volume, chaque
-      # recréation de conteneur repart d'une installation vierge.
-      # Docker initialise le volume avec l'uid 1000 de /data dans l'image.
+      # /data holds the authentication accounts and the session key (auth/), the
+      # API key, the settings, the skills and the agent configuration. Without
+      # this volume every container recreation starts from a fresh installation
+      # and the setup wizard runs again.
+      # Docker initializes the volume with the uid 1000 of /data in the image.
       - z-cloudium-data:/data
-      # Workspace : volume nommé par défaut pour que `docker compose up -d`
-      # fonctionne sans préparation. Pour travailler sur de vrais fichiers,
-      # commenter cette ligne et monter un dossier de l'hôte à la place
-      # (après `chown 1000:1000` côté hôte, le conteneur tourne en uid 1000) :
+      # Workspace: a named volume by default, so `docker compose up -d` works
+      # without preparation. To work on real files, comment this line out and
+      # mount a host directory instead (after `chown 1000:1000` on the host,
+      # since the container runs as uid 1000):
       #   - /srv/z-cloudium/workspace:/workspace
       - z-cloudium-workspace:/workspace
 
     environment:
-      # HOME et ZCODE_DATA_BASE_DIR pointent tous deux vers /data : les skills
-      # ($HOME/.zcode/skills), les mémoires (<base>/.zcode/cli/memories) et la
-      # configuration vivent dans le volume, donc persistent.
+      # HOME and ZCODE_DATA_BASE_DIR both point at /data: the skills
+      # ($HOME/.zcode/skills), the memories, the agent configuration
+      # ($HOME/.zcode/cli/config.json) and the web settings live in the volume,
+      # so they persist.
       HOME: /data
       ZCODE_DATA_BASE_DIR: /data
       ZCODE_SERVER_WORKSPACE: /workspace
       ZCODE_MODEL_TELEMETRY_ENABLED: "0"
 
-    ## ---------- Durcissement ----------
-    # Le rootfs du conteneur ne peut pas être modifié : une compromission ne
-    # persiste pas, et l'outillage de l'image (node, git) ne peut pas être altéré
-    # depuis l'intérieur. Les écritures légitimes passent par /data, /workspace
-    # et /tmp.
+      # Authentication gateway on the published port: a password plus a TOTP
+      # code, and the setup wizard on the first connection. Setting
+      # ZCLOUDIUM_AUTH=off publishes the runtime directly, without any
+      # authentication, which is only acceptable on a trusted network.
+      ZCLOUDIUM_AUTH: "on"
+      # Browser automation through the MCP server baked into the image. "off"
+      # leaves the agent configuration untouched.
+      ZCLOUDIUM_BROWSER_MCP: "on"
+      # How long a session lasts, in hours. 12 by default, which is also the
+      # window during which a stolen cookie stays usable: raise it only with
+      # that in mind. Any value that is not a positive number falls back to 12.
+      ZCLOUDIUM_SESSION_TTL_HOURS: "12"
+      # Leave this off unless a reverse proxy in front of the container
+      # overwrites x-forwarded-for: with it on, the failure block is keyed on a
+      # header the client can set, which is the same as having no block at all.
+      # With it off (the default) the block is keyed on the connecting socket,
+      # and every client behind the Docker port mapping shares one key.
+      # ZCLOUDIUM_TRUST_PROXY: "off"
+
+    ## ---------- Hardening ----------
+    # The container root filesystem cannot be modified: a compromise does not
+    # persist, and the image tooling (node, git, chromium) cannot be altered
+    # from the inside. The gateway only writes into the /data volume, which is
+    # why this keeps working. Legitimate writes go to /data, /workspace and /tmp.
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777
-    # Empêche toute élévation via binaire setuid ou fichier-capability.
+    # Prevents any elevation through a setuid binary or a file capability, which
+    # is also what makes Chromium's setuid sandbox helper unusable (see
+    # SECURITY.md for the consequence, it is stated there and not hidden).
     security_opt:
       - no-new-privileges:true
-    # Aucune capacité : uid 1000 n'en a besoin d'aucune pour son travail.
+    # No capability: uid 1000 needs none for its work.
     cap_drop:
       - ALL
-    # Garde-fous de ressources (à ajuster selon la machine).
+    # Resource guards (adjust to the machine). Browser automation adds a handful
+    # of Chromium processes and its own memory; raise pids_limit and mem_limit if
+    # a heavy page hits them.
     pids_limit: 512
     mem_limit: 4g
     cpus: 2
 
-    command:
-      - --web
-      - --host=0.0.0.0
-      - --port=3030
-      - --workspace=/workspace
-      - --no-open
-      # Sans authentification : acceptable uniquement sur réseau privé.
-      # Pour l'activer, retirer cette ligne (le token apparaît dans les logs).
-      - --no-token
+    # With ZCLOUDIUM_AUTH=off there is no gateway, and the probe above falls
+    # through to the web app. Uncomment this to probe the runtime instead:
+    # healthcheck:
+    #   test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/server-info').then(r=>process.exit(r.ok||r.status===401?0:1)).catch(()=>process.exit(1))\""]
+    #   interval: 30s
+    #   timeout: 5s
+    #   start_period: 20s
+    #   retries: 3
 
 volumes:
   z-cloudium-data:
