@@ -159,10 +159,85 @@ async function main() {
       .inputValue({ timeout: 5000 })
       .catch(() => null);
 
-  /** A digest of a screenshot, so "the picture changed" is a number and not an impression. */
-  const digestOf = async (name) => {
-    const bytes = await readFile(join(options.out, `${name}.png`));
-    return { name, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16) };
+  /** A digest of a screenshot that has already been written, and of its bytes. */
+  const digestOfFile = async (path) => {
+    const bytes = await readFile(path);
+    return { file: path.split(/[\\/]/).pop(), bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16) };
+  };
+
+  /**
+   * The frontend is DevTools, and DevTools builds most of its chrome inside shadow
+   * roots. `document.querySelector` does not see into those, so every probe below
+   * goes through Playwright's locators, which pierce them.
+   */
+  const seenInputs = async (page) => {
+    const inputs = page.locator("input");
+    const count = await inputs.count();
+    const rows = [];
+    for (let index = 0; index < Math.min(count, 40); index += 1) {
+      const element = inputs.nth(index);
+      rows.push({
+        ariaLabel: await element.getAttribute("aria-label"),
+        className: await element.getAttribute("class"),
+        title: await element.getAttribute("title"),
+        value: await element.inputValue().catch(() => null),
+      });
+    }
+    return rows;
+  };
+
+  /**
+   * What the frontend offers, read through the shadow DOM.
+   *
+   * `treeRows`, `addressBar` and `inputs` are the positive controls: the same
+   * locator engine that finds the Elements tree rows and the address bar is the
+   * one that finds no device toolbar below, so the absence is a measurement and
+   * not a blind spot.
+   */
+  const affordancesSeen = async (page) => ({
+    mainToolbar: await page.locator(".main-toolbar").count(),
+    deviceToolbar: await page.locator(".device-toolbar, .device-mode-toolbar, .device-toolbar-container").count(),
+    deviceModeToggle: await page
+      .locator('[aria-label*="device" i], [title*="device" i], .device-mode-toggle')
+      .count(),
+    treeRows: await page.locator("[role='treeitem']").count(),
+    selectedRows: await page.locator("[role='treeitem'][aria-selected='true'], [role='treeitem'].selected").count(),
+    addressBar: await page.locator('input[aria-label="Address bar"]').count(),
+    inputs: await seenInputs(page),
+  });
+
+  /** A clip in viewer coordinates for a rectangle the page reported, in page coordinates. */
+  const clipFor = async (page, rect) => {
+    const map = await screencastMap(page);
+    if (!map) {
+      throw new Error("no screencast canvas in the viewer");
+    }
+    const scaleX = map.width / map.intrinsicWidth;
+    const scaleY = map.height / map.intrinsicHeight;
+    return {
+      x: Math.max(0, map.x + rect.x * scaleX),
+      y: Math.max(0, map.y + rect.y * scaleY),
+      width: Math.max(4, rect.width * scaleX),
+      height: Math.max(4, rect.height * scaleY),
+    };
+  };
+
+  const cropDigest = async (page, clip) =>
+    createHash("sha256")
+      .update(await page.screenshot({ clip }))
+      .digest("hex")
+      .slice(0, 16);
+
+  /** Samples a crop until it differs from a baseline taken before the change. */
+  const settleFrom = async (page, clip, baseline, { attempts = 12, intervalMs = 500 } = {}) => {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      await page.waitForTimeout(intervalMs);
+      const digest = await cropDigest(page, clip);
+      if (digest !== baseline) {
+        return { changed: true, ms: attempt * intervalMs, from: baseline, to: digest };
+      }
+    }
+    return { changed: false, ms: attempts * intervalMs, from: baseline, to: baseline };
   };
 
   /** Clicks a page coordinate through the panel, using the element's own rect. */
@@ -187,7 +262,6 @@ async function main() {
     screencast: await screencastMap(viewer),
   });
   await shot(viewer, "obs1-a-before-navigation");
-  const digestA = await digestOf("obs1-a-before-navigation");
   await agent("obs1-before", [
     {
       tool: "evaluate_script",
@@ -204,11 +278,7 @@ async function main() {
   ]);
   await viewer.waitForTimeout(DEFAULTS.settleMs);
   await shot(viewer, "obs1-b-after-agent-navigation");
-  await note({
-    observation: "obs1-after-navigation",
-    shownUrl: await shownUrl(viewer),
-    digests: [digestA, await digestOf("obs1-b-after-agent-navigation"), await digestOf("obs1-c-back-on-the-fixture")],
-  });
+  await note({ observation: "obs1-after-navigation", shownUrl: await shownUrl(viewer) });
 
   await agent(
     "obs1-back",
@@ -220,7 +290,77 @@ async function main() {
   );
   await viewer.waitForTimeout(DEFAULTS.settleMs);
   await shot(viewer, "obs1-c-back-on-the-fixture");
-  await note({ observation: "obs1-back", shownUrl: await shownUrl(viewer) });
+
+  /**
+   * Two things observation 1 needs, and a whole-screenshot digest gives neither.
+   *
+   * The digest is taken after the file is written, so a clean evidence directory
+   * is not an error. And the claim is not "the bytes differ", which a ticking
+   * clock would satisfy even from a frozen picture: it is "the picture shows what
+   * the agent made the page show". So one crop of the fixture's heading is
+   * sampled while nothing changes, sampled again while the page ticks its own
+   * clock, then sampled around two changes the agent makes. The first is the
+   * control, the second measures whether a repaint alone reaches the panel, the
+   * last is the claim itself.
+   */
+  const headingSet = (text) =>
+    agent("obs1-heading", [
+      {
+        tool: "evaluate_script",
+        args: {
+          function: `() => { document.getElementById("heading").textContent = ${JSON.stringify(text)}; return document.getElementById("heading").textContent; }`,
+        },
+      },
+    ]);
+
+  const livenessRects = await agent("obs1-liveness", [
+    {
+      tool: "evaluate_script",
+      args: {
+        function:
+          "() => { const rect = (id) => { const b = document.getElementById(id).getBoundingClientRect(); return { x: b.x, y: b.y, width: b.width, height: b.height }; }; return { heading: rect('heading'), clock: rect('clock') }; }",
+      },
+    },
+  ]);
+  const rects = jsonFromTool(livenessRects[0]);
+  const headingClip = await clipFor(viewer, rects.heading);
+  const clockClip = await clipFor(viewer, rects.clock);
+
+  const stability = [];
+  for (let index = 0; index < 4; index += 1) {
+    stability.push(await cropDigest(viewer, headingClip));
+    await viewer.waitForTimeout(300);
+  }
+  const clockBaseline = await cropDigest(viewer, clockClip);
+  const clockWatch = await settleFrom(viewer, clockClip, clockBaseline);
+
+  const headingBaseline = await cropDigest(viewer, headingClip);
+  const changed = await headingSet("the agent changed this");
+  const afterFirstChange = await settleFrom(viewer, headingClip, headingBaseline);
+  await shot(viewer, "obs1-d-after-agent-dom-change");
+
+  const restoreBaseline = await cropDigest(viewer, headingClip);
+  const restored = await headingSet("Phase 0 fixture");
+  const afterRestore = await settleFrom(viewer, headingClip, restoreBaseline);
+
+  await note({
+    observation: "obs1-liveness",
+    shownUrl: await shownUrl(viewer),
+    clips: { heading: headingClip, clock: clockClip },
+    stabilitySamples: stability,
+    stabilityEqual: new Set(stability).size === 1,
+    clockWatch,
+    pageSaidAfterChange: jsonFromTool(changed[0]),
+    afterFirstChange,
+    pageSaidAfterRestore: jsonFromTool(restored[0]),
+    afterRestore,
+  });
+
+  const digests = [];
+  for (const name of ["obs1-a-before-navigation", "obs1-b-after-agent-navigation", "obs1-c-back-on-the-fixture"]) {
+    digests.push(await digestOfFile(join(options.out, `${name}.png`)));
+  }
+  await note({ observation: "obs1-back", shownUrl: await shownUrl(viewer), digests });
 
   // Observation 2: what the viewport affordances of the frontend actually are.
   //
@@ -230,17 +370,15 @@ async function main() {
   // reaches the page the operator is watching.
   const viewportProbe = { attempts: [] };
   viewportProbe.attempts.push({ attempt: "ctrl-shift-m", before: await screencastMap(viewer) });
+  viewportProbe.attempts[0].affordancesBefore = await affordancesSeen(viewer);
   await viewer.keyboard.press("Control+Shift+M");
   await viewer.waitForTimeout(1500);
   await shot(viewer, "obs2-a-after-device-mode-shortcut");
   viewportProbe.attempts[0].after = await screencastMap(viewer);
-  viewportProbe.attempts[0].toolbar = await viewer.evaluate(() =>
-    [...document.querySelectorAll("input, select, button")]
-      .filter((element) => /width|height|device|viewport/i.test(`${element.getAttribute("aria-label") ?? ""} ${element.className} ${element.title}`))
-      .map((element) => ({ tag: element.tagName, ariaLabel: element.getAttribute("aria-label"), className: element.className, value: element.value }))
-      .slice(0, 30),
+  viewportProbe.attempts[0].affordancesAfter = await affordancesSeen(viewer);
+  viewportProbe.attempts[0].deviceLikeInputs = viewportProbe.attempts[0].affordancesAfter.inputs.filter((input) =>
+    /width|height|device|viewport/i.test(`${input.ariaLabel ?? ""} ${input.className ?? ""} ${input.title ?? ""}`),
   );
-  viewportProbe.attempts[0].mainToolbar = await viewer.evaluate(() => Boolean(document.querySelector(".main-toolbar")));
   await note({ observation: "obs2-probe", viewportProbe });
 
   const emulated = await agent("obs2-emulate", [
@@ -280,11 +418,16 @@ async function main() {
   const clickAt = await clickPagePoint(viewer, targetPoint);
   await viewer.waitForTimeout(1500);
   await shot(viewer, "obs3-a-after-picking");
-  const selected = await viewer.evaluate(() => ({
-    selected: document.querySelector(".elements-wrap .selected")?.textContent ?? null,
-    treeRows: [...document.querySelectorAll(".elements-wrap [role='treeitem']")].length,
-    title: document.querySelector(".screencast-element-title")?.textContent ?? null,
-  }));
+  const selected = {
+    treeRows: await viewer.locator("[role='treeitem']").count(),
+    selectedRows: await viewer.locator("[role='treeitem'][aria-selected='true'], [role='treeitem'].selected").count(),
+    selectedText: await viewer
+      .locator("[role='treeitem'][aria-selected='true'], [role='treeitem'].selected")
+      .first()
+      .textContent()
+      .catch(() => null),
+    breadcrumb: await viewer.locator(".crumbs-widget").first().textContent().catch(() => null),
+  };
   await note({ observation: "obs3-selection", clickAt, selected });
 
   // The selector, taken the way an operator takes it: right click on the selected
@@ -292,13 +435,11 @@ async function main() {
   let copied = null;
   let copyError = null;
   try {
-    const node = viewer.locator(".elements-wrap .selected").first();
+    const node = viewer.locator(".elements-wrap .selected, [role='treeitem'][aria-selected='true']").first();
     await node.click({ button: "right" });
     await viewer.waitForTimeout(800);
     await shot(viewer, "obs3-b-context-menu");
-    const menuText = await viewer.evaluate(() =>
-      [...document.querySelectorAll(".soft-context-menu-item, [role='menuitem']")].map((element) => element.textContent?.trim()),
-    );
+    const menuText = await viewer.locator(".soft-context-menu-item, [role='menuitem']").allTextContents();
     await note({ observation: "obs3-menu", items: menuText });
     const copy = viewer.locator(".soft-context-menu-item", { hasText: /^Copy$/ }).first();
     await copy.hover();
