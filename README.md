@@ -217,6 +217,13 @@ sets to `/host/home/<user>`. Without it the image default `/workspace` wins, and
 the agent works in a throwaway path inside the container instead of your home on
 the machine.
 
+The unsafe profile (`compose.unsafe.yml`) carried the same block, and the defect
+it hid was worse there: `/workspace` is not mounted on that profile at all, so the
+agent worked in the container's own filesystem, outside `/host`, and lost the work
+with the container. That file now sets `ZCODE_SERVER_WORKSPACE` to the same
+`/host/home/<user>`, and `./check-unsafe.sh` fails when the runtime does not report
+it.
+
 ## Browser automation for the agent
 
 ZCode has a built-in Browser Use, but in web mode it cannot start: its headless
@@ -349,6 +356,15 @@ tells you the picture is fresh rather than frozen. Drag and drop through the
 browser's own HTML5 API (dropping a file onto a page) is the one gesture the panel
 does not do.
 
+The picture is capped independently of the layout size, at `1920x1080`, and the
+panel asks for that cap on attach, before it knows the page's own size. Chromium
+scales a larger page down to fit those bounds, keeps the page's aspect ratio, and
+never scales a smaller one up. Measured on the browser of the image
+(`153.0.8010.52`): a `1920x1080` page streams `1920x1080`, a `3840x2160` page
+streams `1920x1080`, and a `640x480` page streams `640x480`. A cap asked for later
+is not possible: Chromium answers a second `Page.startScreencast` while one is
+running with `Screencast is already active`.
+
 ### Where the browser profile lives
 
 The profile, with the agent's cookies and logins, is written to
@@ -358,9 +374,17 @@ The profile, with the agent's cookies and logins, is written to
   and nothing is written to the read-only root filesystem;
 - full access and unsafe profiles: `HOME` **and** `ZCODE_DATA_BASE_DIR` are your
   real home, so the profile lands in **your own `~/browser-profile`** (inside the
-  container, `/host/home/<user>/browser-profile`). It is the same directory the
-  agent's browser uses when the panel is off, so the logins accumulated there are
-  the ones the panel shows.
+  container, `/host/home/<user>/browser-profile`).
+
+That directory belongs to the panel and is written only while the panel is on.
+With `ZCLOUDIUM_BROWSER_PANEL=off` the agent's MCP server launches its own browser
+with `--isolated` (the entry at the top of this section): a throwaway profile under
+the container's temporary directory, so nothing is written to
+`<ZCODE_DATA_BASE_DIR>/browser-profile` and no login outlives that browser process.
+With the panel on, the one container browser keeps its cookies and logins in that
+directory across restarts of the container, and the panel shows that same browser,
+so what it displays is the state accumulated there since the panel was first turned
+on.
 
 A container that was killed rather than stopped leaves Chromium's `SingletonLock`
 in that directory, pointing at the old machine name, and Chromium then refuses to
@@ -617,6 +641,19 @@ Tested by actually running things, not only written:
   `workspaces[].path` as the mounted operator home (measured on a throwaway home
   in the test), not the image default `/workspace`: the workspace comes from
   `ZCODE_SERVER_WORKSPACE`
+- **unsafe workspace, and the check that keeps it**: `./check-unsafe.sh` starts
+  the throwaway container with the image's own entrypoint (no `--entrypoint bash`,
+  no `command:` block, the home and the workspace in the environment) and reads
+  the workspace back from the running runtime, at
+  `http://127.0.0.1:3131/api/server-info`: it answers
+  `workspaces[0].path == /host/tmp/zcloudium-unsafe-home`, the mounted home. The
+  same container started with the pre-fix settings (the `command:` block with
+  `--workspace=/host/home/delta`, no `ZCODE_SERVER_WORKSPACE`) answered
+  `/workspace`, logged `ignoring the extra command line arguments (...)`, and that
+  path is not a mount inside the container (`mount` shows none): the agent's work
+  landed in the container's own filesystem. Removing the variable from the script
+  makes probe 1 fail with `reports '/workspace' instead of
+  /host/tmp/zcloudium-unsafe-home` and the script exits `1`
 - **leftover `command:` block**: a container started with the old argument list
   appended logs `ignoring the extra command line arguments (...)` and still runs
   with the loopback arguments built from the environment
@@ -696,10 +733,10 @@ Tested by actually running things, not only written:
   document that names another host cannot point the panel's socket anywhere but
   its own gateway (unit tested on the URL builder)
 - **TLS terminating proxy**: with `ZCLOUDIUM_TRUST_PROXY=on`, an `https` Origin
-  whose authority is exactly the request's own is accepted on the browser route
-  and on its upgrade, and a different authority, name or port is still refused
-  with 403; with the flag off the `https` Origin is refused, which is the
-  behaviour before this change
+  of the request's own authority (case and the scheme's default port normalised)
+  is accepted on the browser route and on its upgrade, and a different authority,
+  name or port is still refused with 403; with the flag off the `https` Origin is
+  refused, which is the behaviour before this change
 - **end to end, both positions of the panel switch**, against the image: the suite
   passes with the panel off (21 passed, the 4 panel specs skipped with a reason)
   and with the panel on (25 passed, including the four panel specs: the session

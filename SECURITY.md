@@ -271,23 +271,30 @@ Origin.
    one, and the clients that must keep working send none: the MCP server, the
    automation harness, curl. Refusing them would break the agent, so their absence
    is not treated as a browser that failed to identify itself.
-2. **A request that carries one must name exactly the origin of the gateway it
-   arrived at**: the scheme comes from the socket, the authority from the `Host`
-   header, and both are compared as strings. Another port, another name, another
-   scheme, a path, or the literal `null` of an opaque origin are refused with 403.
-   The reason this check exists at all: every other service on the operator's
-   loopback is same-site, so its pages arrive with the session cookie attached
-   (`SameSite=Lax` counts loopback to loopback as same-site), and without a check
-   one of those pages could open a control channel into the browser that holds the
-   agent's sessions.
+2. **A request that carries one must name the origin of the gateway it arrived
+   at**: the scheme comes from the socket, the authority from the `Host` header,
+   and both are compared as strings once the authority has been normalised (the
+   host lower cased, the scheme's default port dropped, see the next point).
+   Another name, another port, another scheme (unless point 3 applies), a path, or
+   the literal `null` of an opaque origin are refused with 403. The reason this
+   check exists at all: every other service on the operator's loopback is
+   same-site, so its pages arrive with the session cookie attached (`SameSite=Lax`
+   counts loopback to loopback as same-site), and without a check one of those
+   pages could open a control channel into the browser that holds the agent's
+   sessions.
 3. **Behind a TLS terminating proxy, `ZCLOUDIUM_TRUST_PROXY=on` also accepts the
    `https` variant of the request's own authority.** The proxy speaks TLS to the
    browser and plain HTTP to the container, so the browser sends `https` while the
    gateway serializes `http`, and without the flag the panel would refuse its own
    frontend in the deployment the README recommends. The flag already means "a
    proxy I control is in front", and it widens nothing else: the authority still
-   has to match character for character, and a different name, port or scheme is
-   still refused. With the flag off, the behaviour is exactly the one before it
+   has to be the request's own authority, so a different name or a different port
+   is refused with the flag on exactly as with it off. Only the spelling is
+   forgiven, and only the two that a browser and a proxy disagree about, because
+   `normalizeAuthority` lower cases the host and drops the port that is the
+   default for the scheme (`:80` on http, `:443` on https): a proxy configured with
+   `$host:$server_port` on an https server appends `:443`, which the browser never
+   spells out. With the flag off, the behaviour is exactly the one before the flag
    existed.
 
 **Why the check lives in the gateway and not inside Chromium.** Chromium has its
