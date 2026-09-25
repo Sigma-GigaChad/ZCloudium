@@ -10,6 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
+import { browserServerEntry } from "../gateway/lib/mcp-config.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "../gateway/lib/session.mjs";
 import {
   DEFAULT_DATA_DIR,
@@ -40,6 +41,8 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
   assert.deepEqual(parseEnv({}), {
     authEnabled: true,
     browserMcp: true,
+    browserPanel: false,
+    browserDebugPort: 9222,
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
     dataDir: DEFAULT_DATA_DIR,
@@ -129,6 +132,19 @@ test("ZCLOUDIUM_BROWSER_MCP defaults to on and is only off when explicitly set",
   for (const value of ["on", "1", "yes", ""]) {
     assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_MCP: value }).browserMcp, true, `"${value}"`);
   }
+});
+
+test("ZCLOUDIUM_BROWSER_PANEL is off by default and takes its port from the environment", () => {
+  assert.equal(parseEnv({}).browserPanel, false, "the whole Phase 0 path is off unless it is asked for");
+  assert.equal(parseEnv({}).browserDebugPort, 9222);
+  for (const value of ["on", "true", "1", "yes", " ON "]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_PANEL: value }).browserPanel, true, `"${value}"`);
+  }
+  for (const value of ["off", "0", "no", "", "maybe"]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_PANEL: value }).browserPanel, false, `"${value}"`);
+  }
+  assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_DEBUG_PORT: "9333" }).browserDebugPort, 9333);
+  assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_DEBUG_PORT: "not-a-port" }).browserDebugPort, 9222);
 });
 
 test("with the gateway on, the runtime is bound to loopback only", () => {
@@ -222,10 +238,28 @@ function fakeProcess() {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-/** Wires start() with stubs and returns everything the assertions need. */
-async function runStart(env, { gateway = null, mcp = async () => ({ status: "unchanged" }), argv = ["node", "/opt/cloudium/gateway/start.mjs"] } = {}) {
+/**
+ * Wires start() with stubs and returns everything the assertions need.
+ *
+ * `browser` is the fake browser process the entrypoint is expected to launch
+ * when the panel is on; `probe` answers for the debug port, so the fallback can
+ * be exercised without a browser.
+ */
+async function runStart(
+  env,
+  {
+    gateway = null,
+    mcp = async () => ({ status: "unchanged" }),
+    argv = ["node", "/opt/cloudium/gateway/start.mjs"],
+    browser = null,
+    probe = async () => ({ reachable: true, version: { Browser: "Chrome/153.0.8010.52" } }),
+  } = {},
+) {
   const child = fakeChild();
   const spawns = [];
+  const browserSpawns = [];
+  const browserStops = [];
+  const probes = [];
   const signals = fakeProcess();
   const exits = [];
   const gatewayCalls = [];
@@ -255,10 +289,32 @@ async function runStart(env, { gateway = null, mcp = async () => ({ status: "unc
       mcpCalls.push(options);
       return mcp(options);
     },
+    launchBrowserFn: (options) => {
+      browserSpawns.push(options);
+      if (!browser) {
+        throw new Error("the panel was not expected to launch a browser");
+      }
+      return browser;
+    },
+    probeBrowserFn: async (options) => {
+      probes.push(options);
+      return probe(options);
+    },
+    stopBrowserFn: async (childArg, options) => {
+      browserStops.push({ child: childArg, options });
+      return "terminated";
+    },
     onExit: (code) => exits.push(code),
   });
 
-  return { result, child, spawns, signals, exits, gatewayCalls, mcpCalls, logs };
+  return { result, child, spawns, signals, exits, gatewayCalls, mcpCalls, logs, browserSpawns, browserStops, probes };
+}
+
+/** A fake Chromium process: the entrypoint only kills it and waits for the exit. */
+function fakeBrowser() {
+  const child = fakeChild();
+  child.pid = 4242;
+  return child;
 }
 
 test("with the gateway on, the runtime is spawned on loopback and the gateway starts in front", async () => {
@@ -282,6 +338,7 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
         upstreamUrl: "http://127.0.0.1:3131",
         sessionTtlMs: DEFAULT_SESSION_TTL_MS,
         trustProxy: false,
+        debugUrl: null,
       },
     ],
   );
@@ -431,4 +488,144 @@ test("a thrown error while merging is caught and does not prevent the startup", 
   );
   assert.equal(spawns.length, 1);
   assert.equal(logs.some((line) => /disk on fire/.test(line)), true, `expected the message in the logs, got ${JSON.stringify(logs)}`);
+});
+
+/**
+ * Phase 0 of issue #5: the browser panel switch, in the entrypoint.
+ *
+ * With the switch off nothing at all may change. With it on, the entrypoint
+ * launches one Chromium on a debug port, points the agent's MCP server at it, and
+ * stops it with the rest of the container. If the debug port never answers, the
+ * agent must fall back to launching its own browser rather than refuse to start.
+ */
+
+test("with the panel off, no browser is launched and the gateway knows nothing about one", async () => {
+  const { browserSpawns, browserStops, probes, gatewayCalls, mcpCalls, logs } = await runStart({ HOME: "/data" });
+  assert.deepEqual(browserSpawns, [], "no browser may be started");
+  assert.deepEqual(browserStops, []);
+  assert.deepEqual(probes, [], "no port may be probed");
+  assert.equal(gatewayCalls[0].debugUrl, null);
+  assert.deepEqual(
+    mcpCalls[0].entry,
+    browserServerEntry(),
+    "with the panel off the entry is exactly the one the image shipped before, launch arguments and all",
+  );
+  assert.equal(
+    logs.some((line) => /browser panel/i.test(line)),
+    true,
+    `the off state has to be stated, got ${JSON.stringify(logs)}`,
+  );
+});
+
+test("with the panel on, one browser is launched on the data volume and the agent attaches to it", async () => {
+  const browser = fakeBrowser();
+  const { browserSpawns, probes, gatewayCalls, mcpCalls, logs } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    { browser },
+  );
+
+  assert.equal(browserSpawns.length, 1);
+  assert.equal(browserSpawns[0].args.includes("--remote-debugging-port=9222"), true);
+  assert.equal(browserSpawns[0].args.includes("--user-data-dir=/data/browser-profile"), true, "the profile belongs on the volume");
+  assert.deepEqual(probes.map((probe) => probe.debugUrl), ["http://127.0.0.1:9222"]);
+
+  assert.equal(mcpCalls.length, 1);
+  assert.equal(mcpCalls[0].entry.args.includes("--browserUrl"), true, "the agent must attach instead of launching its own browser");
+  assert.equal(mcpCalls[0].entry.args[mcpCalls[0].entry.args.indexOf("--browserUrl") + 1], "http://127.0.0.1:9222");
+  assert.equal(gatewayCalls[0].debugUrl, "http://127.0.0.1:9222", "the gateway needs the port to proxy it");
+  assert.equal(
+    logs.some((line) => /attaches to http:\/\/127\.0\.0\.1:9222/.test(line)),
+    true,
+    `the attach must be stated, got ${JSON.stringify(logs)}`,
+  );
+});
+
+test("the debug port is configurable from the environment, and the profile follows the data directory", async () => {
+  const browser = fakeBrowser();
+  const { browserSpawns, probes, gatewayCalls, mcpCalls } = await runStart(
+    {
+      HOME: "/data",
+      ZCLOUDIUM_BROWSER_PANEL: "1",
+      ZCLOUDIUM_BROWSER_DEBUG_PORT: "9333",
+      ZCODE_DATA_BASE_DIR: "/state",
+    },
+    { browser },
+  );
+  assert.equal(browserSpawns[0].args.includes("--remote-debugging-port=9333"), true);
+  assert.equal(browserSpawns[0].args.includes("--user-data-dir=/state/browser-profile"), true);
+  assert.deepEqual(probes.map((probe) => probe.debugUrl), ["http://127.0.0.1:9333"]);
+  assert.equal(gatewayCalls[0].debugUrl, "http://127.0.0.1:9333");
+  assert.equal(mcpCalls[0].entry.args[mcpCalls[0].entry.args.indexOf("--browserUrl") + 1], "http://127.0.0.1:9333");
+});
+
+test("a browser that never answers its debug port falls back to the launch shape and does not block the start", async () => {
+  const browser = fakeBrowser();
+  const { browserStops, gatewayCalls, mcpCalls, logs, spawns, child, exits } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    { browser, probe: async () => ({ reachable: false }) },
+  );
+
+  assert.equal(spawns.length, 1, "the runtime must start whatever the browser does");
+  assert.equal(mcpCalls[0].entry.args.includes("--browserUrl"), false);
+  assert.deepEqual(mcpCalls[0].entry, browserServerEntry(), "the fallback is exactly the shape the image shipped before");
+  assert.equal(gatewayCalls[0].debugUrl, null, "an unreachable port must not be proxied");
+  assert.equal(browserStops.length, 1, "a browser nobody can attach to must not be left running");
+  assert.equal(
+    logs.some((line) => /did not answer|not reachable|falls back/i.test(line)),
+    true,
+    `the fallback must be stated, got ${JSON.stringify(logs)}`,
+  );
+
+  child.emit("exit", 0, null);
+  await tick();
+  assert.deepEqual(exits, [0], "the runtime still exits normally after the fallback");
+});
+
+test("the browser is stopped cleanly when the runtime exits", async () => {
+  const browser = fakeBrowser();
+  const { child, browserStops, exits, logs } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    { browser },
+  );
+
+  child.emit("exit", 0, null);
+  await tick();
+  assert.deepEqual(exits, [0]);
+  assert.equal(browserStops.length, 1, "the browser must not outlive the container");
+  assert.equal(browserStops[0].child, browser);
+  assert.equal(
+    logs.some((line) => /browser stopped/i.test(line)),
+    true,
+    `the stop must be reported, got ${JSON.stringify(logs)}`,
+  );
+});
+
+test("a shutdown signal stops the browser as well as the runtime", async () => {
+  const browser = fakeBrowser();
+  const { child, signals, browserStops } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on" },
+    { browser },
+  );
+
+  signals.signal("SIGTERM");
+  await tick();
+  assert.deepEqual(child.killed, ["SIGTERM"], "the runtime is forwarded the signal as before");
+  assert.equal(browserStops.length, 1, "the browser is asked to stop on the same signal");
+});
+
+test("with the browser MCP off there is nothing for the panel to attach to, so no browser starts", async () => {
+  const { browserSpawns, probes, mcpCalls, gatewayCalls, logs } = await runStart({
+    HOME: "/data",
+    ZCLOUDIUM_BROWSER_PANEL: "on",
+    ZCLOUDIUM_BROWSER_MCP: "off",
+  });
+  assert.deepEqual(browserSpawns, [], "no agent browser means no browser to launch");
+  assert.deepEqual(probes, []);
+  assert.deepEqual(mcpCalls, []);
+  assert.equal(gatewayCalls[0].debugUrl, null);
+  assert.equal(
+    logs.some((line) => /panel.*browser MCP|browser MCP.*off/i.test(line)),
+    true,
+    `the interaction must be stated rather than silent, got ${JSON.stringify(logs)}`,
+  );
 });

@@ -13,6 +13,7 @@
 
 import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { BROWSER_EXECUTABLE } from "./browser.mjs";
 
 /** Name under `mcp.servers`: it is what the tools are prefixed with. */
 export const BROWSER_SERVER_NAME = "chrome-devtools";
@@ -21,10 +22,20 @@ export const BROWSER_SERVER_NAME = "chrome-devtools";
 export const BROWSER_MCP_PACKAGE = "chrome-devtools-mcp";
 export const BROWSER_MCP_VERSION = "1.10.1";
 export const BROWSER_MCP_COMMAND = "/usr/local/bin/chrome-devtools-mcp";
-/** Chromium from the distribution, the one `chromium --version` reports in the image. */
-export const BROWSER_MCP_EXECUTABLE = "/usr/bin/chromium";
+/**
+ * Chromium from the distribution, the one `chromium --version` reports in the
+ * image. Named once: the browser panel launches the same binary, and an image
+ * where the agent drives a different browser than the operator attached to would
+ * be a bug nobody sees until a captcha.
+ */
+export const BROWSER_MCP_EXECUTABLE = BROWSER_EXECUTABLE;
+
+/** Telemetry is off in both shapes, whether the server launches a browser or attaches to one. */
+export const BROWSER_MCP_COMMON_ARGS = ["--no-usage-statistics", "--no-performance-crux"];
 
 /**
+ * The launch shape: the MCP server starts its own Chromium.
+ *
  * `--headless`: the container has no display.
  * `--isolated`: a throwaway profile under the temporary directory, so the
  *   operator home stays clean and the read-only root filesystem needs nothing.
@@ -40,19 +51,37 @@ export const BROWSER_MCP_ARGS = [
   "--executablePath",
   BROWSER_MCP_EXECUTABLE,
   "--chromeArg=--no-sandbox",
-  "--no-usage-statistics",
-  "--no-performance-crux",
+  ...BROWSER_MCP_COMMON_ARGS,
 ];
+
+/**
+ * The attach shape (Phase 0 of issue #5): the browser is already running, with
+ * the debug port this url names, so the server only connects to it.
+ *
+ * It carries none of the launch arguments on purpose. `--executablePath` or
+ * `--isolated` would make the server start a second, private browser, and the
+ * agent would then drive a page nobody is watching, which is the exact failure
+ * this shape exists to prevent.
+ */
+export function browserAttachArgs(browserUrl) {
+  return ["--browserUrl", String(browserUrl), ...BROWSER_MCP_COMMON_ARGS];
+}
 
 /** Chromium takes seconds to answer; the agent must not give up before that. */
 export const BROWSER_MCP_TIMEOUT_MS = 60_000;
 
-/** A fresh entry, so a caller cannot mutate the constants through it. */
-export function browserServerEntry() {
+/**
+ * The entry to write. `browserUrl` selects the shape: with a debug endpoint the
+ * server attaches to it, without one it launches the image's Chromium exactly as
+ * it did before Phase 0. The decision of which url to pass belongs to the
+ * entrypoint (see resolveBrowserMode in browser.mjs).
+ */
+export function browserServerEntry({ browserUrl = null } = {}) {
+  const url = typeof browserUrl === "string" ? browserUrl.trim() : "";
   return {
     type: "stdio",
     command: BROWSER_MCP_COMMAND,
-    args: [...BROWSER_MCP_ARGS],
+    args: url === "" ? [...BROWSER_MCP_ARGS] : browserAttachArgs(url),
     enabled: true,
     timeoutMs: BROWSER_MCP_TIMEOUT_MS,
   };

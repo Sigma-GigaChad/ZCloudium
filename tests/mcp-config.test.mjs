@@ -11,10 +11,13 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BROWSER_EXECUTABLE } from "../gateway/lib/browser.mjs";
 import {
+  BROWSER_MCP_ARGS,
   BROWSER_MCP_COMMAND,
   BROWSER_MCP_EXECUTABLE,
   BROWSER_MCP_PACKAGE,
+  BROWSER_MCP_TIMEOUT_MS,
   BROWSER_MCP_VERSION,
   BROWSER_SERVER_NAME,
   applyBrowserMcp,
@@ -79,6 +82,62 @@ test("the baked browser MCP server is chrome-devtools-mcp, headless, on the imag
   const index = entry.args.indexOf("--executablePath");
   assert.equal(entry.args[index + 1], BROWSER_MCP_EXECUTABLE, "the server must use the Chromium installed in the image");
   assert.equal(JSON.stringify(entry).includes("--no-sandbox"), true, "the container has no sandbox: see SECURITY.md");
+});
+
+/**
+ * Phase 0: the entry has two shapes. The attach shape points the server at the
+ * browser the container already runs, the launch shape is today's behaviour and
+ * the fallback. The decision between them lives in gateway/lib/browser.mjs
+ * (resolveBrowserMode) and is tested there; here is what each shape is.
+ */
+test("the attach shape connects to the running browser instead of launching one", () => {
+  const entry = browserServerEntry({ browserUrl: "http://127.0.0.1:9222" });
+  assert.equal(entry.type, "stdio");
+  assert.equal(entry.command, BROWSER_MCP_COMMAND);
+  assert.equal(entry.enabled, true);
+  assert.equal(entry.args.includes("--browserUrl"), true);
+  assert.equal(entry.args[entry.args.indexOf("--browserUrl") + 1], "http://127.0.0.1:9222");
+  // Attaching means the browser is not ours to launch: none of the launch
+  // arguments may survive, or the server would start a second browser and the
+  // agent would drive a page nobody is watching.
+  assert.equal(entry.args.includes("--executablePath"), false, "attaching must not name a browser to launch");
+  assert.equal(entry.args.includes("--isolated"), false, "attaching must not create a throwaway profile");
+  assert.equal(entry.args.includes("--headless"), false, "the browser's mode is the launcher's decision, not the attacher's");
+  assert.equal(JSON.stringify(entry).includes("--no-sandbox"), false, "no browser is launched, so there is nothing to pass it to");
+  assert.equal(entry.args.includes("--no-usage-statistics"), true, "no telemetry in either shape");
+  assert.equal(entry.args.includes("--no-performance-crux"), true, "no telemetry in either shape");
+});
+
+test("without a browser url the entry is exactly the one the image shipped before", () => {
+  for (const empty of [undefined, null, "", "   "]) {
+    assert.deepEqual(browserServerEntry({ browserUrl: empty }), browserServerEntry(), `browserUrl=${JSON.stringify(empty)}`);
+  }
+  assert.deepEqual(browserServerEntry(), {
+    type: "stdio",
+    command: BROWSER_MCP_COMMAND,
+    args: [...BROWSER_MCP_ARGS],
+    enabled: true,
+    timeoutMs: BROWSER_MCP_TIMEOUT_MS,
+  });
+});
+
+test("switching between the shapes rewrites the entry rather than leaving a stale one", async () => {
+  await withHome(undefined, async ({ home, configPath }) => {
+    const attach = browserServerEntry({ browserUrl: "http://127.0.0.1:9222" });
+    await applyBrowserMcp({ home, entry: attach });
+    assert.deepEqual((await readJson(configPath)).mcp.servers[BROWSER_SERVER_NAME], attach);
+
+    // The next start, with the panel off: the entry must go back to launching.
+    const result = await applyBrowserMcp({ home });
+    assert.equal(result.status, "updated");
+    assert.deepEqual((await readJson(configPath)).mcp.servers[BROWSER_SERVER_NAME], browserServerEntry());
+  });
+});
+
+test("one executable, named once: the panel and the MCP launch the same Chromium", () => {
+  // Two constants for one path is how an image ends up with an agent driving a
+  // browser that is not the one the operator attached to.
+  assert.equal(BROWSER_MCP_EXECUTABLE, BROWSER_EXECUTABLE);
 });
 
 test("mergeMcpServer adds the entry without mutating its input", () => {

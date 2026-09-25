@@ -15,7 +15,19 @@ import { spawn } from "node:child_process";
 import { constants, homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyBrowserMcp } from "./lib/mcp-config.mjs";
+import {
+  BROWSER_PREFIX,
+  browserArgs,
+  browserDebugUrl,
+  browserProfileDir,
+  launchBrowser,
+  parseBrowserDebugPort,
+  parseBrowserPanel,
+  resolveBrowserMode,
+  stopBrowser,
+  waitForBrowser,
+} from "./lib/browser.mjs";
+import { applyBrowserMcp, browserServerEntry } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
 
@@ -89,6 +101,8 @@ export function parseEnv(env = process.env) {
   return {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
     browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
+    browserPanel: parseBrowserPanel(env.ZCLOUDIUM_BROWSER_PANEL),
+    browserDebugPort: parseBrowserDebugPort(env.ZCLOUDIUM_BROWSER_DEBUG_PORT),
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
     dataDir: envValue(env, "ZCODE_DATA_BASE_DIR", DEFAULT_DATA_DIR),
@@ -175,6 +189,9 @@ export async function start({
   spawnRuntime = (file, args, options) => spawn(file, args, options),
   createGatewayFn = createGateway,
   applyMcpConfigFn = applyBrowserMcp,
+  launchBrowserFn = launchBrowser,
+  probeBrowserFn = waitForBrowser,
+  stopBrowserFn = stopBrowser,
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
@@ -227,10 +244,82 @@ export async function start({
 
   // Before the runtime starts, so that it reads a configuration that already
   // contains the browser server instead of writing its own state over it.
+  //
+  // Phase 0 of issue #5: when the panel is on, the container launches one
+  // Chromium with a debug port on loopback first, and the agent's MCP server
+  // attaches to it instead of launching its own browser. Off by default: without
+  // ZCLOUDIUM_BROWSER_PANEL nothing here runs, the entry keeps the shape the
+  // image shipped before, and the gateway is not told about a debug port.
+  const debugUrl = browserDebugUrl(config.browserDebugPort);
+  let browser = null;
+  let browserStop = null;
+
+  /** Asks the browser to stop once, whatever asked for it. */
+  const stopBrowserOnce = (reason) => {
+    if (!browser) {
+      return Promise.resolve("no-browser");
+    }
+    if (!browserStop) {
+      logger(`[start] stopping the browser (${reason})`);
+      browserStop = Promise.resolve(stopBrowserFn(browser, { logger })).then((outcome) => {
+        logger(`[start] browser stopped: ${outcome}`);
+        return outcome;
+      });
+    }
+    return browserStop;
+  };
+
+  if (config.browserPanel && !config.browserMcp) {
+    // The panel is the agent's browser made visible. With no browser MCP server
+    // there is no agent browser, so a browser here would be a stray process.
+    logger(
+      "[start] browser panel requested but the browser MCP server is off (ZCLOUDIUM_BROWSER_MCP=off): no browser is " +
+        "started, because nothing would drive it",
+    );
+  } else if (config.browserPanel) {
+    const profile = browserProfileDir(config.dataDir);
+    browser = launchBrowserFn({
+      args: browserArgs({ port: config.browserDebugPort, userDataDir: profile }),
+      env,
+      logger,
+      onExit: (code, signal, error) =>
+        logger(
+          `[start] the browser exited (code ${code}, signal ${signal ?? "none"}${error ? `, ${error}` : ""})`,
+        ),
+    });
+
+    const probe = await probeBrowserFn({ debugUrl });
+    if (resolveBrowserMode({ panelEnabled: true, debugUrl, reachable: probe.reachable }) === "attach") {
+      logger(
+        `[start] browser panel: the agent attaches to ${debugUrl} (pid ${browser.pid}), profile ${profile}. ` +
+          `The DevTools frontend is on ${BROWSER_PREFIX}/ behind the session.`,
+      );
+    } else {
+      // A browser that never opened its debug port is no use to anyone: the
+      // agent falls back to launching its own, and this one is stopped rather
+      // than left running and invisible.
+      logger(
+        `[start] browser panel: ${debugUrl} did not answer its discovery endpoint, so the agent falls back to the ` +
+          "browser it launches itself",
+      );
+      await stopBrowserOnce("the debug port did not answer");
+      browser = null;
+    }
+  } else {
+    logger(
+      "[start] browser panel off (ZCLOUDIUM_BROWSER_PANEL is not on): the agent launches its own headless browser",
+    );
+  }
+
+  const attached = browser !== null;
+
   if (config.browserMcp) {
     const home = homeOf(env);
     try {
-      const result = await applyMcpConfigFn({ home });
+      const result = await applyMcpConfigFn({
+        home,
+        entry: browserServerEntry({ browserUrl: attached ? debugUrl : null }),
+      });
       logger(`[start] browser MCP ${describeMerge(result)}`);
     } catch (error) {
       // A configuration problem must not keep the interface from starting.
@@ -250,6 +339,10 @@ export async function start({
     if (!child.kill(signal)) {
       logger(`[start] the runtime did not accept ${signal}`);
     }
+    // The browser is stopped on the same signal. Chromium flushes its profile on
+    // the way out, and that profile holds the agent's sessions, so it must not be
+    // left to a kill from the runtime's own shutdown.
+    void stopBrowserOnce(signal);
   };
   signals.on("SIGTERM", () => forward("SIGTERM"));
   signals.on("SIGINT", () => forward("SIGINT"));
@@ -261,6 +354,7 @@ export async function start({
     const current = gateway;
     gateway = null;
     if (!current) {
+      await stopBrowserOnce("the runtime exited");
       return;
     }
     try {
@@ -268,6 +362,7 @@ export async function start({
     } catch (error) {
       logger(`[start] gateway shutdown failed: ${error.message}`);
     }
+    await stopBrowserOnce("the runtime exited");
   };
 
   child.on("exit", (code, signal) => {
@@ -295,10 +390,15 @@ export async function start({
     // of the startup lines. Without it, a refused password, the reason a code was
     // rejected and the temporary block of an address are written nowhere, which
     // is exactly what an operator needs after a suspicious connection.
-    gateway = await createGatewayFn({ ...gatewayOptions(config), logger });
+    gateway = await createGatewayFn({
+      ...gatewayOptions(config),
+      debugUrl: attached ? debugUrl : null,
+      logger,
+    });
     logger(
       `[start] gateway listening on ${PUBLISHED_HOST}:${gateway.port} (authentication on), ` +
-        `runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})`,
+        `runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})` +
+        (attached ? `, browser panel proxied on ${BROWSER_PREFIX}/` : ""),
     );
   } else {
     logger(
