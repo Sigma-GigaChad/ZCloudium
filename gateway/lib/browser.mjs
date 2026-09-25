@@ -57,11 +57,6 @@ export function browserDebugUrl(port = BROWSER_DEBUG_PORT, host = BROWSER_DEBUG_
   return `http://${host}:${port}`;
 }
 
-/** The host:port pair Chromium advertises in its discovery documents. */
-export function debugAuthority(port = BROWSER_DEBUG_PORT, host = BROWSER_DEBUG_ADDRESS) {
-  return `${host}:${port}`;
-}
-
 /**
  * The launch arguments.
  *

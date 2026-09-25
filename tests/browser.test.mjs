@@ -28,7 +28,6 @@ import {
   browserDebugUrl,
   browserProfileDir,
   classifyRoute,
-  debugAuthority,
   debugPathFor,
   isAcceptableOrigin,
   isDiscoveryPath,
@@ -217,8 +216,6 @@ test("the browser is spawned on the image's Chromium, and its exit is reported",
 });
 
 test("the proxied authority comes from the Host header, and nothing else", () => {
-  assert.equal(debugAuthority(), "127.0.0.1:9222");
-  assert.equal(debugAuthority(9333), "127.0.0.1:9333");
   assert.equal(proxyAuthorityFor("panel.example:3030"), "panel.example:3030/_browser");
   assert.equal(proxyAuthorityFor("127.0.0.1:3030"), "127.0.0.1:3030/_browser");
   assert.equal(proxyAuthorityFor("[::1]:3030"), "[::1]:3030/_browser");
