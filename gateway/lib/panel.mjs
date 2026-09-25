@@ -53,6 +53,15 @@ export const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
  * down to fit inside these and keeps the aspect ratio, so a 3840x2160 viewport
  * still streams a bounded picture while the page itself lays out at full size.
  * Measured: maxWidth 320 on a 640x480 viewport produced a 320x240 frame.
+ *
+ * Measured as well, on the browser of the image (Chromium 153.0.8010.52): the
+ * bounds are what the panel asks for at attach (`screencastParams` with no
+ * argument), and the frame never grows past the page's own size, so a 640x480
+ * page under these bounds still streams 640x480 and nothing is upscaled. A
+ * screencast is started once per session because Chromium refuses a second
+ * `Page.startScreencast` while one is running ("Screencast is already active"),
+ * which is why the bounds, and not the values the fields hold at that moment,
+ * are what has to be asked for.
  */
 export const SCREENCAST_MAX_WIDTH = 1920;
 export const SCREENCAST_MAX_HEIGHT = 1080;
@@ -98,8 +107,15 @@ export function deviceMetricsParams({ width, height }) {
 /**
  * The screencast request. Frames are JPEG, one per produced frame, capped by the
  * picture bounds.
+ *
+ * Without a layout size the bounds themselves are asked for, which is the call
+ * the panel makes at attach: at that moment the fields still hold the defaults
+ * and the page has not reported its own size yet. Capping on those defaults would
+ * hold the picture at 1280x800 for the whole session, and the caps themselves
+ * would never be reached. The frame stays inside the page's own size either way,
+ * so a page smaller than the bounds is not upscaled.
  */
-export function screencastParams({ width, height }) {
+export function screencastParams({ width = SCREENCAST_MAX_WIDTH, height = SCREENCAST_MAX_HEIGHT } = {}) {
   return {
     format: "jpeg",
     quality: SCREENCAST_QUALITY,
@@ -451,6 +467,7 @@ const STYLE = `
   --surface: #ffffff0d;
   --surface-hover: #ffffff1a;
   --border: #ffffff1a;
+  --border-hover: #ffffff26;
   --foreground: #e5e5e5;
   --foreground-subtle: #e5e5e599;
   --foreground-subtlest: #e5e5e54d;
@@ -494,7 +511,7 @@ body {
   color: var(--foreground-subtle);
   cursor: help;
 }
-.status { font-size: 11px; color: var(--foreground-subtler, #e5e5e566); }
+.status { font-size: 11px; color: var(--foreground-subtle); }
 .status[data-kind="connected"] { color: #7dd3a0; }
 .status[data-kind="error"] { color: var(--destructive); }
 .target-url {
@@ -522,7 +539,7 @@ select, input[type="number"] {
 input[type="number"] { width: 78px; font-family: var(--font-mono); }
 input[type="number"]:disabled { opacity: .5; }
 select { max-width: 320px; }
-select:focus, input[type="number"]:focus { border-color: var(--border-hover, #ffffff26); background: var(--surface-hover); }
+select:focus, input[type="number"]:focus { border-color: var(--border-hover); background: var(--surface-hover); }
 button, a.button {
   font-family: inherit;
   font-size: 12px;
@@ -727,8 +744,13 @@ function connect(targetId) {
   socket.onopen = function () {
     setStatus("connected", "connected");
     quietly("Page.enable", {});
-    const viewport = clampViewport({ width: widthEl.value, height: heightEl.value });
-    send("Page.startScreencast", screencastParams(viewport)).catch(function (error) {
+    // The picture bounds, not the values the fields hold: a round trip later
+    // refreshReported adopts the size the page reports, and whatever is asked for
+    // here is the cap for the rest of the session (Chromium refuses a second
+    // startScreencast while one runs). Capping on the fields at this point would
+    // freeze the picture at the defaults, 1280x800, even after the operator
+    // widens the viewport.
+    send("Page.startScreencast", screencastParams()).catch(function (error) {
       setStatus(error.message, "error");
     });
     // The panel adopts the size the page is already at instead of imposing its

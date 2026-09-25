@@ -108,6 +108,26 @@ test("the screencast asks for JPEG frames capped at the picture bounds", () => {
   });
 });
 
+test("the picture bounds are what the panel asks for before the page size is known", () => {
+  // The panel asks for these at attach, when the fields still hold the defaults
+  // and the page has not reported its own size yet. Capping on the fields there
+  // would freeze the picture at 1280x800 for the whole session, which is what
+  // made the bounds below unreachable.
+  const bounds = {
+    format: "jpeg",
+    quality: SCREENCAST_QUALITY,
+    maxWidth: SCREENCAST_MAX_WIDTH,
+    maxHeight: SCREENCAST_MAX_HEIGHT,
+    everyNthFrame: 1,
+  };
+  assert.deepEqual(screencastParams(), bounds);
+  assert.deepEqual(screencastParams({}), bounds);
+  // The point of asking for them: they are wider and taller than the defaults the
+  // fields hold at that moment, so there is a range in between to reach.
+  assert.ok(SCREENCAST_MAX_WIDTH > DEFAULT_VIEWPORT.width);
+  assert.ok(SCREENCAST_MAX_HEIGHT > DEFAULT_VIEWPORT.height);
+});
+
 test("the frame metadata is the size the page is rendered at, not the bitmap size", () => {
   // Measured: with maxWidth 320 on a 640x480 viewport, Chromium sends a 320x240
   // bitmap whose metadata still says deviceWidth 640, deviceHeight 480. The
@@ -351,6 +371,23 @@ test("a click right after a viewport change is mapped into the size the page has
   });
 });
 
+test("the panel asks for the picture bounds on attach, not the values the fields hold", async () => {
+  const panel = panelRuntime();
+  await panel.connected();
+  // One command, sent once: the browser refuses a second startScreencast while
+  // one is running ("Screencast is already active", measured on Chromium 153), so
+  // a cap asked for here is the cap for the whole session. The fields hold the
+  // defaults at this moment, which is why asking for them capped the picture at
+  // 1280x800 and made SCREENCAST_MAX_* unreachable.
+  assert.deepEqual(panel.lastParams("Page.startScreencast"), {
+    format: "jpeg",
+    quality: SCREENCAST_QUALITY,
+    maxWidth: SCREENCAST_MAX_WIDTH,
+    maxHeight: SCREENCAST_MAX_HEIGHT,
+    everyNthFrame: 1,
+  });
+});
+
 test("the mouse messages carry the fields CDP expects, for every kind of gesture", () => {
   const point = { x: 120.4, y: 240.6 };
   assert.deepEqual(mouseParams({ type: "mouseMoved", point }), { type: "mouseMoved", x: 120, y: 241, button: "none", buttons: 0 });
@@ -537,6 +574,26 @@ test("the served page is one file, with no external asset and no framework", () 
   assert.equal(html.includes("</script>\n<script>"), true, "the helpers and the wiring are separate blocks on purpose");
 });
 
+test("every theme token the served page references is one the page defines", () => {
+  const html = panelPage();
+  // Only the :root block defines tokens, so only it is read as definitions: a
+  // `var(--x, #fff)` use must never count as one.
+  const rootStart = html.indexOf(":root {");
+  assert.notEqual(rootStart, -1, "the served page must still carry its theme block");
+  const root = html.slice(rootStart, html.indexOf("}", rootStart));
+  const defined = new Set([...root.matchAll(/(--[a-z0-9-]+)\s*:/g)].map((match) => match[1]));
+  const used = [...new Set([...html.matchAll(/var\((--[a-z0-9-]+)/g)].map((match) => match[1]))];
+
+  assert.ok(used.length >= 10, `the page is expected to use the theme tokens, found ${used.length}`);
+  for (const token of used) {
+    assert.ok(defined.has(token), `${token} is referenced but never defined in the :root block`);
+  }
+  // The token the panel shipped with, named so that it cannot come back through a
+  // copy and paste of the pages.mjs palette: the panel defines `subtle` and
+  // `subtlest`, and nothing in between.
+  assert.equal(defined.has("--foreground-subtler"), false);
+});
+
 test("the helpers the page runs are the helpers these tests cover", () => {
   const html = panelPage();
   const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
@@ -570,6 +627,9 @@ test("the helpers the page runs are the helpers these tests cover", () => {
   same("clampViewport", [{ width: 800, height: 600 }]);
   same("deviceMetricsParams", [{ width: 800, height: 600 }]);
   same("screencastParams", [{ width: 3840, height: 2160 }]);
+  // With no size at all the page asks for the picture bounds themselves, which is
+  // what the wiring does at attach: the default has to travel into the page too.
+  same("screencastParams", []);
   same("viewportFromFrameMetadata", [{ deviceWidth: 640, deviceHeight: 480 }]);
   same("viewportFromFrameMetadata", [{}, { width: 800, height: 600 }]);
   same("canvasToViewport", [{ x: 300, y: 200 }, { rect: { left: 100, top: 50, width: 400, height: 300 }, viewport: { width: 800, height: 600 } }]);
