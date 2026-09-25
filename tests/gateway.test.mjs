@@ -6,6 +6,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// The block duration is read from the gateway rather than copied here: a copy
+// would keep the old value and the timing tests below would then measure a
+// number the product no longer uses.
 import { BLOCK_MS, createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
 import { totp } from "../gateway/lib/totp.mjs";
 
@@ -15,9 +18,10 @@ const PASSWORD = "correct-horse-battery-staple";
 /**
  * The bound the documentation advertises for one block, and therefore a contract.
  *
- * It is read from the gateway rather than copied here: a copy would keep the old
- * duration and the timing tests below would then measure a value the product no
- * longer uses.
+ * Deliberately a literal, and not the imported value: the timing tests below
+ * measure BLOCK_MS, the duration the gateway applies, while this copy is the
+ * number README.md and SECURITY.md promise, and the pin test compares the two.
+ * A change to the duration that is not also made to the documents fails there.
  */
 const ADVERTISED_BLOCK_MS = 5 * 60 * 1000;
 

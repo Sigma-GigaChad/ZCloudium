@@ -55,8 +55,6 @@ function submitCode(api, code) {
   return api.post("/_auth/verify", { form: { code }, maxRedirects: 0 });
 }
 
-test.describe.configure({ mode: "serial" });
-
 test("repeated failures at the second factor are refused, and the refusal covers a valid code", async ({
   baseURL,
 }) => {

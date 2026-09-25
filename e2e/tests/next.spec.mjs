@@ -15,8 +15,11 @@
  *      origin. The page render is the only place the sanitiser is applied exactly
  *      once (the verify step applies it to its own previous result), so this is
  *      the layer that pins the sanitiser itself, and it is the one that fails
- *      against a gateway built before the sanitiser fixes. Eight of the nine
- *      values below were rendered verbatim by the gateway this branch replaces.
+ *      against a gateway built before the sanitiser fixes. The released gateway
+ *      returned any value that started with a single slash unmodified, which is
+ *      why crafted values reached the browser as the attacker wrote them, and why
+ *      the assertion below asks the browser what such a value resolves to instead
+ *      of deciding it here.
  *
  *   2. A crafted value submitted from the browser, followed to the end, leaves the
  *      browser on this origin, on the application at "/", and the answer the code
@@ -25,8 +28,9 @@
  *      sanitiser a second time to its own result, so a sanitiser that returned a
  *      protocol relative path would still be caught by the page render above and
  *      not here. What it does catch is the value that survives both applications
- *      and still changes where the browser lands, which is what the gateway this
- *      branch replaces did.
+ *      and still changes where the browser lands, which is what the released
+ *      gateway did: it answered the code step with a Location of /\evil.com, and a
+ *      browser reads that as another host.
  *
  * The crafted values, one per class of rewrite the URL specification allows:
  *   //evil.com         the plain protocol relative form, a control: the origin
