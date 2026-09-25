@@ -14,6 +14,10 @@
  * raw result is written to stdout and appended to `--out` as one JSON object per
  * line, so the evidence survives the run.
  *
+ * With `--page <substring of the url>`, the page id is resolved by calling
+ * list_pages first and injected into every page scoped step: the server numbers
+ * pages per connection, so the id is not something a caller may assume.
+ *
  * `--list` prints the tools the server exposes and stops.
  */
 
@@ -25,8 +29,54 @@ import { connectMcp } from "./mcp-client.mjs";
 
 const run = promisify(execFile);
 
+/** The tools whose input schema carries a pageId, read from tools/list. */
+export const PAGE_SCOPED_TOOLS = new Set([
+  "click",
+  "close_page",
+  "drag",
+  "emulate",
+  "evaluate_script",
+  "fill",
+  "fill_form",
+  "get_console_message",
+  "get_css_styles",
+  "get_network_request",
+  "handle_dialog",
+  "hover",
+  "lighthouse_audit",
+  "list_console_messages",
+  "list_network_requests",
+  "navigate_page",
+  "performance_analyze_insight",
+  "performance_start_trace",
+  "performance_stop_trace",
+  "press_key",
+  "resize_page",
+  "select_page",
+  "take_heapsnapshot",
+  "take_screenshot",
+  "take_snapshot",
+  "type_text",
+  "upload_file",
+  "wait_for",
+]);
+
+/**
+ * The page id the server gave the page whose url contains `needle`. The listing
+ * is `## Pages` followed by `id: title (url)`, with `[selected]` on one of them.
+ */
+export function pageIdFromListing(text, needle) {
+  for (const line of String(text ?? "").split("\n")) {
+    const match = line.match(/^\s*(\d+):\s*(.*)$/);
+    if (match && match[2].includes(needle)) {
+      return Number(match[1]);
+    }
+  }
+  return null;
+}
+
 function parseArgs(argv) {
-  const out = { home: "/data", steps: [], outPath: null, list: false, docker: "docker" };
+  const out = { home: "/data", steps: [], outPath: null, list: false, docker: "docker", page: null };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
     const value = argv[index + 1];
@@ -45,6 +95,10 @@ function parseArgs(argv) {
         break;
       case "--steps-file":
         out.stepsFile = value;
+        index += 1;
+        break;
+      case "--page":
+        out.page = value;
         index += 1;
         break;
       case "--out":
@@ -79,7 +133,6 @@ async function readEntry(container, home) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const { path, entry, config } = await readEntry(options.container, options.home);
-  const steps = options.stepsFile ? JSON.parse(await readFile(options.stepsFile, "utf8")) : options.steps;
 
   process.stdout.write(
     `${JSON.stringify({ event: "entry", configPath: path, entry, otherServers: Object.keys(config?.mcp?.servers ?? {}) })}\n`,
@@ -110,6 +163,21 @@ async function main() {
     if (options.list) {
       await record({ event: "tools", result: await client.listTools() });
       return;
+    }
+
+    let steps = options.stepsFile ? JSON.parse(await readFile(options.stepsFile, "utf8")) : options.steps;
+
+    if (options.page) {
+      const listing = await client.callTool("list_pages", {});
+      const text = listing?.content?.map((part) => part.text ?? "").join("\n") ?? "";
+      const pageId = pageIdFromListing(text, options.page);
+      await record({ event: "page-resolution", needle: options.page, pageId, listing: text });
+      if (pageId === null) {
+        throw new Error(`no page matches ${options.page} in:\n${text}`);
+      }
+      steps = steps.map((step) =>
+        PAGE_SCOPED_TOOLS.has(step.tool) ? { ...step, args: { pageId, ...(step.args ?? {}) } } : step,
+      );
     }
 
     for (const [index, step] of steps.entries()) {
