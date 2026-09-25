@@ -577,6 +577,24 @@ test("the debug port is configurable from the environment, and the profile follo
   assert.equal(mcpCalls[0].entry.args[mcpCalls[0].entry.args.indexOf("--browserUrl") + 1], "http://127.0.0.1:9333");
 });
 
+test("the attach line does not promise a panel the deployment has no gateway for", async () => {
+  // ZCLOUDIUM_AUTH=off publishes the runtime directly: nothing serves the browser
+  // prefix, so the log must not say the panel is there.
+  const { browserSpawns, logs } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "on", ZCLOUDIUM_AUTH: "off" },
+    { browser: fakeBrowser() },
+  );
+  assert.equal(browserSpawns.length, 1, "the browser is still started: the agent drives it");
+  const line = logs.find((entry) => /browser panel: the agent attaches/.test(entry));
+  assert.ok(line, `the attach must still be stated, got ${JSON.stringify(logs)}`);
+  assert.match(line, /no gateway serves \/_browser\/, so the panel is not reachable/);
+  assert.equal(
+    /The panel is on \/_browser\//.test(line),
+    false,
+    "with no gateway the panel is not served, and the log must not claim it is",
+  );
+});
+
 test("a browser that never answers its debug port falls back to the launch shape and does not block the start", async () => {
   const browser = fakeBrowser();
   const { browserStops, gatewayCalls, mcpCalls, logs, spawns, child, exits } = await runStart(

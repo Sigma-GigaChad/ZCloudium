@@ -167,6 +167,35 @@ export function canvasToViewport(point, { rect, viewport } = {}) {
   };
 }
 
+/**
+ * The viewport input is mapped with, from the two things the panel knows: the last
+ * frame it painted, and the override it last applied.
+ *
+ * The frame is the primary source, because the picture is what the operator is
+ * aiming at. The exception is the window between an override landing and the first
+ * frame at the new size: there the page has already been laid out again while the
+ * picture is still the previous one, so a click has to be mapped into the layout
+ * the page has rather than the one on screen. That window is short (tens of
+ * milliseconds) and it is exactly the kind of thing that shows up only as a click
+ * landing next to the field the operator aimed at, which is how the end to end
+ * suite found it.
+ *
+ * The stamps come from a single counter in the page and are only ever compared
+ * with each other. A tie goes to the frame, because a measured size beats a
+ * requested one.
+ */
+export function inputViewport({ frame = null, frameStamp = null, applied = null, appliedStamp = null } = {}) {
+  if (!frame) {
+    return applied ?? null;
+  }
+  if (!applied) {
+    return frame;
+  }
+  const frameOrder = Number.isFinite(frameStamp) ? frameStamp : -Infinity;
+  const appliedOrder = Number.isFinite(appliedStamp) ? appliedStamp : -Infinity;
+  return appliedOrder > frameOrder ? applied : frame;
+}
+
 /** The DOM button number as the name CDP expects. */
 export function buttonName(button) {
   if (button === 1) {
@@ -383,6 +412,7 @@ const PAGE_HELPERS = [
   screencastParams,
   viewportFromFrameMetadata,
   canvasToViewport,
+  inputViewport,
   buttonName,
   mouseParams,
   keyFields,
@@ -546,6 +576,10 @@ const state = {
   targets: [],
   targetIds: "",
   frameViewport: null,
+  frameStamp: 0,
+  appliedViewport: null,
+  appliedStamp: 0,
+  stamp: 0,
   frames: 0,
   lastFrameAt: 0,
   painting: false,
@@ -624,6 +658,8 @@ function onFrame(params) {
   const viewport = viewportFromFrameMetadata(params.metadata, state.frameViewport);
   if (viewport) {
     state.frameViewport = viewport;
+    state.stamp += 1;
+    state.frameStamp = state.stamp;
   }
   // The acknowledgement goes first and unconditionally: without it the browser
   // stops sending frames. A frame that is still being decoded is skipped rather
@@ -666,6 +702,11 @@ function connect(targetId) {
   closeSocket();
   state.targetId = targetId;
   state.frameViewport = null;
+  state.frameStamp = 0;
+  // The override the previous panel applied belongs to the page it applied it to,
+  // so a new attachment starts from what the new page reports.
+  state.appliedViewport = null;
+  state.appliedStamp = 0;
   state.frames = 0;
   state.dirty = false;
   const target = state.targets.filter(function (entry) {
@@ -765,11 +806,14 @@ function applyViewport(width, height) {
   return send("Emulation.setDeviceMetricsOverride", deviceMetricsParams(viewport))
     .then(function () {
       // The page is at the new size the moment the override lands, while the
-      // picture is still the previous frame for a few milliseconds. Input is
-      // interpreted in the emulated viewport, so aiming with the override is the
-      // correct reading of a click made in that window; the next frame replaces
-      // this with the same numbers, measured rather than assumed.
-      state.frameViewport = viewport;
+      // picture is still the previous frame for a few milliseconds. The stamp is
+      // what tells the input mapping which of the two is the newer information,
+      // so a click made in that window is aimed at the layout the page has; the
+      // next frame replaces this with the same numbers, measured rather than
+      // assumed.
+      state.appliedViewport = viewport;
+      state.stamp += 1;
+      state.appliedStamp = state.stamp;
       setStatus("viewport " + viewport.width + "x" + viewport.height, "connected");
       return refreshReported(false);
     })
@@ -833,10 +877,13 @@ function refreshTargets() {
 }
 
 function mappedPoint(event) {
-  return canvasToViewport(
-    { x: event.clientX, y: event.clientY },
-    { rect: canvas.getBoundingClientRect(), viewport: state.frameViewport },
-  );
+  const viewport = inputViewport({
+    frame: state.frameViewport,
+    frameStamp: state.frameStamp,
+    applied: state.appliedViewport,
+    appliedStamp: state.appliedStamp,
+  });
+  return canvasToViewport({ x: event.clientX, y: event.clientY }, { rect: canvas.getBoundingClientRect(), viewport });
 }
 
 function sendMouse(type, event, extra) {

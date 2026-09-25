@@ -704,8 +704,11 @@ Tested by actually running things, not only written:
   passes with the panel off (21 passed, the 4 panel specs skipped with a reason)
   and with the panel on (25 passed, including the four panel specs: the session
   requirement including the upgrade, the viewport control measured from the page,
-  the detach and reattach continuity, and the DevTools button). CI runs both, in
-  parallel jobs
+  the detach and reattach continuity, and the DevTools button). Those two runs were
+  made by hand on this machine, with `run-e2e.sh` as the README documents it. The
+  e2e workflow is configured to run the same suite twice on every push, in two
+  parallel jobs, one per position of the switch; that part is configuration here
+  and has not been observed green on the runner yet.
 
 ## Implementation details
 

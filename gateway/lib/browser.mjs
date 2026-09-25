@@ -357,6 +357,49 @@ export function proxyAuthorityFor(host, prefix = BROWSER_PREFIX) {
   return authority === null ? null : `${authority}${prefix}`;
 }
 
+/** The port an origin never spells out, per scheme. */
+const DEFAULT_PORTS = { "http:": "80", "https:": "443" };
+
+/**
+ * One authority as an origin spells it: the host lower cased, and the port
+ * dropped when it is the default for the scheme.
+ *
+ * Two spellings of one authority have to compare equal where origins are
+ * compared, because a browser and a reverse proxy disagree about them all the
+ * time. A browser lower cases the host in the `Origin` header and never writes a
+ * port that is the scheme's default; a reverse proxy writes its `Host` header
+ * from its own configuration, and `proxy_set_header Host $host:$server_port` on
+ * an https server appends `:443`, which is the default for https and therefore
+ * invisible in the origin the browser sends. Without this, the gateway computes
+ * its own origin as a different string than its own frontend sends and refuses
+ * that frontend with a 403, with the trust flag on or off.
+ *
+ * Anything that is not an authority (a path, a space, a userinfo section, a
+ * newline) is still refused, by the same check as before: the value ends up in a
+ * comparison against an origin.
+ */
+export function normalizeAuthority(authority, scheme = "http:") {
+  const value = hostAuthority(authority);
+  if (value === null) {
+    return null;
+  }
+  let host = value;
+  let port = null;
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    host = value.slice(0, end + 1);
+    port = value.slice(end + 2) || null;
+  } else {
+    const separator = value.indexOf(":");
+    if (separator >= 0) {
+      host = value.slice(0, separator);
+      port = value.slice(separator + 1) || null;
+    }
+  }
+  const lower = host.toLowerCase();
+  return port === null || port === DEFAULT_PORTS[scheme] ? lower : `${lower}:${port}`;
+}
+
 /** A string that is exactly an origin, or null. Anything with a path is not one. */
 function strictOrigin(value) {
   try {
@@ -365,6 +408,38 @@ function strictOrigin(value) {
   } catch {
     return null;
   }
+}
+
+/** The shape of an origin: a scheme, an authority, and nothing else but a tail. */
+const ORIGIN_SHAPE = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]+)([\s\S]*)$/;
+
+/**
+ * An origin normalised to the one spelling this comparison uses, or null when the
+ * value is not an origin.
+ *
+ * The shape is checked after the normalisation rather than before it, so
+ * `HTTP://Panel.Example:80` and `http://panel.example` are the same origin while a
+ * path, a query, a fragment, a userinfo section or the opaque `null` is still
+ * refused: what is left of the value after the scheme and the authority has to be
+ * empty, and `strictOrigin` is what says so.
+ */
+function canonicalOrigin(value) {
+  const match = ORIGIN_SHAPE.exec(value);
+  if (!match) {
+    return null;
+  }
+  const scheme = `${match[1].toLowerCase()}:`;
+  if (scheme !== "http:" && scheme !== "https:") {
+    return null;
+  }
+  const authority = normalizeAuthority(match[2], scheme);
+  return authority === null ? null : strictOrigin(`${scheme}//${authority}${match[3]}`);
+}
+
+/** The gateway's own origin in one scheme, normalised, or null. */
+function ownOrigin(scheme, host) {
+  const authority = normalizeAuthority(host, `${scheme}:`);
+  return authority === null ? null : `${scheme}://${authority}`;
 }
 
 /**
@@ -391,29 +466,27 @@ function strictOrigin(value) {
  *
  * `trustProxy` covers the deployment README.md recommends: a TLS terminating
  * proxy in front, so the browser sends an `https` Origin while the socket the
- * gateway sees is plain http, and its own origin is computed as `http`. The flag
- * already means "a proxy I control is in front", which is exactly the condition
- * under which the https variant of the request's own authority is trustworthy.
- * It adds that one variant and nothing else: the authority is still compared
- * character for character, and with the flag off the behaviour is the one before
- * it existed.
+ * gateway sees is plain http. The flag already means "a proxy I control is in
+ * front", which is exactly the condition under which the https variant of the
+ * request's own authority is trustworthy. It adds that one scheme variant of the
+ * request's own authority and nothing else, and the authority still has to be the
+ * same one after normalisation (`normalizeAuthority`): another name, another port
+ * or a different scheme is refused, and with the flag off the behaviour is the one
+ * before it existed.
  */
 export function isAcceptableOrigin(origin, host, { secure = false, trustProxy = false } = {}) {
   if (origin === undefined || origin === null || String(origin).trim() === "") {
     return true;
   }
-  const authority = hostAuthority(host);
-  if (authority === null) {
-    // Without a usable host there is no own origin to compare against, so a
-    // request that came from a page is refused rather than waved through.
-    return false;
-  }
-  const theirs = strictOrigin(String(origin).trim());
+  const theirs = canonicalOrigin(String(origin).trim());
   if (theirs === null) {
+    // A value that is not an origin cannot be compared, so a request that came
+    // from a page is refused rather than waved through.
     return false;
   }
-  if (theirs === strictOrigin(`${secure ? "https" : "http"}://${authority}`)) {
+  const own = secure ? "https" : "http";
+  if (theirs === ownOrigin(own, host)) {
     return true;
   }
-  return trustProxy && theirs === strictOrigin(`https://${authority}`);
+  return trustProxy && theirs === ownOrigin("https", host);
 }

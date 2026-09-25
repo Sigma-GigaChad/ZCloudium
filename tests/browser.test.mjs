@@ -34,6 +34,7 @@ import {
   isDiscoveryPath,
   isStaleSingletonLock,
   launchBrowser,
+  normalizeAuthority,
   parseBrowserDebugPort,
   parseBrowserPanel,
   prepareBrowserProfile,
@@ -297,6 +298,68 @@ test("behind a trusted proxy an https Origin of this exact authority is accepted
   assert.equal(isAcceptableOrigin("https://panel.example:3041", undefined, { trustProxy: true }), false);
   // And a client that is not a page still carries no Origin at all.
   assert.equal(isAcceptableOrigin(undefined, host, { trustProxy: true }), true);
+});
+
+/**
+ * The spelling of the authority, which is where a browser and a reverse proxy
+ * disagree.
+ *
+ * A browser lower cases the host in the Origin header and never writes a port
+ * that is the scheme's default. A reverse proxy writes the Host header from its
+ * own configuration, and `proxy_set_header Host $host:$server_port` on an https
+ * server appends `:443`, which is the default for https and invisible in the
+ * origin. Comparing the two without normalising them refuses a deployment the
+ * README recommends, with the trust flag on or off.
+ */
+test("the authority is normalised the way an origin spells it", () => {
+  assert.equal(normalizeAuthority("panel.example:3041"), "panel.example:3041");
+  assert.equal(normalizeAuthority("PANEL.EXAMPLE:3041"), "panel.example:3041", "an origin lower cases the host");
+  assert.equal(normalizeAuthority("Panel.Example"), "panel.example");
+  assert.equal(normalizeAuthority("panel.example:80"), "panel.example", "80 is the default for http");
+  assert.equal(normalizeAuthority("panel.example:443"), "panel.example:443", "443 is not the default for http");
+  assert.equal(normalizeAuthority("panel.example:443", "https:"), "panel.example", "443 is the default for https");
+  assert.equal(normalizeAuthority("panel.example:8443", "https:"), "panel.example:8443");
+  assert.equal(normalizeAuthority("panel.example", "https:"), "panel.example");
+  assert.equal(normalizeAuthority("127.0.0.1:3030"), "127.0.0.1:3030");
+  assert.equal(normalizeAuthority("[::1]:3041"), "[::1]:3041");
+  assert.equal(normalizeAuthority("[::1]:443", "https:"), "[::1]");
+  assert.equal(normalizeAuthority("[::1]:80"), "[::1]");
+  assert.equal(normalizeAuthority("[::1]"), "[::1]");
+  assert.equal(normalizeAuthority("  panel.example:3041  "), "panel.example:3041", "a Host header may carry spaces around it");
+
+  // The same refusal as before: nothing that is not an authority gets through,
+  // because the result still ends up in a comparison against an origin.
+  for (const hostile of [undefined, null, "", "   ", "evil.example/../x", "evil.example x", "user:pass@host", "host\nSet-Cookie: x", "host/", "http://host", "panel.example:"]) {
+    assert.equal(normalizeAuthority(hostile), null, JSON.stringify(hostile));
+  }
+});
+
+test("the same origin in another spelling is still the same origin", () => {
+  // The ordinary reverse proxy case: it maps its own port (443, the https
+  // default) onto the container's Host while the browser sends no port at all.
+  assert.equal(isAcceptableOrigin("https://panel.example", "panel.example:443", { trustProxy: true }), true);
+  assert.equal(isAcceptableOrigin("https://panel.example", "PANEL.EXAMPLE:443", { trustProxy: true }), true);
+  // An uppercase host on either side, and an explicit default port in the origin.
+  assert.equal(isAcceptableOrigin("http://PANEL.EXAMPLE:3041", "panel.example:3041"), true);
+  assert.equal(isAcceptableOrigin("http://panel.example:80", "panel.example"), true);
+  assert.equal(isAcceptableOrigin("https://PANEL.EXAMPLE:443", "panel.example", { trustProxy: true }), true);
+  // A real TLS socket already accepted the https variant, and still does.
+  assert.equal(isAcceptableOrigin("https://panel.example:443", "panel.example:443", { secure: true }), true);
+
+  // A port that is not the scheme's default is still a different origin, on
+  // either side of the comparison.
+  assert.equal(isAcceptableOrigin("https://panel.example", "panel.example:3041", { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example:3041", "panel.example", { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("http://panel.example:3041", "panel.example:80"), false);
+  // And another name is still another origin, whatever the ports say.
+  assert.equal(isAcceptableOrigin("https://evil.example", "panel.example:443", { trustProxy: true }), false);
+  assert.equal(isAcceptableOrigin("https://panel.example.evil.example", "panel.example:443", { trustProxy: true }), false);
+
+  // The shape check is not loosened by any of this: a trailing slash, a query, a
+  // fragment or a userinfo section is not an origin.
+  for (const odd of ["http://panel.example/", "http://panel.example:80/", "http://panel.example?x=1", "http://panel.example#a", "http://user:pass@panel.example", "null", "panel.example:443"]) {
+    assert.equal(isAcceptableOrigin(odd, "panel.example:443", { trustProxy: true }), false, odd);
+  }
 });
 
 test("an Origin that is not a plain origin is refused, and a broken Host refuses everything", () => {

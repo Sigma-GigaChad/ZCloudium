@@ -743,6 +743,24 @@ export async function createGateway({
       socket.on("close", drop);
     });
 
+    /**
+     * The upstream answered a plain HTTP response instead of upgrading, which is
+     * what the debug port does when the target is not there any more (a tab closed
+     * under the operator, a target id a browser kept in its history). Passing that
+     * answer on is the difference between an error the operator can read and a
+     * socket that hangs until the browser gives up, so the status line, the headers
+     * and the body all travel back and the socket is then closed.
+     */
+    upstream.on("response", (response) => {
+      const lines = [`HTTP/1.1 ${response.statusCode} ${response.statusMessage ?? ""}`.trim()];
+      for (let index = 0; index < response.rawHeaders.length; index += 2) {
+        lines.push(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}`);
+      }
+      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+      response.pipe(socket);
+      response.on("end", () => socket.end());
+    });
+
     upstream.on("error", (error) => {
       logger(`[auth] upgrade error: ${error.message}`);
       socket.destroy();

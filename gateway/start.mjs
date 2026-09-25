@@ -304,10 +304,17 @@ export async function start({
 
     const probe = await probeBrowserFn({ debugUrl });
     if (resolveBrowserMode({ panelEnabled: true, debugUrl, reachable: probe.reachable }) === "attach") {
+      // Where the panel can be reached depends on the gateway existing: with
+      // ZCLOUDIUM_AUTH=off the runtime is published directly and nothing serves
+      // the browser prefix, so saying the panel is on /_browser/ there would be a
+      // promise the deployment cannot keep.
+      const where = config.authEnabled
+        ? `The panel is on ${BROWSER_PREFIX}/ behind the session, and Chromium's own DevTools frontend on ` +
+          `${BROWSER_PREFIX}/devtools/inspector.html.`
+        : `With ZCLOUDIUM_AUTH=off no gateway serves ${BROWSER_PREFIX}/, so the panel is not reachable: the browser ` +
+          "runs for the agent only.";
       logger(
-        `[start] browser panel: the agent attaches to ${debugUrl} (pid ${browser.pid}), profile ${profile}. ` +
-          `The panel is on ${BROWSER_PREFIX}/ behind the session, and Chromium's own DevTools frontend on ` +
-          `${BROWSER_PREFIX}/devtools/inspector.html.`,
+        `[start] browser panel: the agent attaches to ${debugUrl} (pid ${browser.pid}), profile ${profile}. ${where}`,
       );
     } else {
       // A browser that never opened its debug port is no use to anyone: the

@@ -680,6 +680,13 @@ async function startDebugStub() {
   });
   server.on("upgrade", (req, socket) => {
     requests.push({ method: "UPGRADE", path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
+    if (req.url.includes("GONE")) {
+      // What the real debug port does when the target is not there any more: a
+      // plain HTTP answer instead of a handshake.
+      const body = "no such target";
+      socket.write(`HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: ${body.length}\r\n\r\n${body}`);
+      return;
+    }
     const accept = createHash("sha1")
       .update(String(req.headers["sec-websocket-key"]) + WS_GUID)
       .digest("base64");
@@ -990,6 +997,22 @@ test("behind a trusted proxy, an https Origin of this exact authority is accepte
       assert.match(accepted.split("\r\n")[0], /200/, "the https variant of this exact authority is this gateway's frontend");
       assert.match(accepted, /ws:\/\/panel\.example:\d+\/_browser\/devtools\/browser/, "and the document is rewritten to the host the browser used");
 
+      // The spelling a reverse proxy actually produces, and the reason the
+      // comparison normalises the authority first: `proxy_set_header Host
+      // $host:$server_port` on the https server hands the container
+      // `panel.example:443`, while the browser's Origin carries no port at all,
+      // because 443 is the default for https. Refusing this would break the
+      // deployment the README recommends, with the flag on.
+      const proxied = await rawGet(port, "/_browser/json/version", { host: "panel.example:443", origin: "https://panel.example", cookie: session });
+      assert.match(proxied.split("\r\n")[0], /200/, `the proxy's Host spelling must be accepted, got "${proxied.split("\r\n")[0]}"`);
+      const upper = await rawGet(port, "/_browser/json/version", { host: "PANEL.EXAMPLE:443", origin: "https://panel.example", cookie: session });
+      assert.match(upper.split("\r\n")[0], /200/, `an uppercase host in the Host header must be accepted, got "${upper.split("\r\n")[0]}"`);
+      // A port that is not the scheme's default is still another origin.
+      const otherPort = await rawGet(port, "/_browser/json/version", { host: "panel.example:3041", origin: "https://panel.example", cookie: session });
+      assert.match(otherPort.split("\r\n")[0], /403/, "another port is another origin");
+      const proxiedUpgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host: "panel.example:443", origin: "https://panel.example" });
+      assert.match(proxiedUpgrade, /101/, `the panel's own handshake must be allowed through that spelling too, got "${proxiedUpgrade}"`);
+
       // The authority is still compared character for character.
       for (const foreign of ["https://panel.example:3042", "https://panel.example", "https://evil.example", "https://127.0.0.1:3041"]) {
         const response = await rawGet(port, "/_browser/json/version", { host, origin: foreign, cookie: session });
@@ -1005,12 +1028,29 @@ test("behind a trusted proxy, an https Origin of this exact authority is accepte
       assert.match(refusedUpgrade, /403/, `a foreign https origin must not upgrade, got "${refusedUpgrade}"`);
       assert.equal(
         debug.requests.filter((request) => request.method === "UPGRADE").length,
-        1,
-        "only the accepted handshake may reach the debug port",
+        2,
+        "only the two accepted handshakes (this authority, and the proxy's spelling of it) may reach the debug port",
       );
     },
     { trustProxy: true },
   ));
+
+test("an upgrade the debug port answers with an HTTP response does not hang the operator", () =>
+  withPanelGateway(async ({ base, port, debug }) => {
+    const { session } = await completeSetup(base);
+    // A tab that was closed under the operator, or a stale target id in a URL a
+    // browser kept: the debug port answers a plain 404 instead of upgrading, and
+    // that answer has to reach the operator rather than leave the socket hanging
+    // until the browser gives up.
+    const status = await wsStatusLine(port, "/_browser/devtools/page/GONE", session);
+    assert.notEqual(status, "TIMEOUT", "the socket must get an answer, not hang");
+    assert.match(status, /404/, `the debug port's own answer must reach the operator, got "${status}"`);
+    assert.equal(
+      debug.requests.filter((request) => request.method === "UPGRADE" && request.path.includes("GONE")).length,
+      1,
+      "the debug port must have been asked, and asked once",
+    );
+  }));
 
 test("the application route keeps its own model: the origin check is the browser route's", () =>
   withPanelGateway(async ({ base }) => {

@@ -34,6 +34,7 @@ import {
   clampViewport,
   deviceMetricsParams,
   devtoolsUrlFor,
+  inputViewport,
   keyCommands,
   keyUpCommands,
   mouseParams,
@@ -143,6 +144,211 @@ test("a canvas point becomes the viewport point the page is aiming at", () => {
   assert.equal(canvasToViewport({ x: 10, y: 10 }, { rect, viewport: null }), null);
   assert.equal(canvasToViewport(null, { rect, viewport }), null);
   assert.equal(canvasToViewport({ x: "10", y: 10 }, { rect, viewport }), null);
+});
+
+/**
+ * Which viewport a click is mapped with, which is the one decision the panel makes
+ * that a rendered page cannot show: between an override landing and the first frame
+ * at the new size, the page is already at the new size while the picture is still
+ * the previous one. The pure half is here; the wiring that consumes it is executed
+ * in `panelRuntime` below, so deleting the line that stamps the override fails a
+ * test rather than slipping through both suites.
+ */
+test("input is mapped with the newest of the frame and the override the panel applied", () => {
+  const frame = { width: 780, height: 437 };
+  const applied = { width: 640, height: 480 };
+  assert.deepEqual(inputViewport({ frame, frameStamp: 1 }), frame, "no override: the picture is what the operator aims at");
+  assert.deepEqual(inputViewport({ applied, appliedStamp: 2 }), applied, "no frame yet: the override is all we know about the page");
+  assert.deepEqual(
+    inputViewport({ frame, frameStamp: 1, applied, appliedStamp: 2 }),
+    applied,
+    "an override newer than the frame wins: the page has already been laid out again",
+  );
+  assert.deepEqual(
+    inputViewport({ frame, frameStamp: 2, applied, appliedStamp: 1 }),
+    frame,
+    "a frame newer than the override wins: the size may have been changed by the agent, and the picture is the measurement",
+  );
+  assert.deepEqual(inputViewport({ frame, frameStamp: 2, applied, appliedStamp: 2 }), frame, "a tie goes to the measured size");
+  assert.deepEqual(inputViewport({ frame, frameStamp: 2, applied, appliedStamp: null }), frame, "an override with no stamp counts as the oldest information");
+  assert.equal(inputViewport({}), null);
+  assert.equal(inputViewport(), null);
+});
+
+/**
+ * The page's own wiring, executed outside a browser.
+ *
+ * The wiring is the part no pure function covers, and the decision above only
+ * matters if the wiring really consumes it. So the served wiring block is run here
+ * against a small DOM stub, and what is asserted is what it puts on the CDP wire:
+ * the mouse message it sends for a click on the picture.
+ */
+function panelRuntime() {
+  const blocks = [...panelPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+  const sent = [];
+  const sockets = [];
+  const handlers = new Map();
+  const elements = new Map();
+
+  const element = (id) => ({
+    id,
+    value: id === "width" ? "1280" : id === "height" ? "800" : "",
+    textContent: "",
+    title: "",
+    href: "",
+    checked: false,
+    disabled: false,
+    dataset: {},
+    style: {},
+    width: 0,
+    height: 0,
+    addEventListener: (event, handler) => {
+      const key = `${id}:${event}`;
+      handlers.set(key, [...(handlers.get(key) ?? []), handler]);
+    },
+    appendChild: () => {},
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }),
+    getContext: () => ({ drawImage: () => {}, clearRect: () => {} }),
+    focus: () => {},
+    blur: () => {},
+  });
+  const elementFor = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, element(id));
+    }
+    return elements.get(id);
+  };
+
+  class FakeSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      sockets.push(this);
+    }
+    send(text) {
+      const message = JSON.parse(text);
+      sent.push(message);
+      // The debug port answers every command, and the wiring waits for the answer.
+      Promise.resolve().then(() => this.onmessage?.({ data: JSON.stringify({ id: message.id, result: {} }) }));
+    }
+    close() {}
+  }
+
+  class FakeImage {
+    constructor() {
+      this.width = 640;
+      this.height = 480;
+    }
+    set src(value) {
+      this._src = value;
+      if (this.onload) {
+        this.onload();
+      }
+    }
+    get src() {
+      return this._src;
+    }
+  }
+
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  const location = { host: "panel.example:3040", protocol: "http:", href: "http://panel.example:3040/_browser/" };
+  const context = {
+    URL,
+    location,
+    window: { addEventListener: () => {}, location },
+    document: { getElementById: elementFor, createElement: (tag) => element(`created:${tag}`), body: element("body") },
+    fetch: async () => ({ ok: true, json: async () => [{ id: "AB", type: "page", url: "about:blank", title: "Fixture" }] }),
+    WebSocket: FakeSocket,
+    Image: FakeImage,
+    ResizeObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(blocks[0], context);
+  vm.runInContext(blocks[1], context);
+
+  const invoke = async (id, event, payload) => {
+    for (const handler of handlers.get(`${id}:${event}`) ?? []) {
+      handler(payload);
+    }
+    await tick();
+  };
+  const lastSent = (method) => [...sent].reverse().find((message) => message.method === method);
+
+  return {
+    sent,
+    lastSent,
+    /** The params of the last command of that name, which is what goes on the wire. */
+    lastParams: (method) => lastSent(method)?.params ?? null,
+    async connected() {
+      for (let attempt = 0; attempt < 50 && sockets.length === 0; attempt += 1) {
+        await tick();
+      }
+      assert.equal(sockets.length, 1, "the wiring must have opened one socket to the target it found");
+      sockets[0].onopen();
+      await tick();
+      return sockets[0];
+    },
+    deliverFrame(metadata) {
+      sockets[0].onmessage({
+        data: JSON.stringify({ method: "Page.screencastFrame", params: { data: "AAAA", sessionId: 1, metadata } }),
+      });
+    },
+    /** Clicks an element of the panel by its id, as the operator would. */
+    click(id) {
+      return invoke(id, "click", {});
+    },
+    moveOnCanvas(point) {
+      return invoke("screen", "mousemove", { clientX: point.x, clientY: point.y, button: 0, buttons: 0, detail: 0 });
+    },
+    fields: (width, height) => {
+      elementFor("width").value = String(width);
+      elementFor("height").value = String(height);
+    },
+  };
+}
+
+test("a click right after a viewport change is mapped into the size the page has", async () => {
+  const panel = panelRuntime();
+  await panel.connected();
+  // The picture is the old, small layout.
+  panel.deliverFrame({ deviceWidth: 780, deviceHeight: 437 });
+  // The operator types a new size and applies it: the override lands, and the
+  // frame at that size is still on its way.
+  panel.fields(1280, 960);
+  await panel.click("apply");
+  await panel.moveOnCanvas({ x: 320, y: 240 });
+  const duringTheWindow = panel.lastParams("Input.dispatchMouseEvent");
+  assert.deepEqual(
+    { x: duringTheWindow.x, y: duringTheWindow.y },
+    { x: 640, y: 480 },
+    "the click must be mapped with the override the panel just applied, not with the previous frame",
+  );
+
+  // Once a frame at the new size arrives, the frame is the source again: the size
+  // may have been changed by something other than this panel.
+  panel.deliverFrame({ deviceWidth: 500, deviceHeight: 400 });
+  await panel.moveOnCanvas({ x: 320, y: 240 });
+  const afterTheFrame = panel.lastParams("Input.dispatchMouseEvent");
+  assert.deepEqual(
+    { x: afterTheFrame.x, y: afterTheFrame.y },
+    { x: 250, y: 200 },
+    "a frame newer than the override must win, and it is the measured size that is used",
+  );
+  // And the override really was applied: this is not a mapping over a size that
+  // never reached the page.
+  assert.deepEqual(panel.lastParams("Emulation.setDeviceMetricsOverride"), {
+    width: 1280,
+    height: 960,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
 });
 
 test("the mouse messages carry the fields CDP expects, for every kind of gesture", () => {
