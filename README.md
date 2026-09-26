@@ -227,24 +227,22 @@ it.
 ## Browser automation for the agent
 
 ZCode ships a built-in Browser Use, and the runtime carries everything it needs:
-the backend, the Playwright that drives it, the browser it looks for at
-`/usr/bin/chromium` on Linux, and the official `browser-use` plugin among the
-plugins the runtime enables by default.
+the backend, the Playwright that drives it, and the official `browser-use`
+plugin among the plugins the runtime enables by default. What web mode does not
+offer is a way to turn it on: `zcode --web` parses a fixed option list and
+rejects `--browser-use`, while the agent it spawns is the process that would
+accept it.
 
-What web mode does not offer is a way to turn it on: `zcode --web` parses a
-fixed option list and rejects `--browser-use`, while the agent it spawns is the
-process that would accept it. The entrypoint therefore starts
-`server/entry-http.js` itself, which is the same server the wrapper starts, and
-hands the agent `--browser-use headless`. That is the whole trick, and it is why
-the browser is always on: an agent that can drive a browser, and an interface
-that shows it, is what the tool is for.
+Until that path has been proven in a container with no display, the capability
+is provided through MCP, which is **additive**: nothing of the application is
+modified.
 
 The image ships:
 
 | Component | Version | Why |
 | --- | --- | --- |
-| `chrome-devtools-mcp` | `1.10.1` | fallback browser for the agent, driven over stdio, until the built-in backend is confirmed in the interface |
-| `chromium` | pinned in `chromium.version`, `154.0.8037.57-1~deb12u1` | the browser both backends drive |
+| `chrome-devtools-mcp` | `1.10.1` | maintained browser MCP server (Google), driven over stdio |
+| `chromium` | pinned in `chromium.version`, `154.0.8037.57-1~deb12u1` | the browser it drives, through `--executablePath /usr/bin/chromium` |
 
 Both are installed **at build time**: no package manager is needed at runtime,
 and two containers started from the same image run the same browser server.

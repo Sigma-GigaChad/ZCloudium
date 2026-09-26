@@ -19,39 +19,30 @@ import {
   HOUR_MS,
   PUBLISHED_HOST,
   PUBLISHED_PORT,
-  RUNTIME_AGENT_ENTRY,
-  RUNTIME_SERVER_ENTRY,
-  RUNTIME_WEB_ROOT,
+  RUNTIME_ENTRY,
   UPSTREAM_HOST,
   UPSTREAM_PORT,
-  agentServerArgs,
   exitCodeFor,
   gatewayOptions,
   homeOf,
   parseEnv,
   parseSessionTtlHours,
   parseTrustProxy,
-  runtimeAddress,
-  serverEnv,
+  runtimeArgs,
   start,
 } from "../gateway/start.mjs";
 
-/** The agent arguments the web server is started with: the browser backend on. */
-const AGENT_ARGS = [
-  RUNTIME_AGENT_ENTRY,
-  "app-server",
-  "--stdio",
-  "--browser-use",
-  "headless",
-  "--browser-executable",
-  "/usr/bin/chromium",
-];
+/** The argument list the runtime received before the gateway existed, verbatim. */
+const DIRECT_ARGS = ["--web", "--host", "0.0.0.0", "--port", "3030", "--workspace", "/workspace", "--no-open", "--no-token"];
+/** The loopback form the gateway proxies to when it is in front of the runtime. */
+const LOOPBACK_ARGS = ["--web", "--host", "127.0.0.1", "--port", "3131", "--workspace", "/workspace", "--no-open", "--no-token"];
 
 test("the defaults match the image: /workspace, /data, loopback runtime, gateway on", () => {
   assert.deepEqual(parseEnv({}), {
     authEnabled: true,
     browserMcp: true,
     browserPanel: false,
+    nativeBrowser: false,
     browserDebugPort: 9222,
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
@@ -61,9 +52,7 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
   });
   assert.equal(DEFAULT_WORKSPACE, "/workspace");
   assert.equal(DEFAULT_DATA_DIR, "/data");
-  assert.equal(RUNTIME_SERVER_ENTRY, "/opt/zcodium/server/entry-http.js");
-  assert.equal(RUNTIME_AGENT_ENTRY, "/opt/zcodium/agent/zcode.cjs");
-  assert.equal(RUNTIME_WEB_ROOT, "/opt/zcodium/web");
+  assert.equal(RUNTIME_ENTRY, "/opt/zcodium/bin/zcode.mjs");
   assert.equal(PUBLISHED_HOST, "0.0.0.0");
   assert.equal(PUBLISHED_PORT, 3030);
   assert.equal(UPSTREAM_HOST, "127.0.0.1");
@@ -160,36 +149,25 @@ test("ZCLOUDIUM_BROWSER_PANEL is off by default and takes its port from the envi
 });
 
 test("with the gateway on, the runtime is bound to loopback only", () => {
-  assert.deepEqual(runtimeAddress({ authEnabled: true }), { host: "127.0.0.1", port: 3131 });
-  assert.equal(runtimeAddress({ authEnabled: true }).host, UPSTREAM_HOST);
-  assert.equal(runtimeAddress({ authEnabled: true }).port, UPSTREAM_PORT);
+  assert.deepEqual(runtimeArgs({ authEnabled: true, workspace: "/workspace" }), LOOPBACK_ARGS);
+  const args = runtimeArgs({ authEnabled: true, workspace: "/srv/work" });
+  assert.equal(args.includes(PUBLISHED_HOST), false, "the runtime must never bind the published interface");
+  assert.deepEqual(args.slice(0, 7), ["--web", "--host", "127.0.0.1", "--port", "3131", "--workspace", "/srv/work"]);
 });
 
-test("with ZCLOUDIUM_AUTH=off, the runtime is published directly", () => {
-  assert.deepEqual(runtimeAddress({ authEnabled: false }), { host: "0.0.0.0", port: 3030 });
-  assert.equal(runtimeAddress({ authEnabled: false }).host, PUBLISHED_HOST);
-  assert.equal(runtimeAddress({ authEnabled: false }).port, PUBLISHED_PORT);
-});
-
-/**
- * The browser in the interface comes from this argument and nothing else: the
- * agent is what the web server spawns, so the agent is where the switch goes.
- */
-test("the agent is started with the built-in browser backend on", () => {
-  assert.deepEqual(agentServerArgs(), AGENT_ARGS);
-  assert.equal(agentServerArgs({ browserExecutable: "/opt/chrome/chrome" })[6], "/opt/chrome/chrome");
-});
-
-test("the server environment carries the address, the interface and the agent", () => {
-  const env = serverEnv({ base: { KEEP: "me" }, host: "127.0.0.1", port: 3131, workspace: "/srv/work" });
-  assert.equal(env.KEEP, "me", "the rest of the environment must be left alone");
-  assert.equal(env.PORT, "3131");
-  assert.equal(env.ZCODE_SERVER_HOST, "127.0.0.1");
-  assert.equal(env.ZCODE_SERVER_WORKSPACE, "/srv/work");
-  assert.equal(env.ZCODE_WEB_STATIC_ROOT, RUNTIME_WEB_ROOT);
-  assert.equal(env.ZCODE_SERVER_AUTH_TOKEN, "", "the gateway is the only thing in front");
-  assert.equal(env.ZCODE_AGENT_SERVER_COMMAND, process.execPath);
-  assert.deepEqual(JSON.parse(env.ZCODE_AGENT_SERVER_ARGS_JSON), AGENT_ARGS);
+test("with ZCLOUDIUM_AUTH=off, the runtime runs exactly as it did before the gateway", () => {
+  assert.deepEqual(runtimeArgs({ authEnabled: false, workspace: "/workspace" }), DIRECT_ARGS);
+  assert.deepEqual(runtimeArgs({ authEnabled: false, workspace: "/srv/work" }), [
+    "--web",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "3030",
+    "--workspace",
+    "/srv/work",
+    "--no-open",
+    "--no-token",
+  ]);
 });
 
 test("the gateway options point at the loopback address the runtime was given", () => {
@@ -203,7 +181,9 @@ test("the gateway options point at the loopback address the runtime was given", 
     trustProxy: false,
   });
 
-  const { host, port } = runtimeAddress(config);
+  const args = runtimeArgs(config);
+  const host = args[args.indexOf("--host") + 1];
+  const port = args[args.indexOf("--port") + 1];
   assert.equal(gatewayOptions(config).upstreamUrl, `http://${host}:${port}`);
 
   const shorter = gatewayOptions(parseEnv({ ZCLOUDIUM_SESSION_TTL_HOURS: "3" }));
@@ -366,10 +346,7 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
 
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0].file, process.execPath);
-  assert.deepEqual(spawns[0].args, [RUNTIME_SERVER_ENTRY]);
-  assert.equal(spawns[0].options.env.PORT, String(UPSTREAM_PORT));
-  assert.equal(spawns[0].options.env.ZCODE_SERVER_HOST, UPSTREAM_HOST);
-  assert.deepEqual(JSON.parse(spawns[0].options.env.ZCODE_AGENT_SERVER_ARGS_JSON), AGENT_ARGS);
+  assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...LOOPBACK_ARGS]);
   assert.equal(spawns[0].options.stdio, "inherit");
   assert.deepEqual(
     gatewayCalls.map(({ logger, ...options }) => options),
@@ -415,9 +392,7 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
 test("with ZCLOUDIUM_AUTH=off the runtime runs directly and no gateway is started", async () => {
   const { result, child, spawns, signals, exits, gatewayCalls } = await runStart({ ZCLOUDIUM_AUTH: "off" });
 
-  assert.deepEqual(spawns[0].args, [RUNTIME_SERVER_ENTRY]);
-  assert.equal(spawns[0].options.env.PORT, String(PUBLISHED_PORT));
-  assert.equal(spawns[0].options.env.ZCODE_SERVER_HOST, PUBLISHED_HOST);
+  assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...DIRECT_ARGS]);
   assert.equal(gatewayCalls.length, 0, "the gateway must not start when auth is off");
   assert.equal(result.gateway, null);
   assert.deepEqual(signals.events().sort(), ["SIGINT", "SIGTERM"]);
@@ -500,7 +475,7 @@ test("extra command line arguments are reported and ignored", async () => {
 
   assert.deepEqual(
     spawns[0].args,
-    [RUNTIME_SERVER_ENTRY],
+    [RUNTIME_ENTRY, ...LOOPBACK_ARGS],
     "the runtime arguments must still come from the environment, not from the command line",
   );
   assert.equal(
