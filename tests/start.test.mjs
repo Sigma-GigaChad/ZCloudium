@@ -42,7 +42,6 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
     authEnabled: true,
     browserMcp: true,
     browserPanel: false,
-    nativeBrowser: false,
     browserDebugPort: 9222,
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,

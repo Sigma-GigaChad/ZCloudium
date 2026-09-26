@@ -16,7 +16,6 @@ import { constants, homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  BROWSER_EXECUTABLE,
   BROWSER_PREFIX,
   browserArgs,
   browserDebugUrl,
@@ -35,18 +34,6 @@ import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
-
-/**
- * The server entry, and the agent it spawns. `zcode --web` is a wrapper around
- * these two: it fills in the environment below and starts the server, which
- * starts the agent. Starting the server ourselves is what lets the agent carry
- * an argument the wrapper refuses, which is the only way to reach the built-in
- * browser backend from web mode.
- */
-export const RUNTIME_SERVER_ENTRY = "/opt/zcodium/server/entry-http.js";
-export const RUNTIME_AGENT_ENTRY = "/opt/zcodium/agent/zcode.cjs";
-/** The interface the server serves, and the one the wrapper points it at. */
-export const RUNTIME_WEB_ROOT = "/opt/zcodium/web";
 
 /** The published address: the only one the image exposes. */
 export const PUBLISHED_HOST = "0.0.0.0";
@@ -116,7 +103,6 @@ export function parseEnv(env = process.env) {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
     browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
     browserPanel: parseBrowserPanel(env.ZCLOUDIUM_BROWSER_PANEL),
-    nativeBrowser: parseBrowserPanel(env.ZCLOUDIUM_NATIVE_BROWSER),
     browserDebugPort: parseBrowserDebugPort(env.ZCLOUDIUM_BROWSER_DEBUG_PORT),
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
@@ -134,77 +120,18 @@ export function parseEnv(env = process.env) {
  * gateway off, these are exactly the arguments the image used before, so the
  * fallback is a known quantity.
  */
-/**
- * Where the runtime listens: loopback while the gateway is in front of it, the
- * published port when it is not. One place, so the wrapper arguments and the
- * server environment cannot disagree.
- */
-export function runtimeAddress({ authEnabled = true } = {}) {
-  return {
-    host: authEnabled ? UPSTREAM_HOST : PUBLISHED_HOST,
-    port: authEnabled ? UPSTREAM_PORT : PUBLISHED_PORT,
-  };
-}
-
 export function runtimeArgs({ authEnabled = true, workspace = DEFAULT_WORKSPACE } = {}) {
-  const { host, port } = runtimeAddress({ authEnabled });
   return [
     "--web",
     "--host",
-    host,
+    authEnabled ? UPSTREAM_HOST : PUBLISHED_HOST,
     "--port",
-    String(port),
+    String(authEnabled ? UPSTREAM_PORT : PUBLISHED_PORT),
     "--workspace",
     workspace,
     "--no-open",
     "--no-token",
   ];
-}
-
-/**
- * The agent arguments the web server spawns the agent with, browser backend
- * included.
- *
- * `--browser-use headless` is the switch that turns the built-in Browser Use on
- * for a machine with no display: the agent then drives a Chromium it manages
- * through the Playwright it carries, instead of the in-app browser the desktop
- * shows. The web mode of the CLI cannot pass it, its option parser is a closed
- * list, so the entrypoint starts the server itself and hands it these
- * arguments. That is the contract bin/zcode.mjs already fills in.
- */
-export function agentServerArgs({ browserExecutable = BROWSER_EXECUTABLE } = {}) {
-  return [
-    RUNTIME_AGENT_ENTRY,
-    "app-server",
-    "--stdio",
-    "--browser-use",
-    "headless",
-    "--browser-executable",
-    browserExecutable,
-  ];
-}
-
-/**
- * The environment the server entry reads: the same keys bin/zcode.mjs fills in,
- * with the agent arguments we choose rather than the ones it hardcodes.
- *
- * `PORT` and `ZCODE_SERVER_HOST` are its listening address; `ZCODE_WEB_STATIC_ROOT`
- * is the interface it serves; `ZCODE_AGENT_SERVER_COMMAND` and
- * `ZCODE_AGENT_SERVER_ARGS_JSON` are the agent it spawns per session. The token
- * stays empty: the gateway is the only thing in front and does its own
- * authentication.
- */
-export function serverEnv({ base = process.env, host, port, workspace, agentArgs = agentServerArgs() } = {}) {
-  return {
-    ...base,
-    PORT: String(port),
-    ZCODE_SERVER_HOST: host,
-    ZCODE_SERVER_WORKSPACE: workspace,
-    ZCODE_WEB_STATIC_ROOT: RUNTIME_WEB_ROOT,
-    ZCODE_SERVER_AUTH_TOKEN: "",
-    ZCODE_AGENT_SERVER_COMMAND: process.execPath,
-    ZCODE_AGENT_SERVER_ARGS_JSON: JSON.stringify(agentArgs),
-  };
 }
 
 /** Options for createGateway: published address, loopback upstream, data volume, session lifetime, rate limit key. */
@@ -424,22 +351,10 @@ export async function start({
     logger("[start] browser MCP disabled (ZCLOUDIUM_BROWSER_MCP=off)");
   }
 
-  const address = runtimeAddress(config);
-  const child = config.nativeBrowser
-    ? spawnRuntime(process.execPath, [RUNTIME_SERVER_ENTRY], {
-        stdio: "inherit",
-        env: serverEnv({ base: env, host: address.host, port: address.port, workspace: config.workspace }),
-      })
-    : spawnRuntime(process.execPath, [RUNTIME_ENTRY, ...args], {
-        stdio: "inherit",
-        env,
-      });
-  if (config.nativeBrowser) {
-    logger(
-      `[start] native browser backend: the server is started directly with the agent arguments ` +
-        `"${agentServerArgs().join(" ")}", so the built-in Browser Use is on (ZCLOUDIUM_NATIVE_BROWSER=on)`,
-    );
-  }
+  const child = spawnRuntime(process.execPath, [RUNTIME_ENTRY, ...args], {
+    stdio: "inherit",
+    env,
+  });
 
   const forward = (signal) => {
     logger(`[start] forwarding ${signal} to the runtime (pid ${child.pid})`);
