@@ -17,6 +17,7 @@ import {
   rewriteDiscovery,
 } from "./browser.mjs";
 import { panelPage } from "./panel.mjs";
+import { createViewportOwner } from "./viewport.mjs";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -115,6 +116,30 @@ async function readForm(req, limit) {
 }
 
 /**
+ * The body of the panel's viewport requests, as an object.
+ *
+ * It is read under the same limit as every other body, and anything that is not a
+ * JSON object is refused rather than coerced: the only caller is the panel, and a
+ * document that is not the one it sends is a caller that should not be here.
+ */
+async function readJson(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) {
+      throw new Error("request body too large");
+    }
+    chunks.push(chunk);
+  }
+  const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("the body must be a JSON object");
+  }
+  return parsed;
+}
+
+/**
  * Only a same origin absolute path is honoured, so `next` cannot be turned into
  * an open redirect.
  *
@@ -198,6 +223,15 @@ export async function createGateway({
   const target = new URL(upstreamUrl);
   const browserEnabled = typeof debugUrl === "string" && debugUrl.trim() !== "";
   const debug = browserEnabled ? new URL(debugUrl) : null;
+  /**
+   * The owner of the emulated viewport (issue #9).
+   *
+   * Created here, once, and only when there is a browser to pose it on. It holds
+   * a connection to the debug port for the life of the process, which is what
+   * makes the operator's resolution outlive the panel: an application that came
+   * and went cannot clear an override it does not own.
+   */
+  const viewport = browserEnabled ? createViewportOwner({ debugUrl, logger }) : null;
   const failures = new Map();
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
@@ -576,6 +610,86 @@ export async function createGateway({
   }
 
   /**
+   * The resolution the panel asks for (issue #9).
+   *
+   * This is where the fix for the viewport lifetime lives, seen from the panel's
+   * side: the operator's Apply button used to pose an override on the panel's own
+   * session, and Chromium 154 clears an override when the session that posed it
+   * detaches, which is what closing the panel did. The panel now asks the gateway,
+   * which poses it on a session that never detaches.
+   *
+   * Three modes, one per thing the panel does:
+   *
+   * - `apply` poses the numbers the operator typed, and re-sends them even when
+   *   they are the ones already in force, because an override can be replaced by
+   *   anything else talking to the same browser;
+   * - `attach` is sent when the panel opens on a target, and puts a size the
+   *   operator already chose back when it drifted. It is what makes reopening the
+   *   pane find the state intact;
+   * - `release` stops forcing a target the panel has moved away from, without
+   *   touching that page: it keeps whatever size it has.
+   *
+   * Same rules as the rest of the browser routes: behind the session, and only
+   * for this gateway's own frontend, so a page served by another service on the
+   * same machine cannot resize the browser the agent is working in.
+   */
+  async function serveViewport(req, res) {
+    if (!originAcceptable(req)) {
+      logger(
+        `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
+          `for the viewport endpoint`,
+      );
+      res.writeHead(403, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Forbidden");
+      return;
+    }
+    if (!viewport) {
+      // Unreachable through classifyRoute, which only answers "viewport" when the
+      // panel is on. Kept because it is the honest answer if that ever changes.
+      res.writeHead(503, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("The browser panel is off");
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { allow: "POST", "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Method not allowed");
+      return;
+    }
+
+    let answer;
+    try {
+      const body = await readJson(req, maxBodyBytes);
+      const targetId = typeof body.targetId === "string" && body.targetId !== "" ? body.targetId : null;
+      if (body.mode === "apply") {
+        answer = await viewport.apply({ targetId, width: body.width, height: body.height });
+      } else if (body.mode === "attach") {
+        answer = await viewport.attach({ targetId });
+      } else if (body.mode === "release") {
+        answer = viewport.release({ targetId });
+      } else {
+        res.writeHead(400, { "content-type": "text/plain", "cache-control": "no-store" });
+        res.end("Unknown mode");
+        return;
+      }
+    } catch (error) {
+      // 502: the gateway is fine, the browser it was asked to drive is not. The
+      // panel shows the message, which is the only diagnostic the operator gets.
+      logger(`[viewport] ${req.method} failed: ${error.message}`);
+      res.writeHead(502, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end(error.message);
+      return;
+    }
+
+    const payload = Buffer.from(JSON.stringify(answer ?? {}), "utf8");
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": payload.length,
+      "cache-control": "no-store",
+    });
+    res.end(payload);
+  }
+
+  /**
    * The debug port, behind the session (Phase 0 of issue #5).
    *
    * Two things have to change on the way through, and both are Chromium's own
@@ -683,9 +797,10 @@ export async function createGateway({
 
     const url = requestUrl(req);
     const route = classifyRoute(url.pathname, { browserEnabled });
-    if (route === "panel") {
-      // The panel is a page, not a socket: there is nothing at that path to
-      // upgrade to, and it must not fall through to the application either.
+    if (route === "panel" || route === "viewport") {
+      // Neither is a socket: the panel is a page, and the viewport endpoint is
+      // plain JSON. There is nothing at those paths to upgrade to, and they must
+      // not fall through to the application either.
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -805,6 +920,10 @@ export async function createGateway({
         servePanel(req, res, url);
         return;
       }
+      if (route === "viewport") {
+        await serveViewport(req, res);
+        return;
+      }
       if (route === "browser") {
         proxyBrowser(req, res, url);
         return;
@@ -870,6 +989,10 @@ export async function createGateway({
         connections.clear();
         server.closeAllConnections?.();
         server.close(() => resolve());
+        // The viewport owner holds a connection of its own: closing it detaches
+        // from the browser and leaves Chromium running, which is the runtime's
+        // browser, not the gateway's.
+        viewport?.close().catch((error) => logger(`[viewport] closing failed: ${error.message}`));
       }),
   };
 }

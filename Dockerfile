@@ -20,6 +20,11 @@
 #     and pinned in chromium.version: the browser is the one component whose
 #     version decides what the agent sees, so two builds of one commit have to
 #     agree on it.
+#   - the operator panel that watches that same browser, served by gateway/. It
+#     does not speak the browser's protocol itself: it asks the gateway for a
+#     resolution, and the gateway poses it on the runtime's own playwright-core,
+#     whose presence the build asserts below so a runtime that stops shipping it
+#     fails here rather than in a container (issue #9).
 #
 # Hardening (see SECURITY.md):
 #   - base image pinned by digest, not by a mutable tag
@@ -133,6 +138,11 @@ RUN set -euo pipefail; \
     rm -f /tmp/zcodium.tar.gz; \
     test -f /opt/zcodium/bin/zcode.mjs; \
     test -f /opt/zcodium/server/entry-http.js; \
+    if [ ! -d /opt/zcodium/agent/node_modules/playwright-core ]; then \
+      echo "The runtime no longer ships playwright-core, which the browser panel uses to own the viewport (issue #9)." >&2; \
+      echo "Either install it explicitly in this image, or point gateway/lib/viewport.mjs at where it went." >&2; \
+      exit 1; \
+    fi; \
     setuid="$(find /opt/zcodium -xdev \( -perm -4000 -o -perm -2000 \) -print)"; \
     if [ -n "$setuid" ]; then \
       echo "Third party runtime: unexpected setuid/setgid binaries, refusing to build." >&2; \

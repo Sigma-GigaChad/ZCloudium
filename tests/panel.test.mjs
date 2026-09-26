@@ -207,6 +207,7 @@ function panelRuntime() {
   const blocks = [...panelPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
   const sent = [];
   const sockets = [];
+  const requests = [];
   const handlers = new Map();
   const elements = new Map();
 
@@ -277,7 +278,21 @@ function panelRuntime() {
     location,
     window: { addEventListener: () => {}, location },
     document: { getElementById: elementFor, createElement: (tag) => element(`created:${tag}`), body: element("body") },
-    fetch: async () => ({ ok: true, json: async () => [{ id: "AB", type: "page", url: "about:blank", title: "Fixture" }] }),
+    fetch: async (url, options) => {
+      // Two endpoints are asked from the page: the target list, which the debug
+      // port answers through the gateway's proxy, and the viewport, which the
+      // gateway answers itself (issue #9). Both are recorded, so a test can assert
+      // what the wiring asked for rather than only what it drew.
+      const body = options?.body ? JSON.parse(options.body) : null;
+      requests.push({ url, body });
+      if (url === `${PANEL_PREFIX}viewport`) {
+        if (body?.mode === "apply") {
+          return { ok: true, json: async () => ({ width: body.width, height: body.height, reported: `${body.width}x${body.height}` }) };
+        }
+        return { ok: true, json: async () => ({ restored: false }) };
+      }
+      return { ok: true, json: async () => [{ id: "AB", type: "page", url: "about:blank", title: "Fixture" }] };
+    },
     WebSocket: FakeSocket,
     Image: FakeImage,
     ResizeObserver: class {
@@ -303,6 +318,9 @@ function panelRuntime() {
 
   return {
     sent,
+    requests,
+    /** What the page asked the gateway, which is where the viewport lives now. */
+    lastRequest: (path) => [...requests].reverse().find((entry) => entry.url === path)?.body ?? null,
     lastSent,
     /** The params of the last command of that name, which is what goes on the wire. */
     lastParams: (method) => lastSent(method)?.params ?? null,
@@ -361,14 +379,22 @@ test("a click right after a viewport change is mapped into the size the page has
     { x: 250, y: 200 },
     "a frame newer than the override must win, and it is the measured size that is used",
   );
-  // And the override really was applied: this is not a mapping over a size that
-  // never reached the page.
-  assert.deepEqual(panel.lastParams("Emulation.setDeviceMetricsOverride"), {
+  // And the override really was asked for: this is not a mapping over a size that
+  // never reached the page. It is asked to the gateway, not sent over the panel's
+  // own control channel, because Chromium 154 clears an override when the session
+  // that posed it detaches, and the panel detaches every time it is closed
+  // (issue #9).
+  assert.deepEqual(panel.lastRequest("/_browser/viewport"), {
+    mode: "apply",
+    targetId: "AB",
     width: 1280,
     height: 960,
-    deviceScaleFactor: 1,
-    mobile: false,
   });
+  assert.equal(
+    panel.lastSent("Emulation.setDeviceMetricsOverride"),
+    undefined,
+    "the page must not pose the override on its own session any more",
+  );
 });
 
 test("the panel asks for the picture bounds on attach, not the values the fields hold", async () => {
@@ -558,7 +584,18 @@ test("the served page is one file, with no external asset and no framework", () 
   assert.match(html, /^<!doctype html>/);
   assert.match(html, /<canvas/);
   assert.match(html, /Page\.startScreencast/);
-  assert.match(html, /Emulation\.setDeviceMetricsOverride/);
+  // The viewport is asked to the gateway, which owns the override now (issue #9):
+  // the page builds that endpoint from the prefix it already knows, and it no
+  // longer carries the emulation call itself.
+  assert.match(html, /PANEL_PREFIX \+ "viewport"/);
+  // What matters is the code path, not the prose: the page must send no
+  // emulation call at all, because the gateway poses it on a session that never
+  // detaches, while the panel detaches every time it is closed (issue #9).
+  assert.equal(
+    /send\(["']Emulation/.test(html),
+    false,
+    "the page must not pose an override on its own control channel any more",
+  );
   assert.match(html, /Input\.dispatchMouseEvent/);
   assert.match(html, /Input\.dispatchKeyEvent/);
   assert.match(html, /inspector\.html/);
@@ -610,7 +647,7 @@ test("the helpers the page runs are the helpers these tests cover", () => {
   // so a constant has to be read by evaluating it, exactly as the browser would.
   const inPage = (expression) => vm.runInContext(expression, page);
 
-  const panelModule = { clampViewport, deviceMetricsParams, screencastParams, viewportFromFrameMetadata, canvasToViewport, buttonName, mouseParams, keyCommands, keyUpCommands, socketUrlFor, devtoolsUrlFor, panelTargets };
+  const panelModule = { clampViewport, screencastParams, viewportFromFrameMetadata, canvasToViewport, buttonName, mouseParams, keyCommands, keyUpCommands, socketUrlFor, devtoolsUrlFor, panelTargets };
   // Cross realm objects have another prototype, so the comparison is on the
   // serialized answer, which is also what goes on the wire.
   const same = (name, args) => {
@@ -625,7 +662,6 @@ test("the helpers the page runs are the helpers these tests cover", () => {
 
   same("clampViewport", [{ width: 5000, height: "abc" }]);
   same("clampViewport", [{ width: 800, height: 600 }]);
-  same("deviceMetricsParams", [{ width: 800, height: 600 }]);
   same("screencastParams", [{ width: 3840, height: 2160 }]);
   // With no size at all the page asks for the picture bounds themselves, which is
   // what the wiring does at attach: the default has to travel into the page too.

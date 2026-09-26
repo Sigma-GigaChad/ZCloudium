@@ -36,6 +36,15 @@ export const BROWSER_DEBUG_PORT = 9222;
 /** The gateway path the debug port is published under, behind the session. */
 export const BROWSER_PREFIX = "/_browser";
 
+/**
+ * Where the panel asks the gateway to pose a viewport (issue #9).
+ *
+ * It sits under the browser prefix, next to the panel, and it is the gateway's
+ * own path rather than the debug port's: the resolution is posed by the gateway's
+ * long lived session, which is what makes it survive the panel closing.
+ */
+export const VIEWPORT_PATH = `${BROWSER_PREFIX}/viewport`;
+
 /** The profile directory, created under the data volume so it survives a restart. */
 export const BROWSER_PROFILE_NAME = "browser-profile";
 
@@ -287,6 +296,9 @@ export function classifyRoute(pathname, { browserEnabled = false } = {}) {
   }
   if (pathname === BROWSER_PREFIX || pathname === PANEL_PREFIX) {
     return "panel";
+  }
+  if (pathname === VIEWPORT_PATH) {
+    return "viewport";
   }
   if (pathname.startsWith(`${BROWSER_PREFIX}/`)) {
     return "browser";

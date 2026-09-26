@@ -319,10 +319,36 @@ session as everything else, and the WebSocket it opens is refused without one.
 | Part | What it is |
 | --- | --- |
 | live view | `Page.startScreencast` frames painted into a canvas, scaled to fit the window |
-| viewport | a width and a height field, `320x320` up to `3840x2160`, plus a fit-to-window option, applied with `Emulation.setDeviceMetricsOverride` |
+| viewport | a width and a height field, `320x320` up to `3840x2160`, plus a fit-to-window option. The panel asks the gateway for it, and the gateway poses it with `Emulation.setDeviceMetricsOverride` on the page |
 | interaction | mouse move, press, release, wheel and drag, and the keyboard, through the CDP input events. Click the picture once to give it the keyboard |
 | indicator | the page is shared with the agent, and the strip shows the address the page is at right now |
 | DevTools | a button that opens Chromium's own DevTools frontend through the gateway, on the same page: Elements, Network, Console, Sources, Performance |
+
+### Who owns the resolution, and why it matters
+
+Chromium changed this in 154: an emulation override now belongs to the session
+that posed it, and is cleared when that session detaches. Until 153 it outlived
+it. A panel that posed its own override therefore lost your resolution every time
+you closed the tab, which is the one case the panel exists for: acting with the
+viewer closed, then reopening and finding the state intact. Measured on the
+pinned browser, both halves of the rule: a session that only attaches and detaches
+leaves another session's override alone, and a session that poses replaces it for
+the whole page, so its own detach leaves the page at the window size.
+
+So the gateway owns the override, not the panel: it opens one connection to the
+debug port on the first request and keeps it, poses the viewport on a session it
+never detaches, and re-sends the call even when the numbers did not change,
+because a second press of Apply has to work. The panel posts small JSON documents
+to `/_browser/viewport`, behind the session and the same origin rule as the rest
+of the browser routes, and it never poses anything itself. Opening the panel asks
+for an `attach`: a page nobody resized is left exactly as it was, and a page whose
+resolution you chose is put back if something else cleared it in the meantime.
+Moving the target selector to another page sends a `release`, which stops forcing
+a size on the page you left without touching it.
+
+That connection is what the runtime's own `playwright-core` is for: the image
+asserts its presence at build time, from the runtime it already pins, rather than
+installing a second copy of it.
 
 The panel needs the browser MCP server, which is on by default: with
 `ZCLOUDIUM_BROWSER_MCP=off` no browser is started and the logs say so, because a
@@ -762,6 +788,16 @@ carries today.
   made while nobody was watching. Opening the panel disturbed nothing, and a
   navigation made by the agent while the panel was open appeared in it (the
   address line and the picture followed)
+- **the viewport survives the panel closing**, on the pinned Chromium
+  (`154.0.8037.57`). The rule was measured first, on a live container: a session
+  that attaches and detaches without posing anything leaves another session's
+  override alone (`1024x768` before and after), while a session that poses its own
+  override replaces it for the whole page and its detach leaves the page at the
+  window size (`780x493`). That second half is the bug: the panel used to pose its
+  own override, so closing it threw the operator's resolution away. With the
+  gateway posing it on a session it never detaches, the end to end continuity spec
+  passes on that same browser: the page still reports `800x600` after the panel is
+  closed and reopened, which it did not before
 - **browser panel, offline and unauthenticated**: without a session, `/_browser/`,
   `/_browser/json/list` and `/_browser/devtools/inspector.html` answer `302` to the
   sign in page and the WebSocket upgrade answers `401` before any upgrade; a

@@ -420,11 +420,15 @@ export function panelTargets(list) {
  * to travel with them. A helper that is only reachable from the module would be
  * undefined in the page, and the sandbox test at the end of tests/panel.test.mjs
  * is what catches that.
+ *
+ * `deviceMetricsParams` is deliberately absent (issue #9): the gesture that poses
+ * a viewport left this page when the gateway took ownership of it, and the page
+ * has no business describing an emulation override it no longer sends. The
+ * function itself stays, because the gateway sends it on the page's behalf.
  */
 const PAGE_HELPERS = [
   positiveInteger,
   clampViewport,
-  deviceMetricsParams,
   screencastParams,
   viewportFromFrameMetadata,
   canvasToViewport,
@@ -715,7 +719,40 @@ function closeSocket() {
   }
 }
 
+/**
+ * How the panel asks for a resolution (issue #9).
+ *
+ * What it replaces: the Apply button used to send Emulation.setDeviceMetricsOverride
+ * on the panel's own control channel. Chromium 154 clears an override when the
+ * session that posed it detaches, and closing the panel detaches exactly that
+ * session, so the operator's viewport died with the tab: the size was gone the
+ * moment the pane was reopened, which is the case the pane exists for. The
+ * gateway now poses it on a session that lives as long as the container, and this
+ * is the request that asks it to. It answers with the numbers it applied, which
+ * are the ones the fields then show.
+ */
+function askViewport(mode, extra) {
+  return fetch(PANEL_PREFIX + "viewport", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(Object.assign({ mode: mode, targetId: state.targetId }, extra || {})),
+  }).then(function (response) {
+    if (!response.ok) {
+      return response.text().then(function (text) {
+        throw new Error(text || "the viewport request failed with " + response.status);
+      });
+    }
+    return response.json();
+  });
+}
+
 function connect(targetId) {
+  const previous = state.targetId;
+  if (previous && previous !== targetId) {
+    // The page the panel moves away from keeps the size it has, but nothing
+    // forces it any more: coming back to it later starts from what it reports.
+    askViewport("release").catch(function () {});
+  }
   closeSocket();
   state.targetId = targetId;
   state.frameViewport = null;
@@ -753,10 +790,22 @@ function connect(targetId) {
     send("Page.startScreencast", screencastParams()).catch(function (error) {
       setStatus(error.message, "error");
     });
-    // The panel adopts the size the page is already at instead of imposing its
-    // own numbers, so opening it changes nothing: the agent's viewport, or the
-    // one left by a previous panel, is what the fields show.
-    refreshReported(true);
+    // A size the operator already chose for this target is put back if something
+    // else cleared it while nobody was watching, and the fields are filled from
+    // what the page reports afterwards, so a page nobody resized is left exactly
+    // as it was: opening the panel changes nothing until Apply is pressed.
+    askViewport("attach")
+      .then(function (answer) {
+        if (answer && answer.restored) {
+          setStatus("viewport " + answer.width + "x" + answer.height + " restored", "connected");
+        }
+      })
+      .catch(function (error) {
+        setStatus(error.message, "error");
+      })
+      .then(function () {
+        refreshReported(true);
+      });
   };
   socket.onmessage = onMessage;
   socket.onerror = function () {
@@ -825,18 +874,26 @@ function applyViewport(width, height) {
   widthEl.value = viewport.width;
   heightEl.value = viewport.height;
   setStatus("applying " + viewport.width + "x" + viewport.height);
-  return send("Emulation.setDeviceMetricsOverride", deviceMetricsParams(viewport))
-    .then(function () {
+  return askViewport("apply", { width: viewport.width, height: viewport.height })
+    .then(function (answer) {
+      // The numbers the gateway applied, not the ones that were asked for: it
+      // clamps on the same bounds, and those are the ones the page is at now.
+      const applied = clampViewport({ width: answer.width, height: answer.height });
+      widthEl.value = applied.width;
+      heightEl.value = applied.height;
       // The page is at the new size the moment the override lands, while the
       // picture is still the previous frame for a few milliseconds. The stamp is
       // what tells the input mapping which of the two is the newer information,
       // so a click made in that window is aimed at the layout the page has; the
       // next frame replaces this with the same numbers, measured rather than
       // assumed.
-      state.appliedViewport = viewport;
+      state.appliedViewport = applied;
       state.stamp += 1;
       state.appliedStamp = state.stamp;
-      setStatus("viewport " + viewport.width + "x" + viewport.height, "connected");
+      setStatus("viewport " + applied.width + "x" + applied.height, "connected");
+      if (typeof answer.reported === "string") {
+        reportedEl.textContent = "page reports " + answer.reported;
+      }
       return refreshReported(false);
     })
     .catch(function (error) {
