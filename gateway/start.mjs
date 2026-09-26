@@ -33,15 +33,12 @@ import { applyBrowserMcp, browserServerEntry } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
 
-/** Where the runtime tarball is extracted in the image. */
-export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
-
 /**
  * The server entry, and the agent it spawns. `zcode --web` is a wrapper around
  * these two: it fills in the environment below and starts the server, which
  * starts the agent. Starting the server ourselves is what lets the agent carry
- * an argument the wrapper refuses, which is the only way to reach the built-in
- * browser backend from web mode.
+ * an argument the wrapper refuses, and that argument is the whole point: the
+ * built-in Browser Use is what puts a browser in the interface.
  */
 export const RUNTIME_SERVER_ENTRY = "/opt/zcodium/server/entry-http.js";
 export const RUNTIME_AGENT_ENTRY = "/opt/zcodium/agent/zcode.cjs";
@@ -116,7 +113,6 @@ export function parseEnv(env = process.env) {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
     browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
     browserPanel: parseBrowserPanel(env.ZCLOUDIUM_BROWSER_PANEL),
-    nativeBrowser: parseBrowserPanel(env.ZCLOUDIUM_NATIVE_BROWSER),
     browserDebugPort: parseBrowserDebugPort(env.ZCLOUDIUM_BROWSER_DEBUG_PORT),
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
@@ -136,29 +132,14 @@ export function parseEnv(env = process.env) {
  */
 /**
  * Where the runtime listens: loopback while the gateway is in front of it, the
- * published port when it is not. One place, so the wrapper arguments and the
- * server environment cannot disagree.
+ * published port when it is not. One place, so the server environment and the
+ * gateway cannot disagree.
  */
 export function runtimeAddress({ authEnabled = true } = {}) {
   return {
     host: authEnabled ? UPSTREAM_HOST : PUBLISHED_HOST,
     port: authEnabled ? UPSTREAM_PORT : PUBLISHED_PORT,
   };
-}
-
-export function runtimeArgs({ authEnabled = true, workspace = DEFAULT_WORKSPACE } = {}) {
-  const { host, port } = runtimeAddress({ authEnabled });
-  return [
-    "--web",
-    "--host",
-    host,
-    "--port",
-    String(port),
-    "--workspace",
-    workspace,
-    "--no-open",
-    "--no-token",
-  ];
 }
 
 /**
@@ -270,7 +251,6 @@ export async function start({
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
-  const args = runtimeArgs(config);
 
   // The addresses, the workspace and the data directory come from the
   // environment. A leftover command line is appended to this script and does
@@ -424,22 +404,18 @@ export async function start({
     logger("[start] browser MCP disabled (ZCLOUDIUM_BROWSER_MCP=off)");
   }
 
+  // The runtime is started as the server, with the agent arguments we choose.
+  // That is the only way the built-in Browser Use is on: the agent gets the
+  // switch, and the switch is what puts a browser in the interface.
   const address = runtimeAddress(config);
-  const child = config.nativeBrowser
-    ? spawnRuntime(process.execPath, [RUNTIME_SERVER_ENTRY], {
-        stdio: "inherit",
-        env: serverEnv({ base: env, host: address.host, port: address.port, workspace: config.workspace }),
-      })
-    : spawnRuntime(process.execPath, [RUNTIME_ENTRY, ...args], {
-        stdio: "inherit",
-        env,
-      });
-  if (config.nativeBrowser) {
-    logger(
-      `[start] native browser backend: the server is started directly with the agent arguments ` +
-        `"${agentServerArgs().join(" ")}", so the built-in Browser Use is on (ZCLOUDIUM_NATIVE_BROWSER=on)`,
-    );
-  }
+  logger(
+    `[start] runtime on ${address.host}:${address.port}, agent "${agentServerArgs().join(" ")}": ` +
+      "the built-in Browser Use is on",
+  );
+  const child = spawnRuntime(process.execPath, [RUNTIME_SERVER_ENTRY], {
+    stdio: "inherit",
+    env: serverEnv({ base: env, host: address.host, port: address.port, workspace: config.workspace }),
+  });
 
   const forward = (signal) => {
     logger(`[start] forwarding ${signal} to the runtime (pid ${child.pid})`);
@@ -514,7 +490,7 @@ export async function start({
     );
   }
 
-  return { child, gateway, config, args };
+  return { child, gateway, config };
 }
 
 async function main() {
