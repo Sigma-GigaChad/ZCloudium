@@ -313,10 +313,10 @@ closed or the container restarts. What its holder keeps is everything a valid
 session has, and it is more than the visible page: the socket carries the browser
 level CDP session, so the cookies and the logged in pages of the browser the agent
 drives are reachable through it. This is the same property as the application's own
-WebSocket, which is authorised once and then left alone, and it is tracked as a
-follow-up rather than fixed here: closing an established connection when its session
-ends belongs to the gateway and would change the behaviour of the application's own
-socket too.
+WebSocket, which is authorised once and then left alone, and it is tracked as
+follow-up issue #8 rather than fixed here: closing an established connection when
+its session ends belongs to the gateway and would change the behaviour of the
+application's own socket too.
 
 **What the panel does not change.** It does not patch the application, does not
 add a dependency, and does not widen the container's reach: it uses the same
