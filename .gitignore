@@ -9,3 +9,6 @@ compose.*.local.yml
 # Miscellaneous
 *.log
 .DS_Store
+
+# Scratch space: run artifacts, screenshots and probe scripts, never part of a delivery
+.zcode/tmp/
