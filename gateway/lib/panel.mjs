@@ -45,8 +45,32 @@ export const VIEWPORT_MIN = 320;
 export const VIEWPORT_MAX_WIDTH = 3840;
 export const VIEWPORT_MAX_HEIGHT = 2160;
 
-/** What the fields start at, which is the container browser's order of magnitude. */
-export const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
+/**
+ * What the fields start at, and what the browser is taken to be until an operator
+ * says otherwise.
+ *
+ * 1366x768 is the laptop layout the desktop build offers by default, and it is
+ * what the panel adopts only when the page has no size of its own yet: opening the
+ * panel still takes whatever the page reports, so this is the fallback rather than
+ * an imposition.
+ */
+export const DEFAULT_VIEWPORT = { width: 1366, height: 768 };
+
+/**
+ * The sizes the preset selector offers, in the order it shows them.
+ *
+ * They stop at 1920x1080 on purpose: that is the picture cap below, so a larger
+ * layout would stream a scaled picture, and the panel would be promising a
+ * fidelity it cannot show. Choosing one fills the fields and applies them in the
+ * same gesture, the way the desktop control does; the fields stay editable for
+ * anything else.
+ */
+export const VIEWPORT_PRESETS = [
+  { width: 1280, height: 720, label: "1280x720 (720p)" },
+  { width: 1366, height: 768, label: "1366x768 (laptop)" },
+  { width: 1600, height: 900, label: "1600x900" },
+  { width: 1920, height: 1080, label: "1920x1080 (1080p)" },
+];
 
 /**
  * The picture bounds, independent of the layout size. Chromium scales the frame
@@ -451,6 +475,7 @@ function pageConstants() {
     `const VIEWPORT_MAX_WIDTH = ${VIEWPORT_MAX_WIDTH};`,
     `const VIEWPORT_MAX_HEIGHT = ${VIEWPORT_MAX_HEIGHT};`,
     `const DEFAULT_VIEWPORT = ${JSON.stringify(DEFAULT_VIEWPORT)};`,
+    `const VIEWPORT_PRESETS = ${JSON.stringify(VIEWPORT_PRESETS)};`,
     `const SCREENCAST_MAX_WIDTH = ${SCREENCAST_MAX_WIDTH};`,
     `const SCREENCAST_MAX_HEIGHT = ${SCREENCAST_MAX_HEIGHT};`,
     `const SCREENCAST_QUALITY = ${SCREENCAST_QUALITY};`,
@@ -584,6 +609,7 @@ const refreshEl = document.getElementById("refresh");
 const devtoolsEl = document.getElementById("devtools");
 const widthEl = document.getElementById("width");
 const heightEl = document.getElementById("height");
+const presetsEl = document.getElementById("presets");
 const fitEl = document.getElementById("fit");
 const applyEl = document.getElementById("apply");
 const reportedEl = document.getElementById("reported");
@@ -864,9 +890,25 @@ function refreshReported(adopt) {
         const parts = size.split("x");
         widthEl.value = parts[0];
         heightEl.value = parts[1];
+        syncPresets(parts[0], parts[1]);
       }
     })
     .catch(function () {});
+}
+
+/**
+ * Points the selector at the size in force.
+ *
+ * A size that is none of the presets is shown as custom rather than leaving the
+ * previous preset selected: the selector describes the page, and a page that was
+ * sized by hand, by the agent, or by an earlier panel is not one of these.
+ */
+function syncPresets(width, height) {
+  const wanted = width + "x" + height;
+  const known = VIEWPORT_PRESETS.filter(function (preset) {
+    return preset.width + "x" + preset.height === wanted;
+  })[0];
+  presetsEl.value = known ? wanted : "custom";
 }
 
 function applyViewport(width, height) {
@@ -881,6 +923,7 @@ function applyViewport(width, height) {
       const applied = clampViewport({ width: answer.width, height: answer.height });
       widthEl.value = applied.width;
       heightEl.value = applied.height;
+      syncPresets(applied.width, applied.height);
       // The page is at the new size the moment the override lands, while the
       // picture is still the previous frame for a few milliseconds. The stamp is
       // what tells the input mapping which of the two is the newer information,
@@ -1031,6 +1074,16 @@ refreshEl.addEventListener("click", function () {
 targetEl.addEventListener("change", function () {
   connect(targetEl.value);
 });
+presetsEl.addEventListener("change", function () {
+  const parts = String(presetsEl.value).split("x");
+  if (parts.length !== 2) {
+    return;
+  }
+  // One gesture, like the desktop control: choosing a preset is applying it. The
+  // fields follow the answer, so a clamped size is shown as the page has it.
+  state.dirty = false;
+  applyViewport(parts[0], parts[1]);
+});
 applyEl.addEventListener("click", function () {
   state.dirty = false;
   applyViewport(widthEl.value, heightEl.value);
@@ -1111,6 +1164,14 @@ export function panelPage() {
 <select id="target"></select>
 <button id="refresh" type="button">Refresh targets</button>
 <span class="sep"></span>
+<label for="presets">preset</label>
+<select id="presets">
+${VIEWPORT_PRESETS.map(
+  (preset) =>
+    `<option value="${preset.width}x${preset.height}"${preset.width === DEFAULT_VIEWPORT.width && preset.height === DEFAULT_VIEWPORT.height ? " selected" : ""}>${preset.label}</option>`,
+).join("\n")}
+<option value="custom">custom</option>
+</select>
 <label for="width">width</label>
 <input id="width" type="number" min="${VIEWPORT_MIN}" max="${VIEWPORT_MAX_WIDTH}" step="1" value="${DEFAULT_VIEWPORT.width}" inputmode="numeric">
 <label for="height">height</label>

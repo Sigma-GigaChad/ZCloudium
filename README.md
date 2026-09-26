@@ -319,7 +319,7 @@ session as everything else, and the WebSocket it opens is refused without one.
 | Part | What it is |
 | --- | --- |
 | live view | `Page.startScreencast` frames painted into a canvas, scaled to fit the window |
-| viewport | a width and a height field, `320x320` up to `3840x2160`, plus a fit-to-window option. The panel asks the gateway for it, and the gateway poses it with `Emulation.setDeviceMetricsOverride` on the page |
+| viewport | a preset selector (`1280x720`, `1366x768`, `1600x900`, `1920x1080`) that applies in one gesture, plus a width and a height field for anything else, `320x320` up to `3840x2160`, and a fit-to-window option. The panel asks the gateway for it, and the gateway poses it with `Emulation.setDeviceMetricsOverride` on the page. `1366x768` is what the fields start at, and what the panel adopts only when the page has no size of its own yet |
 | interaction | mouse move, press, release, wheel and drag, and the keyboard, through the CDP input events. Click the picture once to give it the keyboard |
 | indicator | the page is shared with the agent, and the strip shows the address the page is at right now |
 | DevTools | a button that opens Chromium's own DevTools frontend through the gateway, on the same page: Elements, Network, Console, Sources, Performance |

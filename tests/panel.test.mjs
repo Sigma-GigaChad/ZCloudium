@@ -29,6 +29,7 @@ import {
   VIEWPORT_MAX_HEIGHT,
   VIEWPORT_MAX_WIDTH,
   VIEWPORT_MIN,
+  VIEWPORT_PRESETS,
   buttonName,
   canvasToViewport,
   clampViewport,
@@ -49,11 +50,31 @@ test("the viewport bounds are the ones the issue advertises", () => {
   assert.equal(VIEWPORT_MIN, 320);
   assert.equal(VIEWPORT_MAX_WIDTH, 3840);
   assert.equal(VIEWPORT_MAX_HEIGHT, 2160);
-  assert.deepEqual(DEFAULT_VIEWPORT, { width: 1280, height: 800 });
+  // 1366x768 is the laptop layout the desktop build offers by default, and it is
+  // the value the fields fall back to when the page has no size of its own.
+  assert.deepEqual(DEFAULT_VIEWPORT, { width: 1366, height: 768 });
   // The picture is capped independently of the layout size, so a huge viewport
   // still streams a bounded frame.
   assert.ok(SCREENCAST_MAX_WIDTH <= VIEWPORT_MAX_WIDTH);
   assert.ok(SCREENCAST_MAX_HEIGHT <= VIEWPORT_MAX_HEIGHT);
+});
+
+test("the presets are inside the bounds, unique, and named for what they are", () => {
+  assert.ok(VIEWPORT_PRESETS.length >= 3, "a preset list of one size would be a field with extra steps");
+  const seen = new Set();
+  for (const preset of VIEWPORT_PRESETS) {
+    const key = `${preset.width}x${preset.height}`;
+    assert.equal(seen.has(key), false, `${key} is offered twice`);
+    seen.add(key);
+    assert.ok(preset.width >= VIEWPORT_MIN && preset.width <= VIEWPORT_MAX_WIDTH, key);
+    assert.ok(preset.height >= VIEWPORT_MIN && preset.height <= VIEWPORT_MAX_HEIGHT, key);
+    assert.match(preset.label, /\d+x\d+/, `${key} must name its size`);
+    // The picture is capped, so a preset beyond the cap would only ever be shown
+    // scaled down: the list stops where the stream stops being faithful.
+    assert.ok(preset.width <= SCREENCAST_MAX_WIDTH && preset.height <= SCREENCAST_MAX_HEIGHT, `${key} is beyond the picture cap`);
+  }
+  // The default is one of them, so the selector can describe the starting state.
+  assert.equal(seen.has(`${DEFAULT_VIEWPORT.width}x${DEFAULT_VIEWPORT.height}`), true);
 });
 
 test("the viewport is clamped into the bounds, per axis, from what the fields hold", () => {
@@ -686,6 +707,9 @@ test("the helpers the page runs are the helpers these tests cover", () => {
   assert.equal(inPage("VIEWPORT_MAX_WIDTH"), VIEWPORT_MAX_WIDTH);
   assert.equal(inPage("VIEWPORT_MAX_HEIGHT"), VIEWPORT_MAX_HEIGHT);
   assert.equal(JSON.stringify(inPage("DEFAULT_VIEWPORT")), JSON.stringify(DEFAULT_VIEWPORT));
+  // The selector is built by the page from this list, so the list has to travel
+  // into the page as data rather than be duplicated in the wiring.
+  assert.equal(JSON.stringify(inPage("VIEWPORT_PRESETS")), JSON.stringify(VIEWPORT_PRESETS));
   assert.equal(inPage("SCREENCAST_MAX_WIDTH"), SCREENCAST_MAX_WIDTH);
   assert.equal(inPage("SCREENCAST_MAX_HEIGHT"), SCREENCAST_MAX_HEIGHT);
   assert.equal(inPage("SCREENCAST_QUALITY"), SCREENCAST_QUALITY);
