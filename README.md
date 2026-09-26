@@ -97,10 +97,10 @@ volume: that is verified before every release, not assumed.
 `latest` follows the latest release. To freeze it:
 
 ```yaml
-image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
+image: ghcr.io/sigma-gigachad/z-cloudium:3.14.4
 ```
 
-The available tags are `latest`, `<version>` (for example `3.14.3`) and
+The available tags are `latest`, `<version>` (for example `3.14.4`) and
 `sha-<commit>`.
 
 ### The image is public
@@ -226,18 +226,23 @@ it.
 
 ## Browser automation for the agent
 
-ZCode has a built-in Browser Use, but in web mode it cannot start: its headless
-backend is only instantiated by the one-shot `--prompt` path and by the TUI, and
-`--browser-use=headless` is rejected in every other mode. Patching the
-application is out of scope here, so the capability is provided through MCP
-instead, which is **additive**: nothing of the application is modified.
+ZCode ships a built-in Browser Use, and the runtime carries everything it needs:
+the backend, the Playwright that drives it, and the official `browser-use`
+plugin among the plugins the runtime enables by default. What web mode does not
+offer is a way to turn it on: `zcode --web` parses a fixed option list and
+rejects `--browser-use`, while the agent it spawns is the process that would
+accept it.
+
+Until that path has been proven in a container with no display, the capability
+is provided through MCP, which is **additive**: nothing of the application is
+modified.
 
 The image ships:
 
 | Component | Version | Why |
 | --- | --- | --- |
 | `chrome-devtools-mcp` | `1.10.1` | maintained browser MCP server (Google), driven over stdio |
-| `chromium` | Debian bookworm package, `153.0.8010.52` | the browser it drives, through `--executablePath /usr/bin/chromium` |
+| `chromium` | pinned in `chromium.version`, `154.0.8037.57-1~deb12u1` | the browser it drives, through `--executablePath /usr/bin/chromium` |
 
 Both are installed **at build time**: no package manager is needed at runtime,
 and two containers started from the same image run the same browser server.
@@ -359,8 +364,9 @@ does not do.
 The picture is capped independently of the layout size, at `1920x1080`, and the
 panel asks for that cap on attach, before it knows the page's own size. Chromium
 scales a larger page down to fit those bounds, keeps the page's aspect ratio, and
-never scales a smaller one up. Measured on the browser of the image
-(`153.0.8010.52`): a `1920x1080` page streams `1920x1080`, a `3840x2160` page
+never scales a smaller one up. Measured on Chromium `153.0.8010.52`, the browser
+the image carried when this panel was written (`chromium.version` pins
+`154.0.8037.57` today): a `1920x1080` page streams `1920x1080`, a `3840x2160` page
 streams `1920x1080`, and a `640x480` page streams `640x480`. A cap asked for later
 is not possible: Chromium answers a second `Page.startScreencast` while one is
 running with `Screencast is already active`.
@@ -545,12 +551,30 @@ instance, one account. See [SECURITY.md](SECURITY.md) for the full reasoning.
 
 ## The versioning model
 
-Two files, one single truth:
+Three files, one single truth, and no value repeated in the build:
 
 | File | Content |
 | --- | --- |
-| `zcode.version` | the pinned upstream release tag (for example `v3.14.3`) |
+| `zcode.version` | the pinned upstream release tag (for example `v3.14.4`) |
 | `zcode.sha256` | the sha256 of that release tarball |
+| `chromium.version` | the pinned browser: both Debian package versions, and the upstream string |
+
+Every build path reads these three files and passes them as build arguments:
+`./build.sh`, `build.yml`, and both jobs of `e2e.yml`. The Dockerfile carries no
+default for any of them and refuses to build when one is missing, so a path that
+forgets a pin fails at the first step instead of shipping an image that
+contradicts its own tag. That is not hypothetical: with the runtime tag in the
+Dockerfile as a default, a CI build of the 3.14.4 tree produced an image
+labelled 3.14.3, carrying the 3.14.3 runtime, that the workflow would have
+pushed as `3.14.4`. The smoke job now compares, rather than prints, the runtime
+and the browser inside the published image.
+
+The browser is pinned for the same reason, and it is the component that matters
+most: Debian's security channel moved chromium from 153 to 154 between two
+builds of the same commit, and that is what broke the operator viewport.
+Raising the pin is a deliberate edit plus a rebuild, never a side effect of when
+the image was built, and the build turns red on its own the day the pinned
+version leaves the distribution channel.
 
 One image tag per release, the sha256 written into a label
 (`org.opencontainers.image.revision`), and an automatic watch:
@@ -564,12 +588,13 @@ REPO=zai-org/ZCode ./check-upstream.sh   # watch the original upstream instead
 
 The `upstream-check` workflow does that watch every week and **opens an issue**
 when a release comes out. It never modifies anything by itself: the bump stays
-an explicit decision.
+an explicit decision. The browser is not part of that watch, because its pin is
+not tied to a release: `chromium.version` says what to do.
 
 ## Building the image yourself
 
 ```bash
-./build.sh                # -> ghcr.io/sigma-gigachad/z-cloudium:{3.14.3,latest}
+./build.sh                # -> ghcr.io/sigma-gigachad/z-cloudium:{<zcode.version>,latest}
 ./build.sh --push         # same, then push to the registry
 ```
 
@@ -614,14 +639,23 @@ browser must not be pointed at untrusted pages. See SECURITY.md.
 
 ## What has been verified
 
-Tested by actually running things, not only written:
+Tested by actually running things, not only written. The measurements below date
+from the run that made them: where one names a version, that is the version it
+was measured on, while `zcode.version` and `chromium.version` are what a build
+carries today.
 
-- **test suite**: all green, in a throwaway container
+- **test suite**: 185 tests, 185 pass, 0 fail, in a throwaway container
   (`node:24.14.0-bookworm-slim`, `node --test`, which prints the count and
   exits on its own)
-- **image build**: 1.38 GB, `chromium --version` answers
-  `Chromium 153.0.8010.52` inside the built image, `chrome-devtools-mcp
-  --version` answers `1.10.1`
+- **image build**: 1.38 GB, and the image agrees with its own tag: the runtime
+  answers `3.14.4`, `chromium --version` answers `Chromium 154.0.8037.57`, the
+  two Debian packages are installed at exactly the versions `chromium.version`
+  pins, and the OCI labels carry `v3.14.4` and the pinned sha256.
+  `chrome-devtools-mcp --version` answers `1.10.1`
+- **the pins are enforced, not documented**: `docker build .` with no build
+  argument fails at the first step with `This build is missing a pinned build
+  argument.` and exit 1, so no build path can ship an image that contradicts
+  its own tag
 - **container start** (restricted profile, all hardening on): the entrypoint
   logs `gateway listening on 0.0.0.0:3030 (authentication on), runtime confined
   to 127.0.0.1:3131`, container `healthy`

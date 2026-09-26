@@ -19,7 +19,7 @@ services:
   z-cloudium:
     image: ghcr.io/sigma-gigachad/z-cloudium:latest
     # To pin a version instead of following `latest`:
-    # image: ghcr.io/sigma-gigachad/z-cloudium:3.14.3
+    # image: ghcr.io/sigma-gigachad/z-cloudium:3.14.4
     container_name: z-cloudium
     restart: unless-stopped
     stop_grace_period: 20s

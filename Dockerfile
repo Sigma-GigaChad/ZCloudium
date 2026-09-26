@@ -16,8 +16,10 @@
 #     published port, asks for a password plus a TOTP code, and proxies to the
 #     runtime, which is then confined to loopback.
 #   - Chromium with the fonts it renders pages with, and the browser MCP server
-#     the agent drives it through. Built in because a container has no display
-#     and the built-in Browser Use only starts in the one-shot and TUI paths.
+#     the agent drives it through. Built in because a container has no display,
+#     and pinned in chromium.version: the browser is the one component whose
+#     version decides what the agent sees, so two builds of one commit have to
+#     agree on it.
 #
 # Hardening (see SECURITY.md):
 #   - base image pinned by digest, not by a mutable tag
@@ -33,9 +35,21 @@ ARG NODE_SLIM_DIGEST=sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199
 
 FROM node:${NODE_VERSION}-bookworm-slim@${NODE_SLIM_DIGEST}
 
-ARG ZCODIUM_VERSION=v3.14.3
-ARG TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/v3.14.3/zcodium-3.14.3.tar.gz
-ARG TARBALL_SHA256=7af6e216ed65bd44bcf4d410d92c651757b19d65afef5a66e314c3927f0dac53
+# The pins are not defaults. They live in zcode.version, zcode.sha256 and
+# chromium.version at the root of the repository, and every build path passes
+# them: ./build.sh, build.yml, and both jobs of e2e.yml. A default here is what
+# let a build ship the previous runtime under the new tag, the image announcing
+# 3.14.3 in its own labels while zcode.version said 3.14.4. The guard below
+# refuses that build instead of producing it.
+ARG ZCODIUM_VERSION
+ARG TARBALL_URL
+ARG TARBALL_SHA256
+
+# The browser, pinned the same way: the exact Debian package versions for apt,
+# and the string `chromium --version` has to contain.
+ARG CHROMIUM_PACKAGE
+ARG CHROMIUM_COMMON_PACKAGE
+ARG CHROMIUM_UPSTREAM
 
 # The browser MCP server is pinned to an exact version, and recorded in
 # README.md: an image must not depend on whatever the npm tag points at on the
@@ -52,9 +66,24 @@ LABEL org.opencontainers.image.title="z-cloudium" \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# First thing the image builds: every pin arrived, or the build stops here, in
+# bash, with a sentence a human can act on.
+RUN for value in "$ZCODIUM_VERSION" "$TARBALL_URL" "$TARBALL_SHA256" "$CHROMIUM_PACKAGE" "$CHROMIUM_COMMON_PACKAGE" "$CHROMIUM_UPSTREAM"; do \
+      if [ -z "$value" ]; then \
+        echo "This build is missing a pinned build argument." >&2; \
+        echo "They come from zcode.version, zcode.sha256 and chromium.version: pass every one with --build-arg." >&2; \
+        exit 1; \
+      fi; \
+    done
+
 # git/curl: the agent runs real shell commands in its workspace and uses them
 # constantly. less/procps: convenience (pagers, ps).
-# chromium: the browser the MCP server drives, from bookworm-security.
+# chromium: the browser the MCP server drives, pinned in chromium.version and
+# installed at that exact version, companion package included so apt cannot pair
+# a pinned chromium with another chromium-common. `chromium --version` is
+# compared to the manifest right after: a distribution point release silently
+# changing the browser is what broke the operator viewport between two builds of
+# one commit.
 # fonts-*: with --no-install-recommends no font is installed at all, and
 # Chromium would then render every page with empty boxes. CJK fonts are
 # deliberately left out (tens of megabytes): install fonts-noto-cjk in a derived
@@ -62,7 +91,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
-      chromium \
+      "chromium=${CHROMIUM_PACKAGE}" \
+      "chromium-common=${CHROMIUM_COMMON_PACKAGE}" \
       curl \
       fonts-dejavu-core \
       fonts-liberation \
@@ -73,7 +103,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /data /workspace \
  && chown node:node /data /workspace \
- && chromium --version
+ && installed="$(chromium --version)" \
+ && echo "$installed" \
+ && case "$installed" in \
+      *"Chromium ${CHROMIUM_UPSTREAM}"*) ;; \
+      *) echo "The installed browser is not the pinned one: ${installed}" >&2; exit 1 ;; \
+    esac
 
 # Browser automation for the agent, installed at build time: no package manager
 # is needed at runtime, and two containers started from the same image run the

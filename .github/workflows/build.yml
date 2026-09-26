@@ -2,14 +2,20 @@ name: build-image
 
 # Builds the image and publishes it to GHCR.
 #
-# There is no separate "build" step to check anything: the Dockerfile verifies
-# the integrity of the runtime itself (sha256 pinned in the repository, setuid
-# scan) and refuses to build on a mismatch. A build that passes has therefore
-# already been checked.
+# The pins live in zcode.version, zcode.sha256 and chromium.version, and this
+# workflow is one of the three places that turn them into build arguments. The
+# Dockerfile refuses a build that is missing one, so no pin can be forgotten
+# silently: that is what let an earlier build ship the previous runtime under
+# the new tag.
+#
+# The Dockerfile also verifies the integrity of the runtime itself (sha256
+# pinned in the repository, setuid scan) and refuses to build on a mismatch. A
+# build that passes has therefore already been checked.
 #
 # A `smoke` job then pulls the published image into a real container and checks
-# that the gateway answers and that the browser MCP server was configured: an
-# image is not shipped without having been started.
+# that the gateway answers, that the image carries the runtime and the browser
+# its tag and its manifest claim, and that the browser MCP server was
+# configured: an image is not shipped without having been started.
 
 on:
   push:
@@ -32,16 +38,34 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      chromium: ${{ steps.version.outputs.chromium }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Read the pinned version
+      # The single place that reads the pins. `list` is what the build step
+      # passes as build arguments, in the shape docker/build-push-action reads.
+      - name: Read the pins
         id: version
         run: |
           tag="$(tr -d '[:space:]' < zcode.version)"
+          sha="$(tr -d '[:space:]' < zcode.sha256)"
+          # shellcheck source=chromium.version
+          . ./chromium.version
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "Pinned version: ${tag}"
+          echo "chromium=${chromium_upstream}" >> "$GITHUB_OUTPUT"
+          {
+            echo "list<<EOF"
+            echo "ZCODIUM_VERSION=${tag}"
+            echo "TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/${tag}/zcodium-${tag#v}.tar.gz"
+            echo "TARBALL_SHA256=${sha}"
+            echo "CHROMIUM_PACKAGE=${chromium_package}"
+            echo "CHROMIUM_COMMON_PACKAGE=${chromium_common}"
+            echo "CHROMIUM_UPSTREAM=${chromium_upstream}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned runtime: ${tag} (sha256 ${sha})"
+          echo "Pinned browser: chromium ${chromium_package}, upstream ${chromium_upstream}"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -57,6 +81,7 @@ jobs:
         with:
           context: .
           push: true
+          build-args: ${{ steps.version.outputs.list }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE }}:latest
@@ -108,9 +133,23 @@ jobs:
           test "$code" = "302"
           echo "$location" | grep -q '/_auth/login'
 
+      # The image has to be the one its tag claims. Both values are compared,
+      # not printed: a printout is exactly what let a 3.14.4 tag carry a 3.14.3
+      # runtime, and nobody noticed.
+      - name: Check that the image carries the runtime and the browser it claims
+        run: |
+          runtime="$(docker exec smoke node /opt/zcodium/bin/zcode.mjs --version)"
+          browser="$(docker exec smoke chromium --version)"
+          echo "runtime: ${runtime}"
+          echo "browser: ${browser}"
+          test "${runtime}" = "${{ needs.build.outputs.version }}"
+          case "${browser}" in
+            *"Chromium ${{ needs.build.outputs.chromium }}"*) ;;
+            *) echo "the browser in the image is not the one chromium.version pins" >&2; exit 1 ;;
+          esac
+
       - name: Check the browser automation baked into the image
         run: |
-          docker exec smoke chromium --version
           docker exec smoke /usr/local/bin/chrome-devtools-mcp --version
           docker exec smoke node -e '
             const config = JSON.parse(require("node:fs").readFileSync("/data/.zcode/cli/config.json", "utf8"));
