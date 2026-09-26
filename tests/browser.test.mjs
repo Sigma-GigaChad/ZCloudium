@@ -448,6 +448,14 @@ test("the route classification keeps the three prefixes apart", () => {
   assert.equal(classifyRoute("/_browser/json/list", { browserEnabled: true }), "browser");
   assert.equal(classifyRoute("/_browser/devtools/inspector.html", { browserEnabled: true }), "browser");
   assert.equal(classifyRoute("/_browser/devtools/page/8B04", { browserEnabled: true }), "browser");
+  // The two endpoints the panel talks to are the gateway's own, not the debug
+  // port's: they must not be proxied, or the panel would be answered by Chromium.
+  assert.equal(classifyRoute("/_browser/viewport", { browserEnabled: true }), "viewport");
+  assert.equal(classifyRoute("/_browser/page", { browserEnabled: true }), "page");
+  assert.equal(classifyRoute("/_browser/viewport", { browserEnabled: false }), "app");
+  assert.equal(classifyRoute("/_browser/page", { browserEnabled: false }), "app");
+  assert.equal(classifyRoute("/_browser/viewport/x", { browserEnabled: true }), "browser");
+  assert.equal(classifyRoute("/_browser/pages", { browserEnabled: true }), "browser");
   // A path that merely starts with the same letters is not the prefix.
   assert.equal(classifyRoute("/_browsers", { browserEnabled: true }), "app");
   assert.equal(classifyRoute("/_browserish/x", { browserEnabled: true }), "app");

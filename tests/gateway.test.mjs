@@ -839,7 +839,17 @@ test("the panel is served at the prefix root, with no session and no debug port 
     assert.equal(response.headers.get("cache-control"), "no-store");
     const body = await response.text();
     assert.match(body, /Page\.startScreencast/, "the live view is the screencast");
-    assert.match(body, /Emulation\.setDeviceMetricsOverride/, "the viewport control is the emulation override");
+    // The viewport and the page are the gateway's now (issue #9): the panel asks
+    // its own endpoints instead of carrying the emulation call, and the browser
+    // is driven from one place.
+    assert.match(body, /PANEL_PREFIX \+ path/, "the panel talks to the gateway's own endpoints");
+    assert.match(body, /askPanel\("viewport",/, "the viewport control goes through the gateway");
+    assert.match(body, /askPanel\("page",/, "the address bar and the history buttons go through the gateway");
+    assert.equal(
+      /Emulation\.setDeviceMetricsOverride/.test(body),
+      false,
+      "the page must not pose an override on a session of its own",
+    );
     assert.match(body, /Shared with the agent/, "the indicator that the page is shared with the agent");
     // The button's URL is built at runtime from the same prefix, so what can be
     // asserted on the served page is the frontend path it points at.

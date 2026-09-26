@@ -140,7 +140,7 @@ RUN set -euo pipefail; \
     test -f /opt/zcodium/server/entry-http.js; \
     if [ ! -d /opt/zcodium/agent/node_modules/playwright-core ]; then \
       echo "The runtime no longer ships playwright-core, which the browser panel uses to own the viewport (issue #9)." >&2; \
-      echo "Either install it explicitly in this image, or point gateway/lib/viewport.mjs at where it went." >&2; \
+      echo "Either install it explicitly in this image, or point gateway/lib/page-owner.mjs at where it went." >&2; \
       exit 1; \
     fi; \
     setuid="$(find /opt/zcodium -xdev \( -perm -4000 -o -perm -2000 \) -print)"; \

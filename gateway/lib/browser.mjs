@@ -46,6 +46,16 @@ export const BROWSER_PREFIX = "/_browser";
  */
 export const VIEWPORT_PATH = `${BROWSER_PREFIX}/viewport`;
 
+/**
+ * Where the panel asks the gateway to drive the page: the address bar, and the
+ * back, forward and reload buttons.
+ *
+ * Same reasoning as the viewport: the gateway holds the connection to the
+ * browser, so the panel asks it instead of opening a channel of its own, and the
+ * agent's page stays one page with one owner.
+ */
+export const PAGE_PATH = `${BROWSER_PREFIX}/page`;
+
 /** The profile directory, created under the data volume so it survives a restart. */
 export const BROWSER_PROFILE_NAME = "browser-profile";
 
@@ -312,6 +322,9 @@ export function classifyRoute(pathname, { browserEnabled = false } = {}) {
   }
   if (pathname === VIEWPORT_PATH) {
     return "viewport";
+  }
+  if (pathname === PAGE_PATH) {
+    return "page";
   }
   if (pathname.startsWith(`${BROWSER_PREFIX}/`)) {
     return "browser";

@@ -543,17 +543,6 @@ body {
 .status { font-size: 11px; color: var(--foreground-subtle); }
 .status[data-kind="connected"] { color: #7dd3a0; }
 .status[data-kind="error"] { color: var(--destructive); }
-.target-url {
-  margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--foreground-subtle);
-  max-width: 44vw;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  direction: rtl;
-}
 label { color: var(--foreground-subtle); font-size: 11px; }
 select, input[type="number"] {
   background: var(--surface);
@@ -586,7 +575,34 @@ button.primary { background: var(--brand); color: #161616; border-color: transpa
 button.primary:hover { opacity: .9; }
 .sep { width: 1px; height: 18px; background: var(--border); }
 .check { display: flex; align-items: center; gap: 5px; }
-.stage { flex: 1; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #0d0d0d; }
+.nav { gap: 6px; padding: 6px 10px; }
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: none;
+  color: var(--foreground-subtle);
+}
+.icon:hover { background: var(--surface-hover); color: var(--foreground); }
+.icon[aria-disabled="true"] { opacity: .4; cursor: default; }
+.address {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  background: var(--surface);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+.address:focus { border-color: var(--border-hover); background: var(--surface-hover); }
+.stage { flex: 1; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; background: var(--background); }
 canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; outline: none; cursor: crosshair; }
 canvas:focus { box-shadow: 0 0 0 1px var(--border); }
 `;
@@ -603,7 +619,12 @@ const canvas = document.getElementById("screen");
 const context2d = canvas.getContext("2d");
 const stage = document.getElementById("stage");
 const statusEl = document.getElementById("status");
-const urlEl = document.getElementById("target-url");
+const addressEl = document.getElementById("address");
+const externalEl = document.getElementById("external");
+const backEl = document.getElementById("back");
+const forwardEl = document.getElementById("forward");
+const reloadEl = document.getElementById("reload");
+const detachEl = document.getElementById("detach");
 const targetEl = document.getElementById("target");
 const refreshEl = document.getElementById("refresh");
 const devtoolsEl = document.getElementById("devtools");
@@ -746,26 +767,33 @@ function closeSocket() {
 }
 
 /**
- * How the panel asks for a resolution (issue #9).
+ * How the panel asks the gateway to do something to the page.
  *
- * What it replaces: the Apply button used to send Emulation.setDeviceMetricsOverride
- * on the panel's own control channel. Chromium 154 clears an override when the
- * session that posed it detaches, and closing the panel detaches exactly that
- * session, so the operator's viewport died with the tab: the size was gone the
- * moment the pane was reopened, which is the case the pane exists for. The
- * gateway now poses it on a session that lives as long as the container, and this
- * is the request that asks it to. It answers with the numbers it applied, which
- * are the ones the fields then show.
+ * One request shape for both endpoints, because they are one idea: the panel is a
+ * viewer, the gateway holds the connection to the browser, and everything the
+ * operator does to that page goes through it.
+ *
+ * The resolution is the historical half (issue #9). It replaces a call the panel
+ * used to make on its own control channel: Chromium 154 clears an override when
+ * the session that posed it detaches, and closing the panel detaches exactly that
+ * session, so the operator's viewport died with the tab, which is the case the
+ * pane exists for. The gateway poses it instead, on a session that lives as long
+ * as the container, and the answer carries the numbers it applied.
+ *
+ * The other half is the page itself: the address bar and the history buttons. The
+ * desktop pane drives its own browser through its host; this one asks the
+ * gateway, so the panel never opens a channel of its own and there is one owner
+ * per page.
  */
-function askViewport(mode, extra) {
-  return fetch(PANEL_PREFIX + "viewport", {
+function askPanel(path, mode, extra) {
+  return fetch(PANEL_PREFIX + path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(Object.assign({ mode: mode, targetId: state.targetId }, extra || {})),
   }).then(function (response) {
     if (!response.ok) {
       return response.text().then(function (text) {
-        throw new Error(text || "the viewport request failed with " + response.status);
+        throw new Error(text || "the " + path + " request failed with " + response.status);
       });
     }
     return response.json();
@@ -777,7 +805,7 @@ function connect(targetId) {
   if (previous && previous !== targetId) {
     // The page the panel moves away from keeps the size it has, but nothing
     // forces it any more: coming back to it later starts from what it reports.
-    askViewport("release").catch(function () {});
+    askPanel("viewport", "release").catch(function () {});
   }
   closeSocket();
   state.targetId = targetId;
@@ -792,8 +820,11 @@ function connect(targetId) {
   const target = state.targets.filter(function (entry) {
     return entry.id === targetId;
   })[0];
-  urlEl.textContent = target ? target.url : "";
-  urlEl.title = target ? target.url : "";
+  // The address bar starts on where the target is, before the page reports
+  // anything: a target that never answers still says which page it is.
+  if (target && document.activeElement !== addressEl) {
+    addressEl.value = target.url;
+  }
   devtoolsEl.href = devtoolsUrlFor(targetId, { host: location.host }) || "#";
   targetEl.value = targetId;
   const url = socketUrlFor(PANEL_PREFIX + "devtools/page/" + targetId, { host: location.host, protocol: location.protocol });
@@ -820,7 +851,7 @@ function connect(targetId) {
     // else cleared it while nobody was watching, and the fields are filled from
     // what the page reports afterwards, so a page nobody resized is left exactly
     // as it was: opening the panel changes nothing until Apply is pressed.
-    askViewport("attach")
+    askPanel("viewport", "attach")
       .then(function (answer) {
         if (answer && answer.restored) {
           setStatus("viewport " + answer.width + "x" + answer.height + " restored", "connected");
@@ -871,8 +902,14 @@ function refreshReported(adopt) {
         return;
       }
       if (typeof href === "string" && href !== "") {
-        urlEl.textContent = href;
-        urlEl.title = href;
+        // The address bar follows the page, except while the operator is typing in
+        // it: a navigation the agent makes under their hands must not replace a
+        // half-typed address.
+        if (document.activeElement !== addressEl) {
+          addressEl.value = href;
+        }
+        externalEl.href = href;
+        externalEl.title = "Open in default browser: " + href;
         if (state.href !== null && state.href !== href) {
           // The page the panel is attached to navigated under it, which is what
           // the agent does all the time: the target list is asked again so the
@@ -916,7 +953,7 @@ function applyViewport(width, height) {
   widthEl.value = viewport.width;
   heightEl.value = viewport.height;
   setStatus("applying " + viewport.width + "x" + viewport.height);
-  return askViewport("apply", { width: viewport.width, height: viewport.height })
+  return askPanel("viewport", "apply", { width: viewport.width, height: viewport.height })
     .then(function (answer) {
       // The numbers the gateway applied, not the ones that were asked for: it
       // clamps on the same bounds, and those are the ones the page is at now.
@@ -998,6 +1035,31 @@ function refreshTargets() {
     });
 }
 
+/**
+ * One navigation, from the address bar or a history button.
+ *
+ * The gateway answers with the address the page ended on, so the bar shows the
+ * truth even when the site redirected, and the same round trip updates the
+ * reported size: a navigation is a layout change like any other.
+ */
+function drivePage(mode, extra) {
+  setStatus(mode === "navigate" ? "opening" : mode);
+  return askPanel("page", mode, extra)
+    .then(function (answer) {
+      if (answer && typeof answer.url === "string" && document.activeElement !== addressEl) {
+        addressEl.value = answer.url;
+      }
+      setStatus("connected", "connected");
+      return refreshReported(false);
+    })
+    .catch(function (error) {
+      setStatus(error.message, "error");
+      // The bar goes back to where the page really is: a refused address must not
+      // stay in the field looking like the current one.
+      return refreshReported(false);
+    });
+}
+
 function mappedPoint(event) {
   const viewport = inputViewport({
     frame: state.frameViewport,
@@ -1073,6 +1135,33 @@ refreshEl.addEventListener("click", function () {
 });
 targetEl.addEventListener("change", function () {
   connect(targetEl.value);
+});
+addressEl.addEventListener("keydown", function (event) {
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
+  const typed = addressEl.value.trim();
+  if (typed === "") {
+    return;
+  }
+  addressEl.blur();
+  drivePage("navigate", { url: typed });
+});
+backEl.addEventListener("click", function () {
+  drivePage("back");
+});
+forwardEl.addEventListener("click", function () {
+  drivePage("forward");
+});
+reloadEl.addEventListener("click", function () {
+  drivePage("reload");
+});
+detachEl.addEventListener("click", function () {
+  // The web app cannot host this page in its own side pane (its browser pane is a
+  // desktop guest, see README.md), so the third column is this page in a window of
+  // its own, opened at the size the desktop pane is usually given.
+  window.open(location.href, "_blank", "noopener,width=1366,height=900");
 });
 presetsEl.addEventListener("change", function () {
   const parts = String(presetsEl.value).split("x");
@@ -1157,8 +1246,15 @@ export function panelPage() {
 <span class="brand"><span class="dot"></span>Browser panel</span>
 <span class="badge" id="shared" title="The agent drives this same page: your clicks and its actions land in one browser, and neither side blocks the other.">Shared with the agent</span>
 <span class="status" id="status">starting</span>
-<span class="target-url" id="target-url"></span>
 </header>
+<div class="bar nav">
+<button id="back" class="icon" type="button" aria-label="Back" title="Back"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+<button id="forward" class="icon" type="button" aria-label="Forward" title="Forward"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button>
+<button id="reload" class="icon" type="button" aria-label="Refresh" title="Refresh"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg></button>
+<input id="address" class="address" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Address" placeholder="Enter a URL and press Enter">
+<a id="external" class="icon" href="#" target="_blank" rel="noopener" aria-label="Open in default browser" title="Open in default browser"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14L21 3"/></svg></a>
+<button id="detach" class="icon" type="button" aria-label="Detach panel" title="Open the panel in its own window"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4l-8 8"/><rect x="3" y="9" width="11" height="12" rx="2"/></svg></button>
+</div>
 <div class="bar">
 <label for="target">target</label>
 <select id="target"></select>

@@ -117,6 +117,19 @@ async function applyViewport(panel, width, height) {
   await expect(panel.locator("#reported")).toContainText(`page reports ${width}x${height}`);
 }
 
+/**
+ * The container's own gateway, as the container's browser sees it.
+ *
+ * The published port varies (the suite is pointed at it through E2E_BASE_URL), but
+ * inside the container the gateway is always on 3030: the image exposes it, the
+ * healthcheck probes it, and both compose files publish it. These two pages are
+ * used as navigation targets because they are served by the gateway itself, so the
+ * navigation test depends on no outside network at all.
+ */
+const CONTAINER_GATEWAY = "http://127.0.0.1:3030";
+const HEALTH_PAGE = `${CONTAINER_GATEWAY}/_auth/health`;
+const LOGIN_PAGE = `${CONTAINER_GATEWAY}/_auth/login`;
+
 test.describe("the browser panel", () => {
   test.describe("without a session", () => {
     test("every panel path is refused, including the WebSocket the panel needs", async ({ browser, baseURL }) => {
@@ -270,6 +283,51 @@ test.describe("the browser panel", () => {
       const pictureAfter = await reopened.locator("#screen").screenshot();
       expect(Buffer.compare(pictureBefore, pictureAfter)).not.toBe(0);
       await reopened.close();
+    });
+
+    test("the address bar navigates the page, and the history buttons move it", async ({ page }) => {
+      test.skip(!(await panelTargetAvailable(page)), "this container runs without the browser panel (start it with E2E_PANEL=on)");
+
+      const target = await installFixture(page);
+      const panel = await page.context().newPage();
+      await panel.goto("/_browser/");
+      await expect(panel.locator("#status")).toHaveText("connected", { timeout: 20_000 });
+      await waitForFrames(panel, 1);
+
+      // The address bar is the only way in: type, Enter, and the page the panel
+      // shows is that page. Measured from the page itself, over CDP.
+      await panel.locator("#address").fill(HEALTH_PAGE);
+      await panel.locator("#address").press("Enter");
+      await expect
+        .poll(() => cdpEvaluate(page, { targetId: target.id, expression: "location.href" }), { timeout: 15_000 })
+        .toBe(HEALTH_PAGE);
+      expect(await cdpEvaluate(page, { targetId: target.id, expression: "document.body.textContent.trim()" })).toBe("ok");
+      await expect(panel.locator("#address")).toHaveValue(HEALTH_PAGE);
+
+      // A second page, so there is somewhere to go back to and forward from.
+      await panel.locator("#address").fill(LOGIN_PAGE);
+      await panel.locator("#address").press("Enter");
+      await expect
+        .poll(() => cdpEvaluate(page, { targetId: target.id, expression: "location.href" }), { timeout: 15_000 })
+        .toBe(LOGIN_PAGE);
+
+      await panel.locator("#back").click();
+      await expect
+        .poll(() => cdpEvaluate(page, { targetId: target.id, expression: "location.href" }), { timeout: 15_000 })
+        .toBe(HEALTH_PAGE);
+      await panel.locator("#forward").click();
+      await expect
+        .poll(() => cdpEvaluate(page, { targetId: target.id, expression: "location.href" }), { timeout: 15_000 })
+        .toBe(LOGIN_PAGE);
+
+      // Reload is a real reload: the same address, a new document.
+      const before = await cdpEvaluate(page, { targetId: target.id, expression: "String(performance.timeOrigin)" });
+      await panel.locator("#reload").click();
+      await expect
+        .poll(() => cdpEvaluate(page, { targetId: target.id, expression: "String(performance.timeOrigin)" }), { timeout: 15_000 })
+        .not.toBe(before);
+      expect(await cdpEvaluate(page, { targetId: target.id, expression: "location.href" })).toBe(LOGIN_PAGE);
+      await panel.close();
     });
 
     test("the DevTools button opens the proxied frontend on this target", async ({ page }) => {

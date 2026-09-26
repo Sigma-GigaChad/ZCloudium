@@ -22,7 +22,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PLAYWRIGHT_CANDIDATES, createViewportOwner, resolvePlaywright } from "../gateway/lib/viewport.mjs";
+import { PLAYWRIGHT_CANDIDATES, absoluteHttpUrl, createPageOwner, resolvePlaywright } from "../gateway/lib/page-owner.mjs";
 
 /**
  * A browser that answers like the debug port, and records what it was asked.
@@ -38,6 +38,20 @@ function fakeBrowser({ pages = [{ targetId: "AB", reported: "800x600" }] } = {})
     spec,
     isClosed: () => Boolean(spec.closed),
     evaluate: async () => spec.reported,
+    goto: async (url) => {
+      (spec.visited ??= []).push(url);
+      spec.url = url;
+    },
+    goBack: async () => {
+      (spec.moves ??= []).push("back");
+    },
+    goForward: async () => {
+      (spec.moves ??= []).push("forward");
+    },
+    reload: async () => {
+      (spec.moves ??= []).push("reload");
+    },
+    url: () => spec.url ?? "about:blank",
   }));
 
   const context = {
@@ -76,7 +90,7 @@ function fakeBrowser({ pages = [{ targetId: "AB", reported: "800x600" }] } = {})
 }
 
 function ownerFor(browser, options = {}) {
-  return createViewportOwner({
+  return createPageOwner({
     debugUrl: "http://127.0.0.1:9222",
     engine: browser.engine,
     ...options,
@@ -201,7 +215,7 @@ test("a page that closed is forgotten instead of pinning a stale session", async
 });
 
 test("a browser that stops answering fails the call instead of hanging", async () => {
-  const stalling = createViewportOwner({
+  const stalling = createPageOwner({
     debugUrl: "http://127.0.0.1:9222",
     engine: {
       connectOverCDP: async () => ({
@@ -241,8 +255,66 @@ test("closing detaches from the browser, and the next call connects again", asyn
 });
 
 test("an owner without a debug url is refused at construction", () => {
-  assert.throws(() => createViewportOwner({}), /requires a debugUrl/);
-  assert.throws(() => createViewportOwner({ debugUrl: "  " }), /requires a debugUrl/);
+  assert.throws(() => createPageOwner({}), /requires a debugUrl/);
+  assert.throws(() => createPageOwner({ debugUrl: "  " }), /requires a debugUrl/);
+});
+
+test("the address bar takes a bare host, and only http and https", () => {
+  // What people type: a host, with or without a path.
+  assert.equal(absoluteHttpUrl("trip.com"), "https://trip.com/");
+  assert.equal(absoluteHttpUrl("  trip.com/hotels?x=1  "), "https://trip.com/hotels?x=1");
+  assert.equal(absoluteHttpUrl("www.trip.com"), "https://www.trip.com/");
+  // Loopback is the one host that is never served over https.
+  assert.equal(absoluteHttpUrl("localhost:3030"), "http://localhost:3030/");
+  assert.equal(absoluteHttpUrl("127.0.0.1:9222/json/list"), "http://127.0.0.1:9222/json/list");
+  assert.equal(absoluteHttpUrl("[::1]:3030"), "http://[::1]:3030/");
+  assert.equal(absoluteHttpUrl("http://example.test/a"), "http://example.test/a");
+  assert.equal(absoluteHttpUrl("https://example.test"), "https://example.test/");
+
+  for (const refused of [
+    // The desktop pane also takes these, and this one does not on purpose: a data
+    // page or a file from the container is indistinguishable from a site inside
+    // the panel, and a session holder already reaches both through the agent.
+    "file:///etc/passwd",
+    "data:text/html,<h1>hi</h1>",
+    "about:blank",
+    "javascript:alert(1)",
+    "chrome://settings",
+    // No scheme and no host: a search term is not an address.
+    "how do magnets work",
+    "",
+    "   ",
+    "/workspace/notes.md",
+    "https://",
+    null,
+    undefined,
+    42,
+  ]) {
+    assert.equal(absoluteHttpUrl(refused), null, JSON.stringify(refused));
+  }
+});
+
+test("navigating goes to the page, with the address this module validated", async () => {
+  const browser = fakeBrowser();
+  const owner = ownerFor(browser);
+  const answer = await owner.navigate({ targetId: "AB", url: "trip.com" });
+  assert.deepEqual(answer, { url: "https://trip.com/", reported: "800x600" });
+  assert.deepEqual(browser.specs[0].visited, ["https://trip.com/"]);
+  // An address the browser cannot be given is refused before anything is asked of
+  // the page, which is the second of the two checks: the server refuses first.
+  await assert.rejects(() => owner.navigate({ targetId: "AB", url: "file:///etc/passwd" }), /only http and https/);
+  assert.deepEqual(browser.specs[0].visited, ["https://trip.com/"]);
+});
+
+test("back, forward and reload are three directions of the same call", async () => {
+  const browser = fakeBrowser();
+  const owner = ownerFor(browser);
+  const spec = browser.specs[0];
+  await owner.history({ targetId: "AB", direction: "back" });
+  await owner.history({ targetId: "AB", direction: "forward" });
+  await owner.history({ targetId: "AB", direction: "reload" });
+  assert.deepEqual(spec.moves, ["back", "forward", "reload"]);
+  await assert.rejects(() => owner.history({ targetId: "AB", direction: "sideways" }), /unknown history direction/);
 });
 
 test("playwright-core is looked for where the image keeps it, then by name", () => {

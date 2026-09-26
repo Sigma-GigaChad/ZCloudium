@@ -300,10 +300,10 @@ function panelRuntime() {
     window: { addEventListener: () => {}, location },
     document: { getElementById: elementFor, createElement: (tag) => element(`created:${tag}`), body: element("body") },
     fetch: async (url, options) => {
-      // Two endpoints are asked from the page: the target list, which the debug
-      // port answers through the gateway's proxy, and the viewport, which the
-      // gateway answers itself (issue #9). Both are recorded, so a test can assert
-      // what the wiring asked for rather than only what it drew.
+      // Three endpoints are asked from the page: the target list, which the debug
+      // port answers through the gateway's proxy, and the two the gateway answers
+      // itself, the viewport and the page (issue #9). All are recorded, so a test
+      // can assert what the wiring asked for rather than only what it drew.
       const body = options?.body ? JSON.parse(options.body) : null;
       requests.push({ url, body });
       if (url === `${PANEL_PREFIX}viewport`) {
@@ -311,6 +311,9 @@ function panelRuntime() {
           return { ok: true, json: async () => ({ width: body.width, height: body.height, reported: `${body.width}x${body.height}` }) };
         }
         return { ok: true, json: async () => ({ restored: false }) };
+      }
+      if (url === `${PANEL_PREFIX}page`) {
+        return { ok: true, json: async () => ({ url: body?.url ?? "about:blank", reported: "800x600" }) };
       }
       return { ok: true, json: async () => [{ id: "AB", type: "page", url: "about:blank", title: "Fixture" }] };
     },
@@ -370,6 +373,11 @@ function panelRuntime() {
       elementFor("width").value = String(width);
       elementFor("height").value = String(height);
     },
+    address: (value) => {
+      elementFor("address").value = String(value);
+    },
+    /** Types an address and presses Enter, the way the operator navigates. */
+    addressEnter: () => invoke("address", "keydown", { key: "Enter", preventDefault() {} }),
   };
 }
 
@@ -433,6 +441,33 @@ test("the panel asks for the picture bounds on attach, not the values the fields
     maxHeight: SCREENCAST_MAX_HEIGHT,
     everyNthFrame: 1,
   });
+});
+
+test("the address bar asks the gateway to navigate, and the buttons ask it to go back, forward and reload", async () => {
+  const panel = panelRuntime();
+  await panel.connected();
+
+  panel.address("trip.com");
+  await panel.addressEnter();
+  assert.deepEqual(panel.lastRequest("/_browser/page"), {
+    mode: "navigate",
+    targetId: "AB",
+    url: "trip.com",
+  }, "the address bar must go through the gateway, which holds the page, and not through a channel of its own");
+
+  await panel.click("back");
+  assert.equal(panel.lastRequest("/_browser/page").mode, "back");
+  await panel.click("forward");
+  assert.equal(panel.lastRequest("/_browser/page").mode, "forward");
+  await panel.click("reload");
+  assert.equal(panel.lastRequest("/_browser/page").mode, "reload");
+
+  // An empty address is not a navigation: pressing Enter on the placeholder must
+  // not reload the page under the operator.
+  const before = panel.requests.length;
+  panel.address("   ");
+  await panel.addressEnter();
+  assert.equal(panel.requests.length, before, "an empty address sends nothing");
 });
 
 test("the mouse messages carry the fields CDP expects, for every kind of gesture", () => {
@@ -605,10 +640,12 @@ test("the served page is one file, with no external asset and no framework", () 
   assert.match(html, /^<!doctype html>/);
   assert.match(html, /<canvas/);
   assert.match(html, /Page\.startScreencast/);
-  // The viewport is asked to the gateway, which owns the override now (issue #9):
-  // the page builds that endpoint from the prefix it already knows, and it no
-  // longer carries the emulation call itself.
-  assert.match(html, /PANEL_PREFIX \+ "viewport"/);
+  // The viewport and the page are asked to the gateway, which owns both now: the
+  // page builds those endpoints from the prefix it knows, and it no longer carries
+  // the emulation call itself.
+  assert.match(html, /PANEL_PREFIX \+ path/);
+  assert.match(html, /askPanel\("viewport",/);
+  assert.match(html, /askPanel\("page",/);
   // What matters is the code path, not the prose: the page must send no
   // emulation call at all, because the gateway poses it on a session that never
   // detaches, while the panel detaches every time it is closed (issue #9).

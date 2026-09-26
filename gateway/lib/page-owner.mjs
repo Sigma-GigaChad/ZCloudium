@@ -1,17 +1,21 @@
 /**
- * Who owns the emulated viewport (issue #9).
+ * Who owns the page the operator watches: its viewport, and its navigation.
  *
- * Chromium 153 and 154 do not answer this the same way, and that difference is
- * the whole bug: until 153 an override outlived the session that set it, and
- * from 154 it belongs to that session and dies with it. A panel that posed its
- * own override therefore lost the operator's resolution the moment the operator
- * closed the tab, which is exactly the case the pane exists for: acting with the
- * viewer closed, then reopening and finding the state intact.
+ * Chromium 153 and 154 do not answer the viewport question the same way, and that
+ * difference is the whole bug: until 153 an override outlived the session that set
+ * it, and from 154 it belongs to that session and dies with it. A panel that posed
+ * its own override therefore lost the operator's resolution the moment the
+ * operator closed the tab, which is exactly the case the pane exists for: acting
+ * with the viewer closed, then reopening and finding the state intact.
  *
  * The fix is ownership, not a workaround: the gateway holds one connection to the
  * debug port for its whole life, poses the override on a session it never
  * detaches, and the panel asks it to. Nothing the panel does can clear the
  * viewport afterwards, because the panel no longer has a session of its own.
+ *
+ * The same hold drives the page: the panel's address bar navigates through here
+ * rather than through a channel of its own, so the panel stays a viewer and the
+ * gateway stays the only client of that browser besides the agent.
  *
  * What was measured on the pinned browser (Chromium 154.0.8037.57) before this
  * file was written, and what the tests below replay against a fake engine:
@@ -23,9 +27,9 @@
  * - Playwright does not re-send an override it already sent, so re-asserting a
  *   size means sending the protocol call again, never calling setViewportSize.
  *
- * The last point is why the calls below go through a CDP session rather than
- * through `page.setViewportSize`: the panel's Apply button has to work the second
- * time the operator presses it with the same numbers.
+ * The last point is why the viewport calls below go through a CDP session rather
+ * than through `page.setViewportSize`: the panel's Apply button has to work the
+ * second time the operator presses it with the same numbers.
  */
 
 import { createRequire } from "node:module";
@@ -96,6 +100,53 @@ function withTimeout(promise, ms, what) {
   });
 }
 
+/** A host, with an optional port and path: what an address bar is given without a scheme. */
+const BARE_HOST = /^(?:localhost|127\.0\.0\.1|\[::1\]|[^\s/?#:]+\.[^\s/?#:]+)(?::\d+)?(?:[/?#].*)?$/;
+
+/**
+ * What was typed in the address bar, as an absolute http or https URL, or null.
+ *
+ * A bare host is what people type in an address bar, so `trip.com` becomes
+ * `https://trip.com` and a loopback address becomes `http://`, which is the only
+ * scheme that ever serves it. Everything else without a scheme is refused rather
+ * than guessed.
+ *
+ * Only http and https are accepted, where the desktop pane also takes file, data
+ * and about. That is deliberate here: a data page or a file from the container,
+ * rendered inside the panel, is indistinguishable from a site, and whoever holds
+ * a session already reaches both through the agent, where it leaves a trace.
+ */
+export function absoluteHttpUrl(raw) {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const value = raw.trim();
+  if (value === "") {
+    return null;
+  }
+  let candidate = null;
+  if (/^https?:\/\//i.test(value)) {
+    candidate = value;
+  } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value) && BARE_HOST.test(value)) {
+    candidate = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::|$)/.test(value) ? `http://${value}` : `https://${value}`;
+  }
+  if (candidate === null) {
+    return null;
+  }
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    if (url.hostname === "") {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The viewport owner.
  *
@@ -104,7 +155,7 @@ function withTimeout(promise, ms, what) {
  * session that poses an override is kept for the life of the gateway, which is
  * what makes the resolution survive the viewer closing.
  */
-export function createViewportOwner({
+export function createPageOwner({
   debugUrl,
   engine = null,
   load = resolvePlaywright,
@@ -112,7 +163,7 @@ export function createViewportOwner({
   timeoutMs = VIEWPORT_CALL_TIMEOUT_MS,
 } = {}) {
   if (typeof debugUrl !== "string" || debugUrl.trim() === "") {
-    throw new Error("createViewportOwner requires a debugUrl");
+    throw new Error("createPageOwner requires a debugUrl");
   }
 
   let connection = null;
@@ -249,6 +300,50 @@ export function createViewportOwner({
     return { released: had };
   }
 
+  /**
+   * Navigates the page, from the panel's address bar.
+   *
+   * The same session that owns the viewport owns the navigation, for the same
+   * reason: the panel has no channel of its own to the browser, so there is one
+   * place where "what the page is" is decided, and it is this one.
+   */
+  async function navigate({ targetId, url } = {}) {
+    const wanted = absoluteHttpUrl(url);
+    if (wanted === null) {
+      throw new Error("only http and https addresses can be opened in the panel");
+    }
+    const entry = await entryFor(targetId);
+    if (!entry) {
+      throw new Error("no page target to navigate");
+    }
+    await withTimeout(entry.page.goto(wanted, { waitUntil: "domcontentloaded" }), timeoutMs, "navigating");
+    return { url: wanted, reported: await reportedOn(entry.page).catch(() => null) };
+  }
+
+  /**
+   * Back, forward and reload.
+   *
+   * Playwright answers null from goBack and goForward when there is nowhere to go,
+   * which is not an error: the panel greys those buttons out from what the page
+   * reports, and a race between the two is not worth a failure message.
+   */
+  async function history({ targetId, direction } = {}) {
+    const entry = await entryFor(targetId);
+    if (!entry) {
+      throw new Error("no page target to move");
+    }
+    if (direction === "back") {
+      await withTimeout(entry.page.goBack({ waitUntil: "domcontentloaded" }), timeoutMs, "going back");
+    } else if (direction === "forward") {
+      await withTimeout(entry.page.goForward({ waitUntil: "domcontentloaded" }), timeoutMs, "going forward");
+    } else if (direction === "reload") {
+      await withTimeout(entry.page.reload({ waitUntil: "domcontentloaded" }), timeoutMs, "reloading");
+    } else {
+      throw new Error(`unknown history direction: ${JSON.stringify(direction)}`);
+    }
+    return { url: entry.page.url() || null, reported: await reportedOn(entry.page).catch(() => null) };
+  }
+
   function state() {
     return {
       connected: Boolean(connection),
@@ -269,5 +364,5 @@ export function createViewportOwner({
     await open.browser.close().catch((error) => logger(`[viewport] closing the connection failed: ${error.message}`));
   }
 
-  return { apply, attach, release, state, close, connect };
+  return { apply, attach, release, navigate, history, state, close, connect };
 }

@@ -319,10 +319,42 @@ session as everything else, and the WebSocket it opens is refused without one.
 | Part | What it is |
 | --- | --- |
 | live view | `Page.startScreencast` frames painted into a canvas, scaled to fit the window |
+| address bar | the address the page is at right now, and the way to change it: type, press Enter, and the gateway navigates the page. Only http and https, deliberately (see below) |
+| navigation | back, forward and refresh, next to the address bar, with the labels the desktop pane uses |
 | viewport | a preset selector (`1280x720`, `1366x768`, `1600x900`, `1920x1080`) that applies in one gesture, plus a width and a height field for anything else, `320x320` up to `3840x2160`, and a fit-to-window option. The panel asks the gateway for it, and the gateway poses it with `Emulation.setDeviceMetricsOverride` on the page. `1366x768` is what the fields start at, and what the panel adopts only when the page has no size of its own yet |
 | interaction | mouse move, press, release, wheel and drag, and the keyboard, through the CDP input events. Click the picture once to give it the keyboard |
-| indicator | the page is shared with the agent, and the strip shows the address the page is at right now |
-| DevTools | a button that opens Chromium's own DevTools frontend through the gateway, on the same page: Elements, Network, Console, Sources, Performance |
+| indicator | the page is shared with the agent, and the strip shows the size the page reports and the age of the last frame |
+| actions | Open DevTools through the gateway, open the current page in your own browser, and detach: the panel in a window of its own, 1366x900, which is how the third column is assembled when the web app cannot host the pane itself |
+
+### Why the address bar is not the desktop pane
+
+The desktop build has a browser pane in its side column, with the same address
+bar, the same free-size viewport and an element picker. That pane is an Electron
+guest: the bundle carries its labels (`browser.title`, `browser.responsive.*`,
+`browser.elementPicker.*`) and the IPC namespace its host uses
+(`zcode:browser-view-*`), and the web entry of that same bundle mounts the
+application with `supportsEmbeddedBrowser: false`. The runtime says it in one
+sentence, `browser.desktopOnly`, which its Settings page renders as "Browser pane
+is available on desktop only".
+
+So in the web build the pane is not offered, and it cannot be turned on from
+outside without patching the client, which this project does not do. What the
+third column is here: this page, in a window beside the application, opened with
+the detach button. The controls are the desktop pane's, so the gesture is the same
+even though the container is not.
+
+Two deliberate differences from the desktop pane, both about not blurring what the
+panel is:
+
+- **the address bar takes http and https only.** The desktop also takes `file:`,
+  `data:` and `about:`. Inside the panel, a `data:` page or a file from the
+  container looks like any other site, and whoever holds a session already reaches
+  both through the agent, where it leaves a trace;
+- **the element picker is DevTools'.** `Ctrl+Shift+C` in the DevTools this panel
+  opens is the real picker, with the real highlight (`Overlay.setInspectMode`),
+  and it yields a selector to paste into the conversation. The desktop pane's own
+  picker exists because it has an IPC channel into the conversation; this page has
+  none, so a picker here would copy what DevTools already does properly.
 
 ### Who owns the resolution, and why it matters
 

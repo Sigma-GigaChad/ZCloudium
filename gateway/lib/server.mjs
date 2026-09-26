@@ -17,7 +17,7 @@ import {
   rewriteDiscovery,
 } from "./browser.mjs";
 import { panelPage } from "./panel.mjs";
-import { createViewportOwner } from "./viewport.mjs";
+import { absoluteHttpUrl, createPageOwner } from "./page-owner.mjs";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -231,7 +231,7 @@ export async function createGateway({
    * makes the operator's resolution outlive the panel: an application that came
    * and went cannot clear an override it does not own.
    */
-  const viewport = browserEnabled ? createViewportOwner({ debugUrl, logger }) : null;
+  const pageOwner = browserEnabled ? createPageOwner({ debugUrl, logger }) : null;
   const failures = new Map();
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
@@ -609,6 +609,71 @@ export async function createGateway({
     res.end(body);
   }
 
+  /** A failure the panel endpoint answers as is, with the status it deserves. */
+  function httpError(status, message) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+  }
+
+  /**
+   * The shape every panel endpoint has: this gateway's own frontend, the panel on,
+   * a POST, and a small JSON document in and out.
+   *
+   * Shared rather than copied because the interesting part of these routes is the
+   * rule they enforce, and two copies of a rule drift apart. The handler receives
+   * the parsed body and answers an object; it throws to be reported, with a
+   * `status` when the request itself was wrong.
+   */
+  async function panelEndpoint(req, res, { name, handle }) {
+    if (!originAcceptable(req)) {
+      logger(
+        `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
+          `for the ${name} endpoint`,
+      );
+      res.writeHead(403, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Forbidden");
+      return;
+    }
+    if (!pageOwner) {
+      // Unreachable through classifyRoute, which only answers for these routes
+      // when the panel is on. Kept because it is the honest answer if that ever
+      // changes.
+      res.writeHead(503, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("The browser panel is off");
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { allow: "POST", "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("Method not allowed");
+      return;
+    }
+
+    let answer;
+    try {
+      answer = await handle(await readJson(req, maxBodyBytes));
+    } catch (error) {
+      // 502 by default: the gateway is fine, the browser it was asked to drive is
+      // not. The panel shows the message, which is the only diagnostic the
+      // operator gets.
+      logger(`[${name}] ${req.method} failed: ${error.message}`);
+      res.writeHead(Number.isInteger(error.status) ? error.status : 502, {
+        "content-type": "text/plain",
+        "cache-control": "no-store",
+      });
+      res.end(error.message);
+      return;
+    }
+
+    const payload = Buffer.from(JSON.stringify(answer ?? {}), "utf8");
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": payload.length,
+      "cache-control": "no-store",
+    });
+    res.end(payload);
+  }
+
   /**
    * The resolution the panel asks for (issue #9).
    *
@@ -628,65 +693,52 @@ export async function createGateway({
    *   pane find the state intact;
    * - `release` stops forcing a target the panel has moved away from, without
    *   touching that page: it keeps whatever size it has.
-   *
-   * Same rules as the rest of the browser routes: behind the session, and only
-   * for this gateway's own frontend, so a page served by another service on the
-   * same machine cannot resize the browser the agent is working in.
    */
-  async function serveViewport(req, res) {
-    if (!originAcceptable(req)) {
-      logger(
-        `[auth] refusing a browser request with a foreign Origin: ${JSON.stringify(req.headers.origin)} ` +
-          `for the viewport endpoint`,
-      );
-      res.writeHead(403, { "content-type": "text/plain", "cache-control": "no-store" });
-      res.end("Forbidden");
-      return;
-    }
-    if (!viewport) {
-      // Unreachable through classifyRoute, which only answers "viewport" when the
-      // panel is on. Kept because it is the honest answer if that ever changes.
-      res.writeHead(503, { "content-type": "text/plain", "cache-control": "no-store" });
-      res.end("The browser panel is off");
-      return;
-    }
-    if (req.method !== "POST") {
-      res.writeHead(405, { allow: "POST", "content-type": "text/plain", "cache-control": "no-store" });
-      res.end("Method not allowed");
-      return;
-    }
-
-    let answer;
-    try {
-      const body = await readJson(req, maxBodyBytes);
-      const targetId = typeof body.targetId === "string" && body.targetId !== "" ? body.targetId : null;
-      if (body.mode === "apply") {
-        answer = await viewport.apply({ targetId, width: body.width, height: body.height });
-      } else if (body.mode === "attach") {
-        answer = await viewport.attach({ targetId });
-      } else if (body.mode === "release") {
-        answer = viewport.release({ targetId });
-      } else {
-        res.writeHead(400, { "content-type": "text/plain", "cache-control": "no-store" });
-        res.end("Unknown mode");
-        return;
-      }
-    } catch (error) {
-      // 502: the gateway is fine, the browser it was asked to drive is not. The
-      // panel shows the message, which is the only diagnostic the operator gets.
-      logger(`[viewport] ${req.method} failed: ${error.message}`);
-      res.writeHead(502, { "content-type": "text/plain", "cache-control": "no-store" });
-      res.end(error.message);
-      return;
-    }
-
-    const payload = Buffer.from(JSON.stringify(answer ?? {}), "utf8");
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "content-length": payload.length,
-      "cache-control": "no-store",
+  function serveViewport(req, res) {
+    return panelEndpoint(req, res, {
+      name: "viewport",
+      handle: (body) => {
+        const targetId = typeof body.targetId === "string" && body.targetId !== "" ? body.targetId : null;
+        if (body.mode === "apply") {
+          return pageOwner.apply({ targetId, width: body.width, height: body.height });
+        }
+        if (body.mode === "attach") {
+          return pageOwner.attach({ targetId });
+        }
+        if (body.mode === "release") {
+          return pageOwner.release({ targetId });
+        }
+        throw httpError(400, `unknown viewport mode: ${JSON.stringify(body.mode)}`);
+      },
     });
-    res.end(payload);
+  }
+
+  /**
+   * The page the panel drives: its address bar, and the three history buttons.
+   *
+   * The address is validated here rather than in the owner, so a typo answers 400
+   * with the sentence the panel shows, while a browser that fails to load a valid
+   * address answers 502. `absoluteHttpUrl` is the same function the owner checks
+   * with, so the two cannot disagree about what an address is.
+   */
+  function servePage(req, res) {
+    return panelEndpoint(req, res, {
+      name: "page",
+      handle: (body) => {
+        const targetId = typeof body.targetId === "string" && body.targetId !== "" ? body.targetId : null;
+        if (body.mode === "navigate") {
+          const url = absoluteHttpUrl(body.url);
+          if (url === null) {
+            throw httpError(400, "only http and https addresses can be opened in the panel");
+          }
+          return pageOwner.navigate({ targetId, url });
+        }
+        if (body.mode === "back" || body.mode === "forward" || body.mode === "reload") {
+          return pageOwner.history({ targetId, direction: body.mode });
+        }
+        throw httpError(400, `unknown page mode: ${JSON.stringify(body.mode)}`);
+      },
+    });
   }
 
   /**
@@ -797,8 +849,8 @@ export async function createGateway({
 
     const url = requestUrl(req);
     const route = classifyRoute(url.pathname, { browserEnabled });
-    if (route === "panel" || route === "viewport") {
-      // Neither is a socket: the panel is a page, and the viewport endpoint is
+    if (route === "panel" || route === "viewport" || route === "page") {
+      // None is a socket: the panel is a page, and the other two endpoints are
       // plain JSON. There is nothing at those paths to upgrade to, and they must
       // not fall through to the application either.
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -924,6 +976,10 @@ export async function createGateway({
         await serveViewport(req, res);
         return;
       }
+      if (route === "page") {
+        await servePage(req, res);
+        return;
+      }
       if (route === "browser") {
         proxyBrowser(req, res, url);
         return;
@@ -992,7 +1048,7 @@ export async function createGateway({
         // The viewport owner holds a connection of its own: closing it detaches
         // from the browser and leaves Chromium running, which is the runtime's
         // browser, not the gateway's.
-        viewport?.close().catch((error) => logger(`[viewport] closing failed: ${error.message}`));
+        pageOwner?.close().catch((error) => logger(`[viewport] closing failed: ${error.message}`));
       }),
   };
 }
