@@ -848,10 +848,10 @@ carries today.
   the DevTools button), and on one started with `ZCLOUDIUM_BROWSER_PANEL=off`
   (21 passed, the 5 panel specs skipped with a reason). Those two runs were made by
   hand on this machine, with the same container flags the compose files use. The
-  e2e workflow is configured to run the same suite twice on every push, in two
-  parallel jobs, one per position of the switch, each asking for its position
-  explicitly; that part is configuration here and has not been observed green on
-  the runner yet.
+  e2e workflow runs the same suite twice on every push, in two parallel jobs, one
+  per position of the switch, each asking for its position explicitly, and both
+  jobs were observed green on the runner with this release
+  (`playwright` and `playwright-panel`, 7m6s and 7m7s).
 
 ## Implementation details
 
