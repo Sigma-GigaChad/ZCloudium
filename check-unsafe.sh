@@ -9,37 +9,53 @@
 # probes are read-only against the machine, and the package installation is a
 # SIMULATION (apt-get -s), so nothing is installed anywhere.
 #
-# The container is started the way the compose file starts it: the image's own
-# entrypoint, with the home, the data directory and the workspace given through
-# the environment. Probe 1 reads the workspace back from the running runtime and
-# the script fails when that workspace is not the mounted home: without
-# ZCODE_SERVER_WORKSPACE (or with a leftover `command:` block, which the
-# entrypoint ignores) the runtime falls back to the image default /workspace,
-# which is not mounted on this profile and dies with the container.
+# The container is started from what compose.unsafe.yml declares, not from
+# literals in this script: the file is parsed with `docker compose config`,
+# HOME/ZCODE_DATA_BASE_DIR/ZCODE_SERVER_WORKSPACE are extracted, and the
+# runtime is asked to report its own workspace back. The script fails when
+# the file drifts (a leftover command: block, or the three paths missing or
+# disagreeing), before any container is started.
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-ghcr.io/sigma-gigachad/z-cloudium:latest}"
-FAKE_HOME="/tmp/zcloudium-unsafe-home"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/check-compose-coherence.sh
+source "${SCRIPT_DIR}/lib/check-compose-coherence.sh"
+
+COMPOSE_FILE="${SCRIPT_DIR}/compose.unsafe.yml"
+assert_compose_profile "$COMPOSE_FILE" || exit 1
+
+FAKE_HOME_DIR="/tmp/zcloudium-unsafe-home"
+
 ## The runtime, on loopback while the gateway holds the published port. Its own
 ## answer is what proves which directory it was given as the workspace.
 RUNTIME_INFO_URL="http://127.0.0.1:3131/api/server-info"
 
-mkdir -p "${FAKE_HOME}/.zcode"
-echo "unsafe check" > "${FAKE_HOME}/.zcode/marker"
+mkdir -p "${FAKE_HOME_DIR}/.zcode"
+echo "unsafe check" > "${FAKE_HOME_DIR}/.zcode/marker"
 
-echo "==> Starting a throwaway container with the unsafe profile settings"
-echo "    (real entrypoint, no command block, workspace from the environment)"
+## Map the file's declared home (/host/home/delta in the file) to the throwaway
+## directory on the real machine, so the probes read what the script wrote
+## without editing the file. The key is that ZCODE_SERVER_WORKSPACE is passed
+## as the file declares it, pointing at /host/<declared-path>, and we bind the
+## declared path to our throwaway directory.
+DECLARED_HOME="${COMPOSE_HOME#/host}"
+mkdir -p "$(dirname "${DECLARED_HOME}")" 2>/dev/null || true
+
+echo
+echo "==> Starting a throwaway container from what '$COMPOSE_FILE' declares"
+echo "    (image: ${COMPOSE_IMAGE}, workspace: ${COMPOSE_WORKSPACE})"
 CONTAINER=$(docker run -d --rm \
   --user root \
   --privileged \
   --pid host \
   -v /:/host \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -e "HOME=/host${FAKE_HOME}" \
-  -e "ZCODE_DATA_BASE_DIR=/host${FAKE_HOME}" \
-  -e "ZCODE_SERVER_WORKSPACE=/host${FAKE_HOME}" \
-  "$IMAGE")
+  -v "${FAKE_HOME_DIR}:${DECLARED_HOME}" \
+  -e "HOME=${COMPOSE_HOME}" \
+  -e "ZCODE_DATA_BASE_DIR=${COMPOSE_HOME}" \
+  -e "ZCODE_SERVER_WORKSPACE=${COMPOSE_WORKSPACE}" \
+  "${COMPOSE_IMAGE}")
 
 trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1 || true' EXIT
 
@@ -57,14 +73,14 @@ for attempt in $(seq 1 90); do
 done
 
 WORKSPACE_OK=0
-echo -n "1. workspace the runtime reports, with the real entrypoint: "
-if [ "$REPORTED" = "/host${FAKE_HOME}" ]; then
+echo -n "1. workspace the runtime reports matches what the file declares: "
+if [ "$REPORTED" = "$COMPOSE_WORKSPACE" ]; then
   echo "OK ($REPORTED)"
   WORKSPACE_OK=1
 elif [ -z "$REPORTED" ]; then
   echo "FAIL (nothing answered on ${RUNTIME_INFO_URL} inside the container)"
 else
-  echo "FAIL (reports '$REPORTED' instead of /host${FAKE_HOME}: the agent would work outside the machine's home)"
+  echo "FAIL (reports '$REPORTED' instead of '$COMPOSE_WORKSPACE': the agent would work outside the declared workspace)"
 fi
 
 echo -n "2. /host/etc/shadow readable (root on the mounted FS): "
@@ -124,7 +140,7 @@ else
 fi
 
 echo -n "7. home visible through the mount: "
-if exec_in sh -c "ls '/host${FAKE_HOME}/.zcode'" >/dev/null 2>&1; then
+if exec_in sh -c "ls '${DECLARED_HOME}/.zcode'" >/dev/null 2>&1; then
   echo "OK"
 else
   echo "REFUSED"
