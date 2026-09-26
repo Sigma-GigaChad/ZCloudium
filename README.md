@@ -702,7 +702,7 @@ from the run that made them: where one names a version, that is the version it
 was measured on, while `zcode.version` and `chromium.version` are what a build
 carries today.
 
-- **test suite**: 198 tests, 198 pass, 0 fail, in a throwaway container
+- **test suite**: 203 tests, 203 pass, 0 fail, in a throwaway container
   (`node:24.14.0-bookworm-slim`, `node --test`, which prints the count and
   exits on its own)
 - **image build**: 1.38 GB, and the image agrees with its own tag: the runtime
@@ -842,15 +842,16 @@ carries today.
   refused, which is the behaviour before this change
 - **end to end, both positions of the panel switch**, against the image: the suite
   passes on a container started with no environment variable at all, which is the
-  default position (25 passed, including the four panel specs: the session
+  default position (26 passed, including the five panel specs: the session
   requirement including the upgrade, the viewport control measured from the page,
-  the detach and reattach continuity, and the DevTools button), and on one started
-  with `ZCLOUDIUM_BROWSER_PANEL=off` (21 passed, the 4 panel specs skipped with a
-  reason). Those two runs were made by hand on this machine, with the same
-  container flags the compose files use. The e2e workflow is configured to run the
-  same suite twice on every push, in two parallel jobs, one per position of the
-  switch, each asking for its position explicitly; that part is configuration here
-  and has not been observed green on the runner yet.
+  the detach and reattach continuity, the address bar with the history buttons, and
+  the DevTools button), and on one started with `ZCLOUDIUM_BROWSER_PANEL=off`
+  (21 passed, the 5 panel specs skipped with a reason). Those two runs were made by
+  hand on this machine, with the same container flags the compose files use. The
+  e2e workflow is configured to run the same suite twice on every push, in two
+  parallel jobs, one per position of the switch, each asking for its position
+  explicitly; that part is configuration here and has not been observed green on
+  the runner yet.
 
 ## Implementation details
 
