@@ -160,6 +160,21 @@ jobs:
             console.log("browser MCP configured:", entry.command, entry.args.join(" "));
           '
 
+      # The panel is on in the image by default, and a default is a claim. The
+      # container above was started with no environment variable at all, so this
+      # is the default position: one browser for the agent and the operator, and
+      # the panel behind the session.
+      - name: Check that the browser panel is on by default, behind the session
+        run: |
+          docker logs smoke 2>&1 | grep -q "browser panel: the agent attaches to" || {
+            echo "the container started with no environment variable did not start the browser for the panel" >&2
+            docker logs smoke >&2
+            exit 1
+          }
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3030/_browser/)"
+          test "$code" = "302"
+          echo "GET /_browser/ -> ${code}, which is the sign in page: the panel is behind the session"
+
       - name: Cleanup
         if: always()
         run: |

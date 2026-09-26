@@ -68,10 +68,12 @@ services:
       ZCLOUDIUM_BROWSER_MCP: "on"
       # The browser panel: the agent's browser with a live view, a viewport
       # control, and the keyboard and the mouse, served on /_browser/ behind
-      # this session. Off by default: with it off nothing observable changes and
-      # no browser is started for the panel. Whoever holds a session then holds
+      # this session. On by default, because that browser is the point of the web
+      # build; "off" restores the previous shape, where no browser is started for
+      # the panel and nothing observable changes. Whoever holds a session holds
       # that browser, sessions and cookies included, so read the panel section of
-      # SECURITY.md before turning it on. It also needs ZCLOUDIUM_BROWSER_MCP.
+      # SECURITY.md before exposing this port to anyone else. It also needs
+      # ZCLOUDIUM_BROWSER_MCP.
       # ZCLOUDIUM_BROWSER_PANEL: "off"
       # How long a session lasts, in hours. 12 by default, which is also the
       # window during which a stolen cookie stays usable: raise it only with

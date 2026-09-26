@@ -17,6 +17,11 @@
 # panel off. Nothing else about the container changes, so one suite covers both
 # positions of the switch.
 #
+# The switch is passed in both cases, on and off, because the image runs the panel
+# on by default: a run that wants the off position has to ask for it, and that is
+# what keeps the two CI jobs on two known positions rather than on whatever the
+# image defaults to on the day it is built.
+#
 # The hardening flags are the ones the compose files use and are not weakened
 # here: read-only root filesystem, a tmpfs for /tmp, no new privileges, no
 # capability, and the port published on loopback only.
@@ -49,8 +54,8 @@ if [ "$E2E_PANEL" = "on" ]; then
   # empty value adds nothing at all.
   PANEL_ARGS="-e ZCLOUDIUM_BROWSER_PANEL=on"
 else
-  echo "==> Starting $CONTAINER from $IMAGE on 127.0.0.1:$PORT"
-  PANEL_ARGS=""
+  echo "==> Starting $CONTAINER from $IMAGE on 127.0.0.1:$PORT, browser panel off"
+  PANEL_ARGS="-e ZCLOUDIUM_BROWSER_PANEL=off"
 fi
 docker run -d \
   --name "$CONTAINER" \

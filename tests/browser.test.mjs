@@ -92,16 +92,19 @@ test("the launch arguments refuse to run without a profile directory", () => {
   }
 });
 
-test("ZCLOUDIUM_BROWSER_PANEL is off unless it is explicitly asked for", () => {
-  assert.equal(parseBrowserPanel(undefined), false, "the default is off: with the switch off nothing must change");
-  assert.equal(parseBrowserPanel(null), false);
-  assert.equal(parseBrowserPanel(""), false);
-  assert.equal(parseBrowserPanel("   "), false);
-  for (const value of ["off", "OFF", "0", "false", "no", "disabled", "onward"]) {
-    assert.equal(parseBrowserPanel(value), false, `"${value}" must keep the panel off`);
+test("ZCLOUDIUM_BROWSER_PANEL is on unless it is explicitly turned off", () => {
+  assert.equal(parseBrowserPanel(undefined), true, "the default is on: the browser is the point of the tool");
+  assert.equal(parseBrowserPanel(null), true);
+  assert.equal(parseBrowserPanel(""), true);
+  assert.equal(parseBrowserPanel("   "), true);
+  // An unclear value keeps the default rather than taking the feature away by
+  // accident, which is the rule the browser MCP switch already follows.
+  assert.equal(parseBrowserPanel("onward"), true);
+  for (const value of ["off", "OFF", " off ", "0", "false", "no", "disabled"]) {
+    assert.equal(parseBrowserPanel(value), false, `"${value}" must turn the panel off`);
   }
   for (const value of ["on", "ON", " on ", "true", "TRUE", "1", "yes"]) {
-    assert.equal(parseBrowserPanel(value), true, `"${value}" must turn the panel on`);
+    assert.equal(parseBrowserPanel(value), true, `"${value}" must keep the panel on`);
   }
 });
 

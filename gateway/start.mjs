@@ -247,11 +247,12 @@ export async function start({
   // Before the runtime starts, so that it reads a configuration that already
   // contains the browser server instead of writing its own state over it.
   //
-  // Phase 0 of issue #5: when the panel is on, the container launches one
-  // Chromium with a debug port on loopback first, and the agent's MCP server
-  // attaches to it instead of launching its own browser. Off by default: without
-  // ZCLOUDIUM_BROWSER_PANEL nothing here runs, the entry keeps the shape the
-  // image shipped before, and the gateway is not told about a debug port.
+  // Phase 0 of issue #5: the container launches one Chromium with a debug port on
+  // loopback first, and the agent's MCP server attaches to it instead of launching
+  // its own browser. On by default, because that browser and the panel that
+  // watches it are the point of the tool: ZCLOUDIUM_BROWSER_PANEL=off restores the
+  // shape the image shipped before, with nothing here running and no debug port
+  // announced to the gateway.
   const debugUrl = browserDebugUrl(config.browserDebugPort);
   let browser = null;
   let browserStop = null;
@@ -275,7 +276,7 @@ export async function start({
     // The panel is the agent's browser made visible. With no browser MCP server
     // there is no agent browser, so a browser here would be a stray process.
     logger(
-      "[start] browser panel requested but the browser MCP server is off (ZCLOUDIUM_BROWSER_MCP=off): no browser is " +
+      "[start] the browser panel is on but the browser MCP server is off (ZCLOUDIUM_BROWSER_MCP=off): no browser is " +
         "started, because nothing would drive it",
     );
   } else if (config.browserPanel) {
@@ -329,7 +330,7 @@ export async function start({
     }
   } else {
     logger(
-      "[start] browser panel off (ZCLOUDIUM_BROWSER_PANEL is not on): the agent launches its own headless browser",
+      "[start] the browser panel is off (ZCLOUDIUM_BROWSER_PANEL=off): the agent launches its own headless browser",
     );
   }
 

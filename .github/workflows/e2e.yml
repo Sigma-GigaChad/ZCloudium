@@ -33,6 +33,11 @@ jobs:
   playwright:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The panel is on in the image by default, so this job asks for the position
+    # it covers rather than inheriting whatever the image defaults to: off here,
+    # on in the job below.
+    env:
+      E2E_PANEL: "off"
     steps:
       - uses: actions/checkout@v7
 

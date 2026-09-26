@@ -41,7 +41,7 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
   assert.deepEqual(parseEnv({}), {
     authEnabled: true,
     browserMcp: true,
-    browserPanel: false,
+    browserPanel: true,
     browserDebugPort: 9222,
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
@@ -134,13 +134,17 @@ test("ZCLOUDIUM_BROWSER_MCP defaults to on and is only off when explicitly set",
   }
 });
 
-test("ZCLOUDIUM_BROWSER_PANEL is off by default and takes its port from the environment", () => {
-  assert.equal(parseEnv({}).browserPanel, false, "the whole Phase 0 path is off unless it is asked for");
+test("ZCLOUDIUM_BROWSER_PANEL is on by default and takes its port from the environment", () => {
+  assert.equal(parseEnv({}).browserPanel, true, "the whole path is on: the browser is what the web build is for");
   assert.equal(parseEnv({}).browserDebugPort, 9222);
   for (const value of ["on", "true", "1", "yes", " ON "]) {
     assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_PANEL: value }).browserPanel, true, `"${value}"`);
   }
-  for (const value of ["off", "0", "no", "", "maybe"]) {
+  // An unclear value keeps the default, so a typo cannot take the browser away.
+  for (const value of ["maybe", ""]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_PANEL: value }).browserPanel, true, `"${value}"`);
+  }
+  for (const value of ["off", "0", "no", "false"]) {
     assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_PANEL: value }).browserPanel, false, `"${value}"`);
   }
   assert.equal(parseEnv({ ZCLOUDIUM_BROWSER_DEBUG_PORT: "9333" }).browserDebugPort, 9333);
@@ -241,9 +245,11 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 /**
  * Wires start() with stubs and returns everything the assertions need.
  *
- * `browser` is the fake browser process the entrypoint is expected to launch
- * when the panel is on; `probe` answers for the debug port, so the fallback can
- * be exercised without a browser.
+ * `browser` is the fake browser process the entrypoint launches, and it has a
+ * default because the default environment launches one: the panel is on unless
+ * it is turned off, so a test that wants no browser at all says so in its own
+ * environment. `probe` answers for the debug port, so the fallback can be
+ * exercised without a browser.
  */
 async function runStart(
   env,
@@ -251,7 +257,7 @@ async function runStart(
     gateway = null,
     mcp = async () => ({ status: "unchanged" }),
     argv = ["node", "/opt/cloudium/gateway/start.mjs"],
-    browser = null,
+    browser = fakeBrowser(),
     probe = async () => ({ reachable: true, version: { Browser: "Chrome/153.0.8010.52" } }),
     prepare = async () => ({ status: "no-lock" }),
   } = {},
@@ -297,9 +303,6 @@ async function runStart(
     },
     launchBrowserFn: (options) => {
       browserSpawns.push(options);
-      if (!browser) {
-        throw new Error("the panel was not expected to launch a browser");
-      }
       return browser;
     },
     probeBrowserFn: async (options) => {
@@ -338,8 +341,11 @@ function fakeBrowser() {
 
 test("with the gateway on, the runtime is spawned on loopback and the gateway starts in front", async () => {
   const closed = [];
+  // The browser is not this test's subject, and it is on by default: pinning it
+  // off keeps the comparison on the runtime and gateway wiring, which is what the
+  // deep equal below is about. The panel's own defaults are asserted above.
   const { result, child, spawns, signals, exits, gatewayCalls, logs } = await runStart(
-    { HOME: "/data" },
+    { HOME: "/data", ZCLOUDIUM_BROWSER_PANEL: "off" },
     { gateway: { port: PUBLISHED_PORT, close: async () => closed.push(true) } },
   );
 
@@ -519,7 +525,12 @@ test("a thrown error while merging is caught and does not prevent the startup", 
  */
 
 test("with the panel off, no browser is launched and the gateway knows nothing about one", async () => {
-  const { browserSpawns, browserStops, probes, gatewayCalls, mcpCalls, logs } = await runStart({ HOME: "/data" });
+  // The switch is the whole point of this test: the panel is on by default now,
+  // so the off position is asked for, not implied.
+  const { browserSpawns, browserStops, probes, gatewayCalls, mcpCalls, logs } = await runStart({
+    HOME: "/data",
+    ZCLOUDIUM_BROWSER_PANEL: "off",
+  });
   assert.deepEqual(browserSpawns, [], "no browser may be started");
   assert.deepEqual(browserStops, []);
   assert.deepEqual(probes, [], "no port may be probed");
@@ -530,7 +541,7 @@ test("with the panel off, no browser is launched and the gateway knows nothing a
     "with the panel off the entry is exactly the one the image shipped before, launch arguments and all",
   );
   assert.equal(
-    logs.some((line) => /browser panel/i.test(line)),
+    logs.some((line) => /browser panel is off/i.test(line)),
     true,
     `the off state has to be stated, got ${JSON.stringify(logs)}`,
   );

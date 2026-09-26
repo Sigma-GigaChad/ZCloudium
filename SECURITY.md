@@ -240,9 +240,10 @@ exercise. Keep that machine disposable.
 
 ## The browser panel
 
-`ZCLOUDIUM_BROWSER_PANEL=on` serves `/_browser/` behind the session: a live view of
-the browser the agent drives, a viewport control, and the keyboard and the mouse.
-Stated plainly, without softening it:
+The browser panel serves `/_browser/` behind the session: a live view of the
+browser the agent drives, a viewport control, and the keyboard and the mouse. It
+is on by default, and `ZCLOUDIUM_BROWSER_PANEL=off` turns it off. Stated plainly,
+without softening it:
 
 **It hands the agent's browser, with its logged in sessions, to whoever holds a
 session.** Not a picture of it: the page itself, its cookies, its open
@@ -253,8 +254,13 @@ the browser adds no new class of power there; on the restricted profile it is th
 first capability that reaches outwards with the agent's own credentials rather
 than through a shell the agent would have to be asked to run.
 
-**Off by default, and off means unchanged.** No browser is started for the panel,
-`/_browser/...` is ordinary application traffic, and the build refuses nothing:
+**On by default because it is the tool, and one variable turns it off.** The
+browser the agent drives, and the panel that watches it, are the point of the web
+build rather than an option, so a deployment that exposes this port to anyone but
+its operator should say `ZCLOUDIUM_BROWSER_PANEL=off` (both compose files carry
+the line, commented) and keep the session as the only thing standing between a
+stranger and the agent's browser. With it off no browser is started for the panel,
+`/_browser/...` is ordinary application traffic, and nothing observable changes:
 the same image carries the same Chromium and the same gateway either way. The
 switch decides whether the entrypoint starts a browser, whether the agent's MCP
 entry attaches to it instead of launching its own, and whether the gateway knows
@@ -406,10 +412,10 @@ Read this before launching the full access profile.
 - Leave `ZCLOUDIUM_TRUST_PROXY` off unless a reverse proxy you control overwrites
   `x-forwarded-for`, and remember that with it off every client behind the same
   last hop shares one block.
-- Turn `ZCLOUDIUM_BROWSER_PANEL` on only where the session is as protected as the
-  browser it exposes: it makes a stolen cookie worth the agent's logged in
-  sessions, and behind a TLS terminating proxy it needs
-  `ZCLOUDIUM_TRUST_PROXY=on` to accept the panel's own frontend.
+- Keep `ZCLOUDIUM_BROWSER_PANEL` on only where the session is as protected as the
+  browser it exposes, and turn it off where it is not: it makes a stolen cookie
+  worth the agent's logged in sessions, and behind a TLS terminating proxy it
+  needs `ZCLOUDIUM_TRUST_PROXY=on` to accept the panel's own frontend.
 - Mount `docker.sock` only if the agent must drive containers, and knowing that
   it is equivalent to root on the host.
 - Put TLS in front of the port if the network is not fully trusted: the gateway

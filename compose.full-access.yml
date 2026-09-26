@@ -85,10 +85,11 @@ services:
       ZCLOUDIUM_BROWSER_MCP: "on"
       # The browser panel: the agent's browser with a live view, a viewport
       # control, and the keyboard and the mouse, served on /_browser/ behind this
-      # session. Off by default. On this profile the browser profile lands in the
+      # session. On by default. On this profile the browser profile lands in the
       # home of the machine, in ~/browser-profile, next to the agent's own
       # state, and a stolen session then reaches the sessions that profile holds.
-      # Read the panel section of SECURITY.md before turning it on.
+      # Read the panel section of SECURITY.md, and turn it off here with "off" if
+      # this machine is shared.
       # ZCLOUDIUM_BROWSER_PANEL: "off"
       # How long a session lasts, in hours. 12 by default, which is also the
       # window during which a stolen cookie stays usable: on this profile that

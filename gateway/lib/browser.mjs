@@ -15,8 +15,9 @@
  *     authenticated operator opens the real DevTools frontend against the
  *     agent's page (the route and rewriting helpers here).
  *
- * Nothing in this module knows about the application, and none of it is on
- * unless `ZCLOUDIUM_BROWSER_PANEL` asks for it.
+ * Nothing in this module knows about the application. All of it is on by
+ * default, and `ZCLOUDIUM_BROWSER_PANEL=off` is what restores the shape the image
+ * shipped before this module existed.
  */
 
 import { spawn } from "node:child_process";
@@ -57,6 +58,9 @@ export const BROWSER_PROBE_INTERVAL_MS = 250;
 
 /** Values that turn a switch on. Anything else keeps the safe default. */
 export const SWITCH_ON = ["on", "true", "1", "yes"];
+
+/** Values that turn off a switch whose default is on. */
+export const SWITCH_OFF = ["off", "false", "0", "no", "disabled"];
 
 export function browserProfileDir(dataDir, name = BROWSER_PROFILE_NAME) {
   return join(dataDir, name);
@@ -101,12 +105,21 @@ export function browserArgs({ port = BROWSER_DEBUG_PORT, userDataDir, address = 
   ];
 }
 
-/** Whether the panel was asked for. Off by default, and off on anything unclear. */
+/**
+ * Whether the browser panel runs.
+ *
+ * On unless it is explicitly turned off. That is the position the tool was asked
+ * for: the browser the agent drives, and the panel that watches it, are the point
+ * of the web build rather than an option, and a deployment that wants the
+ * previous shape says so with one environment variable. An unclear value keeps the
+ * default, the same way the browser MCP switch does, so a typo cannot silently
+ * take the feature away.
+ */
 export function parseBrowserPanel(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return false;
+    return true;
   }
-  return SWITCH_ON.includes(String(raw).trim().toLowerCase());
+  return !SWITCH_OFF.includes(String(raw).trim().toLowerCase());
 }
 
 /** A TCP port, or the default. A typo must not produce a browser nobody can reach. */

@@ -305,13 +305,13 @@ is what makes the web build usable for the workflows that need a human in the
 loop, and it is the one thing a screen stream could not give (a viewport control
 without giving up the view, see below).
 
-`ZCLOUDIUM_BROWSER_PANEL=on` (off by default) makes the entrypoint start one
-Chromium in the container, attach the agent's MCP server to it, and serve the
-panel from the gateway. Both sides then drive **one single page**: your clicks and
-its actions land in the same browser, and neither blocks the other. With the
-switch off nothing observable changes: no browser is started, the MCP entry keeps
-the shape the image shipped before, and `/_browser/...` is ordinary application
-traffic.
+The panel is on by default, which is the position the tool was asked for: the
+entrypoint starts one Chromium in the container, attaches the agent's MCP server
+to it, and serves the panel from the gateway. Both sides then drive **one single
+page**: your clicks and its actions land in the same browser, and neither blocks
+the other. `ZCLOUDIUM_BROWSER_PANEL=off` restores the shape the image shipped
+before: no browser is started, the MCP entry keeps its launch arguments, and
+`/_browser/...` is ordinary application traffic.
 
 Open `http://<host>:3030/_browser/` after signing in. It is behind the same
 session as everything else, and the WebSocket it opens is refused without one.
@@ -408,15 +408,15 @@ The profile, with the agent's cookies and logins, is written to
   real home, so the profile lands in **your own `~/browser-profile`** (inside the
   container, `/host/home/<user>/browser-profile`).
 
-That directory belongs to the panel and is written only while the panel is on.
-With `ZCLOUDIUM_BROWSER_PANEL=off` the agent's MCP server launches its own browser
-with `--isolated` (the entry at the top of this section): a throwaway profile under
-the container's temporary directory, so nothing is written to
-`<ZCODE_DATA_BASE_DIR>/browser-profile` and no login outlives that browser process.
-With the panel on, the one container browser keeps its cookies and logins in that
-directory across restarts of the container, and the panel shows that same browser,
-so what it displays is the state accumulated there since the panel was first turned
-on.
+That directory belongs to the panel and is written only while the panel is on,
+which is the default. With `ZCLOUDIUM_BROWSER_PANEL=off` the agent's MCP server
+launches its own browser with `--isolated` (the entry at the top of this section):
+a throwaway profile under the container's temporary directory, so nothing is
+written to `<ZCODE_DATA_BASE_DIR>/browser-profile` and no login outlives that
+browser process. With the panel on, the one container browser keeps its cookies
+and logins in that directory across restarts of the container, and the panel shows
+that same browser, so what it displays is the state accumulated there since the
+container was first started.
 
 A container that was killed rather than stopped leaves Chromium's `SingletonLock`
 in that directory, pointing at the old machine name, and Chromium then refuses to
@@ -670,7 +670,7 @@ from the run that made them: where one names a version, that is the version it
 was measured on, while `zcode.version` and `chromium.version` are what a build
 carries today.
 
-- **test suite**: 185 tests, 185 pass, 0 fail, in a throwaway container
+- **test suite**: 198 tests, 198 pass, 0 fail, in a throwaway container
   (`node:24.14.0-bookworm-slim`, `node --test`, which prints the count and
   exits on its own)
 - **image build**: 1.38 GB, and the image agrees with its own tag: the runtime
@@ -769,7 +769,7 @@ carries today.
   container whose logs show the gateway on the published port and the runtime
   confined to loopback, and `GET /` answers `302` to the sign in page
 - **browser panel, in a real browser, against a real container**
-  (`ZCLOUDIUM_BROWSER_PANEL=on`, hardening on, read-only root filesystem): the
+  (panel on, which is the default, hardening on, read-only root filesystem): the
   panel is served at `/_browser/` behind the session; it painted a first frame
   about 900 ms after opening and adopted the size the page was already at; the
   viewport fields applied `640x480` and the page itself reported
@@ -809,13 +809,15 @@ carries today.
   name or port is still refused with 403; with the flag off the `https` Origin is
   refused, which is the behaviour before this change
 - **end to end, both positions of the panel switch**, against the image: the suite
-  passes with the panel off (21 passed, the 4 panel specs skipped with a reason)
-  and with the panel on (25 passed, including the four panel specs: the session
+  passes on a container started with no environment variable at all, which is the
+  default position (25 passed, including the four panel specs: the session
   requirement including the upgrade, the viewport control measured from the page,
-  the detach and reattach continuity, and the DevTools button). Those two runs were
-  made by hand on this machine, with `run-e2e.sh` as the README documents it. The
-  e2e workflow is configured to run the same suite twice on every push, in two
-  parallel jobs, one per position of the switch; that part is configuration here
+  the detach and reattach continuity, and the DevTools button), and on one started
+  with `ZCLOUDIUM_BROWSER_PANEL=off` (21 passed, the 4 panel specs skipped with a
+  reason). Those two runs were made by hand on this machine, with the same
+  container flags the compose files use. The e2e workflow is configured to run the
+  same suite twice on every push, in two parallel jobs, one per position of the
+  switch, each asking for its position explicitly; that part is configuration here
   and has not been observed green on the runner yet.
 
 ## Implementation details
