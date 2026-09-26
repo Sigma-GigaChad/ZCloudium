@@ -96,6 +96,8 @@ async function withGateway(run, options = {}) {
     await gateway.close();
     upstream.destroy();
     await new Promise((resolve) => upstream.server.close(resolve));
+    // Regression guard (issue #7): the upstream server must not survive either.
+    assert.equal(upstream.server.listening, false, "the upstream stub must not survive its test (issue #7 leak guard)");
     await rm(dataDir, { recursive: true, force: true });
   }
 }
@@ -716,6 +718,7 @@ async function startDebugStub() {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = server.address().port;
   return {
+    server,
     url: `http://127.0.0.1:${port}`,
     authority: `127.0.0.1:${port}`,
     requests,
@@ -735,6 +738,13 @@ async function withPanelGateway(run, options = {}) {
     await withGateway((context) => run({ ...context, debug }), { debugUrl: debug.url, ...options });
   } finally {
     debug.destroy();
+    // The sockets-only destroy above is not enough: server.close() is what
+    // releases the listener, and leaking it kept node --test alive forever
+    // (issue #7). This mirrors the upstream stub's teardown in withGateway.
+    await new Promise((resolve) => debug.server.close(resolve));
+    // Regression guard for issue #7: if this ever fires, the teardown above
+    // has regressed and a listening server survives the test.
+    assert.equal(debug.server.listening, false, "the debug stub must not survive its test (issue #7 leak guard)");
   }
 }
 
