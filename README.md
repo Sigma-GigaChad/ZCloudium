@@ -356,6 +356,37 @@ panel is:
   picker exists because it has an IPC channel into the conversation; this page has
   none, so a picker here would copy what DevTools already does properly.
 
+### The one script the gateway adds to the application
+
+Attaching a file fails with `fault.attachment.checksumUnavailable` on any origin
+that is not a secure context, which means every plain `http://` address except
+`localhost`. The client hashes the attachment before uploading it
+(`crypto.subtle.digest("SHA-256", ...)`) and refuses to go on when `crypto.subtle`
+is absent, and browsers only provide it over https or on localhost. Nothing in the
+runtime is wrong: it is the platform's rule meeting the deployment this README
+recommends, a container reached over a LAN or a VPN address.
+
+So the gateway supplies the missing piece: it appends one script block to the
+application's document as it proxies it. The script does nothing when
+`crypto.subtle` exists, which covers every https origin and `localhost`, and
+otherwise defines `digest` for SHA-256, the only method the bundle uses. Its hash
+is checked against Node's own implementation in `tests/app-script.test.mjs`, on the
+empty message, the padding boundary, several blocks and non-ASCII bytes: a wrong
+hash would be worse than the fault it replaces.
+
+This is the only place the gateway edits the application's own code, and it is
+additive: the document the runtime sends is what the browser receives, plus a
+block before `</body>`. The document is asked for uncompressed so the edit is
+possible, and only when the request is for a document: an asset, an API answer or
+a request that does not accept html crosses untouched. `insecureHelpers: false`
+on `createGateway` turns it off, and then the document is the runtime's byte for
+byte (both cases are asserted in `tests/gateway.test.mjs`).
+
+TLS in front of the port remains the better answer, and the reason is bigger than
+this fault: a secure origin is also what makes the clipboard, service workers and
+the rest of the platform available. This block is what keeps a plain http
+deployment usable in the meantime.
+
 ### Who owns the resolution, and why it matters
 
 Chromium changed this in 154: an emulation override now belongs to the session

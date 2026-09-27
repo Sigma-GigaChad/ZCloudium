@@ -29,6 +29,14 @@ const ADVERTISED_BLOCK_MS = 5 * 60 * 1000;
 async function startUpstream() {
   const sockets = new Set();
   const server = createServer((req, res) => {
+    // One path answers a document, because the gateway edits documents and
+    // nothing else, and a test of that edit needs something to edit.
+    if (req.url.startsWith("/index.html")) {
+      const body = "<!doctype html><html><body><div id=root></div></body></html>";
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
     res.writeHead(200, { "content-type": "text/plain" });
     res.end(`UPSTREAM ${req.url}`);
   });
@@ -823,6 +831,40 @@ test("the frontend assets and the query string cross the proxy untouched", () =>
  * carry nothing secret, and the same Origin rule applies, because the panel is
  * the page that opens the control channel.
  */
+test("the application's document carries the insecure-origin helpers, and nothing else does", () =>
+  withGateway(async ({ base }) => {
+    const { session } = await completeSetup(base);
+
+    const document = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "text/html" } });
+    assert.equal(document.status, 200);
+    const html = await document.text();
+    // What the reported failure needed: the SHA-256 an insecure origin withholds.
+    assert.match(html, /gateway: insecure-origin helpers/);
+    assert.match(html, /SHA-256/);
+    assert.equal(html.includes("UPSTREAM"), false, "the document is the runtime's, the gateway only appends");
+    assert.match(html, /<div id=root><\/div>/, "the body the runtime sent is still there");
+
+    // An answer that is not a document crosses untouched.
+    const plain = await fetch(`${base}/api/server-info`, { headers: { cookie: session, accept: "text/html" } });
+    assert.equal(await plain.text(), "UPSTREAM /api/server-info");
+
+    // A request that does not ask for a document is not edited either: the
+    // document has to arrive uncompressed for the edit to be possible, and that
+    // negotiation is limited to the requests that need it.
+    const notADocument = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "application/json" } });
+    assert.equal(await notADocument.text(), "<!doctype html><html><body><div id=root></div></body></html>");
+  }));
+
+test("the helpers can be turned off, and then the document is the runtime's byte for byte", () =>
+  withGateway(
+    async ({ base }) => {
+      const { session } = await completeSetup(base);
+      const document = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "text/html" } });
+      assert.equal(await document.text(), "<!doctype html><html><body><div id=root></div></body></html>");
+    },
+    { insecureHelpers: false },
+  ));
+
 test("the panel is served at the prefix root, with no session and no debug port involved", () =>
   withPanelGateway(async ({ base, port, debug }) => {
     for (const path of ["/_browser", "/_browser/"]) {

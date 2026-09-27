@@ -92,6 +92,21 @@ already is root of the machine, and the gateway decides only who reaches it.
 What it does: it authenticates a browser session (password plus TOTP), it keeps
 the runtime off every published interface, and it owns the session cookies.
 
+**It also edits one answer: the application's own document.** A script block is
+appended before `</body>` of the html the runtime sends, which supplies the
+SHA-256 a browser withholds on a non-secure origin (without it, sending a file
+fails with `fault.attachment.checksumUnavailable` on every plain `http://` address
+except `localhost`). What that means in security terms, stated plainly: the
+gateway is not a pure pass-through towards the application's document, the page
+the operator loads carries code this project wrote, and that code runs with the
+application's own privileges in that tab. It is our own code, it is served from
+the same origin behind the same session, it is the only such edit the gateway
+makes, and it is asserted by tests that also assert the negative case (with
+`insecureHelpers: false`, the document reaches the browser byte for byte). It
+grants no new power to anyone: whoever reaches that page already has the panel,
+the browser and the whole session. What it does rule out is a claim that the
+application's document is untouched, and that claim is not made anywhere any more.
+
 **The one window where it protects nothing: before the wizard is finished.** With
 no `/data/auth/users.json`, `POST /_auth/setup` needs no session at all, because
 that is what creates the first account. Between the moment the container starts

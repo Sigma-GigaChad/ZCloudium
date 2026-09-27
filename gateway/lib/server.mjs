@@ -18,6 +18,7 @@ import {
 } from "./browser.mjs";
 import { panelPage } from "./panel.mjs";
 import { absoluteHttpUrl, createPageOwner } from "./page-owner.mjs";
+import { injectAppScript } from "./app-script.mjs";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -209,6 +210,15 @@ export async function createGateway({
    * header, and it is the failure mode to prefer.
    */
   trustProxy = false,
+  /**
+   * Whether the gateway supplies the browser APIs an insecure origin withholds.
+   *
+   * On by default, because without it sending a file fails on any plain http
+   * origin that is not localhost, which is exactly the deployment the README
+   * describes as the common one (a container reached over a LAN or a VPN address).
+   * On an https origin, and on localhost, the script it adds does nothing at all.
+   */
+  insecureHelpers = true,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
 } = {}) {
@@ -506,11 +516,32 @@ export async function createGateway({
     }));
   }
 
+  /**
+   * Whether this request is the application's own document.
+   *
+   * The document is the one answer the gateway edits on its way through, so it is
+   * the one answer that has to arrive uncompressed: a gzipped body cannot be
+   * edited without decoding it, and decoding what the runtime sent is more of the
+   * runtime's business than ours. Asking for identity is a standard, explicit
+   * negotiation, and it is limited to the document.
+   */
+  function wantsDocument(req) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return false;
+    }
+    const accept = String(req.headers.accept ?? "");
+    return accept.includes("text/html");
+  }
+
   function proxy(req, res) {
     const headers = { ...req.headers, host: target.host };
     headers["x-forwarded-for"] = clientAddress(req);
     headers["x-forwarded-proto"] = req.socket.encrypted ? "https" : "http";
     delete headers["connection"];
+    const document = insecureHelpers && wantsDocument(req);
+    if (document) {
+      headers["accept-encoding"] = "identity";
+    }
 
     const upstream = httpRequest(
       {
@@ -522,8 +553,25 @@ export async function createGateway({
         headers,
       },
       (response) => {
-        res.writeHead(response.statusCode ?? 502, response.headers);
-        response.pipe(res);
+        const type = String(response.headers["content-type"] ?? "");
+        if (!document || !type.includes("text/html")) {
+          res.writeHead(response.statusCode ?? 502, response.headers);
+          response.pipe(res);
+          return;
+        }
+        // Buffered, because the script goes in before the closing body tag. The
+        // document is a few kilobytes; anything else keeps streaming.
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const body = Buffer.from(injectAppScript(Buffer.concat(chunks).toString("utf8")), "utf8");
+          res.writeHead(response.statusCode ?? 502, {
+            ...response.headers,
+            "content-length": body.length,
+            "cache-control": "no-store",
+          });
+          res.end(body);
+        });
       },
     );
     upstream.on("error", (error) => {
