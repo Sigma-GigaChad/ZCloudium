@@ -61,7 +61,7 @@ const OFF = "off";
 const isOff = (value) => typeof value === "string" && value.trim().toLowerCase() === OFF;
 
 /** Values that explicitly ask for a switch to be on, and values that refuse it. */
-export const TLS_ON = ["on", "true", "1", "yes"];
+export const TLS_OFF = ["off", "false", "0", "no", "disabled"];
 
 const TRUST_PROXY_ON = ["on", "true", "1", "yes"];
 export const TRUST_PROXY_OFF = ["off", "false", "0", "no"];
@@ -82,16 +82,22 @@ const envValue = (env, name, fallback) => {
 /**
  * Whether the gateway terminates TLS itself.
  *
- * Off unless it is explicitly asked for, and that direction is deliberate: a
- * deployment that already has a reverse proxy terminating TLS must keep letting
- * that proxy do it, and turning this on there would break it. A value that is not
- * recognised keeps the default.
+ * On unless it is turned off. That is the position asked for, and the argument is
+ * simple: a self-signed https is better than plain http, it is what makes the
+ * origin a secure context (the clipboard, service workers, the attachment
+ * checksum), and nobody should have to think about it to get an encrypted
+ * connection.
+ *
+ * A deployment with a reverse proxy, a WireGuard or a Tailscale tunnel, or a NAS
+ * certificate already terminating TLS says `ZCLOUDIUM_TLS=off`, because two layers
+ * doing it is one too many. An unrecognised value keeps the default, so a typo
+ * cannot silently downgrade the connection.
  */
 export function parseTls(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return false;
+    return true;
   }
-  return TLS_ON.includes(String(raw).trim().toLowerCase());
+  return !TLS_OFF.includes(String(raw).trim().toLowerCase());
 }
 
 /**

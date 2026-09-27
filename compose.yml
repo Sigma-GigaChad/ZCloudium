@@ -75,11 +75,12 @@ services:
       # SECURITY.md before exposing this port to anyone else. It also needs
       # ZCLOUDIUM_BROWSER_MCP.
       # ZCLOUDIUM_BROWSER_PANEL: "off"
-      # TLS terminated by the gateway, with a self-signed certificate it generates
-      # on first start. Turn it on when nothing in front terminates TLS, and
-      # declare the address you browse to, or the browser refuses the certificate
-      # even after accepting the warning. Leave it off behind a reverse proxy.
-      # ZCLOUDIUM_TLS: "on"
+      # TLS is ON by default: the gateway terminates it with a self-signed
+      # certificate it generates on first start, broad enough to cover the private
+      # hostname families. Turn it OFF behind a reverse proxy, a WireGuard or
+      # Tailscale tunnel, or a NAS that already terminates TLS: two layers doing it
+      # is one too many. Declare the address you browse to when it is an IP.
+      # ZCLOUDIUM_TLS: "off"
       # ZCLOUDIUM_TLS_HOSTS: "192.168.1.20,nas.local"
       # How long a session lasts, in hours. 12 by default, which is also the
       # window during which a stolen cookie stays usable: raise it only with

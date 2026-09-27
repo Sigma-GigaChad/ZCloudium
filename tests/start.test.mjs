@@ -43,7 +43,7 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
     browserMcp: true,
     browserPanel: true,
     browserDebugPort: 9222,
-    tls: false,
+    tls: true,
     tlsHosts: [],
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
@@ -118,13 +118,15 @@ test("ZCLOUDIUM_TRUST_PROXY defaults to off and is only on when explicitly asked
   assert.equal(parseTrustProxy(null), false);
 });
 
-test("ZCLOUDIUM_TLS is off unless it is asked for, and then the certificate is made", () => {
-  assert.equal(parseEnv({}).tls, false, "TLS is off by default: a reverse proxy in front must keep doing it");
+test("TLS is on unless it is turned off, and only an explicit value turns it off", () => {
+  assert.equal(parseEnv({}).tls, true, "https is the default: nobody should have to ask for an encrypted connection");
+  assert.equal(parseEnv({ ZCLOUDIUM_TLS: "maybe" }).tls, true, "a typo must not downgrade the connection");
+  assert.deepEqual(parseEnv({ ZCLOUDIUM_TLS_HOSTS: "192.168.51.224, nas.local" }).tlsHosts, ["192.168.51.224", "nas.local"]);
+  for (const value of ["off", "OFF", "0", "no", "false", "disabled"]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_TLS: value }).tls, false, `"${value}" turns it off, for a proxy in front`);
+  }
   for (const value of ["on", "true", "1", "yes", " ON "]) {
     assert.equal(parseEnv({ ZCLOUDIUM_TLS: value }).tls, true, `"${value}"`);
-  }
-  for (const value of ["off", "0", "no", "false", "maybe"]) {
-    assert.equal(parseEnv({ ZCLOUDIUM_TLS: value }).tls, false, `"${value}" keeps the default`);
   }
 });
 
@@ -219,7 +221,7 @@ test("the gateway options point at the loopback address the runtime was given", 
     upstreamUrl: "http://127.0.0.1:3131",
     sessionTtlMs: DEFAULT_SESSION_TTL_MS,
     trustProxy: false,
-    tls: false,
+    tls: true,
   });
 
   const args = runtimeArgs(config);
@@ -405,7 +407,7 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
         upstreamUrl: "http://127.0.0.1:3131",
         sessionTtlMs: DEFAULT_SESSION_TTL_MS,
         trustProxy: false,
-        tls: null,
+        tls: { cert: "fake certificate", key: "fake key" },
         debugUrl: null,
       },
     ],

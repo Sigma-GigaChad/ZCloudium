@@ -40,6 +40,26 @@ const run = promisify(execFile);
 /** Where the certificate lives, under the data volume so it survives a restart. */
 export const TLS_DIR_NAME = "tls";
 
+/**
+ * The names every deployment gets, before its own addresses are added.
+ *
+ * The wildcards are the point: an operator reaches this container by a hostname
+ * that lives in their own network (nas.local, media.lan, box.internal) far more
+ * often than by an address, and a certificate that names the family covers all of
+ * them without anybody having to declare anything. An address is not covered by a
+ * wildcard, and that is the one case `ZCLOUDIUM_TLS_HOSTS` exists for.
+ */
+export const DEFAULT_HOSTS = [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.local",
+  "*.lan",
+  "*.internal",
+  "*.home.arpa",
+  "*.home",
+];
+
 /** How long a generated certificate is valid. 825 days is the limit Apple enforces. */
 export const TLS_DAYS = 825;
 
@@ -62,7 +82,7 @@ export function certificatePaths(dataDir) {
  * regenerates when the names no longer cover the machine.
  */
 export function certificateHosts({ interfaces = networkInterfaces(), hostname: name = systemHostname() } = {}) {
-  const hosts = new Set(["localhost", "127.0.0.1", "::1"]);
+  const hosts = new Set(DEFAULT_HOSTS);
   if (typeof name === "string" && name.trim() !== "") {
     hosts.add(name.trim());
   }

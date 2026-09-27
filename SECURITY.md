@@ -89,8 +89,7 @@ already is root of the machine, and the gateway decides only who reaches it.
 
 ## TLS: what the gateway's own certificate is worth
 
-`ZCLOUDIUM_TLS=on` makes the gateway serve https with a certificate it generates
-itself. Stated plainly, because the difference matters more than the padlock:
+The gateway serves https by default, with a certificate it generates itself. Stated plainly, because the difference matters more than the padlock:
 
 **It encrypts the connection and it does not authenticate the server.** Nobody
 signed that certificate, so a browser warns once and the operator accepts it. An
@@ -108,10 +107,11 @@ hash an attachment before upload need (see README.md, and app-script.mjs for the
 polyfill this makes unnecessary). Encryption of the traffic is the second benefit,
 not the first.
 
-**Where it must stay off**: anywhere something in front already terminates TLS. A
-reverse proxy, a WireGuard or Tailscale tunnel, a NAS with its own certificate:
-turning this on there breaks that setup, and the proxy usually does the job
-better, with a certificate the browser actually trusts.
+**Where it must be turned off**: anywhere something in front already terminates
+TLS. A reverse proxy, a WireGuard or Tailscale tunnel, a NAS with its own
+certificate: `ZCLOUDIUM_TLS=off` there, because the proxy does the job better, with
+a certificate the browser actually trusts. That is the one deployment where the
+default is wrong, and it is one variable.
 
 **The names are the trap.** A certificate generated inside the container cannot
 name the address the browser uses, and a browser refuses a name the certificate

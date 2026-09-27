@@ -14,6 +14,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DEFAULT_HOSTS,
   TLS_DAYS,
   certificateHosts,
   certificatePaths,
@@ -86,15 +87,28 @@ test("the names the certificate carries are the ones the machine answers to", ()
       fe80: [{ address: "fe80::42:acff:fe11:2%eth0", family: "IPv6" }],
     },
   });
-  for (const expected of ["localhost", "127.0.0.1", "::1", "zcloudium-host", "192.168.51.224", "172.17.0.1", "fe80::42:acff:fe11:2"]) {
+  for (const expected of [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "zcloudium-host",
+    "192.168.51.224",
+    "172.17.0.1",
+    "fe80::42:acff:fe11:2",
+    // The families an operator's network names live in: a hostname is covered
+    // without anybody declaring it, which is the whole point of the wildcards.
+    "*.local",
+    "*.lan",
+    "*.internal",
+  ]) {
     assert.ok(hosts.includes(expected), `${expected} must be in the certificate`);
   }
   // A zone index is not part of an address, and openssl refuses it in a SAN.
   assert.equal(hosts.some((host) => host.includes("%")), false);
   // Sorted and unique, so the argv is stable for a given machine.
   assert.deepEqual(hosts, [...new Set(hosts)].sort());
-  // A machine with nothing to say still gets the loopback names.
-  assert.deepEqual(certificateHosts({ hostname: "  ", interfaces: {} }), ["127.0.0.1", "::1", "localhost"]);
+  // A machine with nothing to say still gets the loopback names and the families.
+  assert.deepEqual(certificateHosts({ hostname: "  ", interfaces: {} }), [...DEFAULT_HOSTS].sort());
 });
 
 test("addresses are IP entries and names are DNS entries", () => {

@@ -188,7 +188,7 @@ EXPOSE 3030
 # tests anything: override the healthcheck to probe /api/server-info, both compose
 # files show how.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "const on=['on','true','1','yes'].includes(String(process.env.ZCLOUDIUM_TLS||'').trim().toLowerCase()); if(!on){fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));} else {require('node:https').get({host:'127.0.0.1',port:3030,path:'/_auth/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));}"
+  CMD node -e "const off=['off','false','0','no','disabled'].includes(String(process.env.ZCLOUDIUM_TLS||'').trim().toLowerCase()); const on=!off; if(!on){fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));} else {require('node:https').get({host:'127.0.0.1',port:3030,path:'/_auth/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));}"
 
 # The entrypoint starts the runtime on loopback, merges the browser MCP server
 # into the agent configuration, and puts the gateway on the published port. It is
