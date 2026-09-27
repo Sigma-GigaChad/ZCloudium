@@ -31,6 +31,7 @@ import {
 import { applyBrowserMcp, browserServerEntry } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
+import { certificateHosts, loadOrCreateCertificate } from "./lib/tls.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
@@ -60,7 +61,9 @@ const OFF = "off";
 const isOff = (value) => typeof value === "string" && value.trim().toLowerCase() === OFF;
 
 /** Values that explicitly ask for a switch to be on, and values that refuse it. */
-export const TRUST_PROXY_ON = ["on", "true", "1", "yes"];
+export const TLS_ON = ["on", "true", "1", "yes"];
+
+const TRUST_PROXY_ON = ["on", "true", "1", "yes"];
 export const TRUST_PROXY_OFF = ["off", "false", "0", "no"];
 
 const envValue = (env, name, fallback) => {
@@ -76,6 +79,40 @@ const envValue = (env, name, fallback) => {
  * attempt, which is the same as having no limit at all. It is only correct behind
  * a reverse proxy that overwrites the header with the address it saw.
  */
+/**
+ * Whether the gateway terminates TLS itself.
+ *
+ * Off unless it is explicitly asked for, and that direction is deliberate: a
+ * deployment that already has a reverse proxy terminating TLS must keep letting
+ * that proxy do it, and turning this on there would break it. A value that is not
+ * recognised keeps the default.
+ */
+export function parseTls(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return false;
+  }
+  return TLS_ON.includes(String(raw).trim().toLowerCase());
+}
+
+/**
+ * The names the certificate must also carry, when the deployment knows them.
+ *
+ * A certificate generated inside the container cannot guess the address the
+ * operator's browser uses: that address belongs to the host, not to the
+ * container. A browser that reaches a name the certificate does not carry refuses
+ * the connection even after the warning is accepted, so the one person who knows
+ * the name is the operator, and this is where they say it.
+ */
+export function parseTlsHosts(raw) {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+  return String(raw)
+    .split(",")
+    .map((host) => host.trim())
+    .filter((host) => host !== "");
+}
+
 export function parseTrustProxy(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === "") {
     return false;
@@ -105,6 +142,8 @@ export function parseEnv(env = process.env) {
     browserPanel: parseBrowserPanel(env.ZCLOUDIUM_BROWSER_PANEL),
     browserDebugPort: parseBrowserDebugPort(env.ZCLOUDIUM_BROWSER_DEBUG_PORT),
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
+    tls: parseTls(env.ZCLOUDIUM_TLS),
+    tlsHosts: parseTlsHosts(env.ZCLOUDIUM_TLS_HOSTS),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
     dataDir: envValue(env, "ZCODE_DATA_BASE_DIR", DEFAULT_DATA_DIR),
     sessionTtlHours,
@@ -139,6 +178,7 @@ export function gatewayOptions({
   dataDir = DEFAULT_DATA_DIR,
   sessionTtlMs = DEFAULT_SESSION_TTL_MS,
   trustProxy = false,
+  tls = null,
 } = {}) {
   return {
     host: PUBLISHED_HOST,
@@ -147,6 +187,7 @@ export function gatewayOptions({
     upstreamUrl: `http://${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
     sessionTtlMs,
     trustProxy,
+    tls,
   };
 }
 
@@ -194,6 +235,7 @@ export async function start({
   probeBrowserFn = waitForBrowser,
   stopBrowserFn = stopBrowser,
   prepareProfileFn = prepareBrowserProfile,
+  loadOrCreateCertificateFn = loadOrCreateCertificate,
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
@@ -236,6 +278,13 @@ export async function start({
         "the rate limit ignores forwarded addresses",
     );
   }
+  logger(
+    config.tls
+      ? "[start] TLS on (ZCLOUDIUM_TLS=on): the gateway serves https with its own certificate. A browser will warn " +
+          "once, because a self-signed certificate is not signed by an authority it knows"
+      : "[start] TLS off (default): the gateway serves plain http. Turn ZCLOUDIUM_TLS=on for https from the gateway, " +
+          "or keep a reverse proxy in front doing it",
+  );
   logger(
     config.trustProxy
       ? "[start] rate limit keyed on the x-forwarded-for header (ZCLOUDIUM_TRUST_PROXY=on): only safe behind a " +
@@ -407,6 +456,24 @@ export async function start({
     void stop().finally(() => onExit(1));
   });
 
+  /**
+   * The certificate, when TLS is asked for.
+   *
+   * It is loaded before the gateway starts, and a failure here is fatal on
+   * purpose: an operator who asked for TLS must not end up with an unencrypted
+   * listener because a file could not be read. The module says which file and why.
+   */
+  let tls = null;
+  if (config.authEnabled && config.tls) {
+    // What the machine answers to, plus what the operator declared: the two
+    // together are what the certificate has to name.
+    tls = await loadOrCreateCertificateFn({
+      dataDir: config.dataDir,
+      logger,
+      hosts: [...new Set([...certificateHosts(), ...config.tlsHosts])].sort(),
+    });
+  }
+
   if (config.authEnabled) {
     // The logger travels with the options, so the gateway reports its own
     // startup and every authentication event through the same sink as the rest
@@ -414,12 +481,12 @@ export async function start({
     // rejected and the temporary block of an address are written nowhere, which
     // is exactly what an operator needs after a suspicious connection.
     gateway = await createGatewayFn({
-      ...gatewayOptions(config),
+      ...gatewayOptions({ ...config, tls }),
       debugUrl: attached ? debugUrl : null,
       logger,
     });
     logger(
-      `[start] gateway listening on ${PUBLISHED_HOST}:${gateway.port} (authentication on), ` +
+      `[start] gateway listening on ${config.tls ? "https" : "http"}://${PUBLISHED_HOST}:${gateway.port} (authentication on), ` +
         `runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})` +
         (attached ? `, browser panel proxied on ${BROWSER_PREFIX}/` : ""),
     );

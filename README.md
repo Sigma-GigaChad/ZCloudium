@@ -356,6 +356,32 @@ panel is:
   picker exists because it has an IPC channel into the conversation; this page has
   none, so a picker here would copy what DevTools already does properly.
 
+### TLS, terminated here or in front
+
+`ZCLOUDIUM_TLS=on` makes the gateway serve https itself, with a certificate it
+generates on first start into `<data>/tls/` and keeps afterwards (it is replaced
+when it expires, when it stops naming a host, or when it cannot be read).
+
+What that buys, and it is more than encryption: an https origin is a **secure
+context**, which is what the platform requires for the clipboard, for service
+workers, and for the SHA-256 a file is hashed with before being attached. On such
+an origin the script described below does nothing at all, because the browser
+already provides what it was there to replace.
+
+What it is not: trust. Nobody signed that certificate, so the browser warns on the
+first visit and the operator accepts it once. And a certificate generated inside
+the container cannot guess the address the browser uses, so **declare it**:
+`ZCLOUDIUM_TLS_HOSTS="192.168.51.224,nas.local"` adds those names, and the
+certificate is regenerated when they change. A browser refuses a name a certificate
+does not carry, even after the warning, which is the one trap here.
+
+Leave it off when something in front already terminates TLS: a reverse proxy, a
+WireGuard or Tailscale tunnel, a NAS with its own certificate. Turning it on there
+would break that setup, which is why the default is off and the startup log says
+which position is in force. Where there is nothing in front, a self-signed https is
+worth more than plain http, and it is the only thing that makes the rest of the
+platform available.
+
 ### The one script the gateway adds to the application
 
 Attaching a file fails with `fault.attachment.checksumUnavailable` on any origin

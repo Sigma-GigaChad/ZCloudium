@@ -8,6 +8,7 @@
 
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
+import { createServer as createSecureServer } from "node:https";
 import {
   classifyRoute,
   debugPathFor,
@@ -219,6 +220,16 @@ export async function createGateway({
    * On an https origin, and on localhost, the script it adds does nothing at all.
    */
   insecureHelpers = true,
+  /**
+   * The certificate to serve https with, when the deployment wants TLS terminated
+   * here rather than by a proxy in front.
+   *
+   * `null` (the default) keeps the plain http listener this gateway has always
+   * had. Everything else about the gateway is unaware of the difference: the
+   * session cookie, the Origin rules and the upgrade handling work the same over
+   * TLS, and `req.socket.encrypted` is what the trust-proxy rules already read.
+   */
+  tls = null,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
 } = {}) {
@@ -1002,7 +1013,7 @@ export async function createGateway({
     upstream.end();
   }
 
-  const server = createServer((req, res) => {
+  const handler = (req, res) => {
     const url = requestUrl(req);
     const pathname = url.pathname;
 
@@ -1047,7 +1058,11 @@ export async function createGateway({
         res.end();
       }
     });
-  });
+  };
+
+  // The only difference between the two: who terminates the connection. The
+  // handler, the sockets it tracks and the upgrade path below are shared.
+  const server = tls ? createSecureServer({ cert: tls.cert, key: tls.key }, handler) : createServer(handler);
 
   server.on("upgrade", handleUpgrade);
 
@@ -1074,7 +1089,9 @@ export async function createGateway({
   });
 
   const actualPort = server.address().port;
-  logger(`[auth] gateway listening on ${host}:${actualPort}, proxying to ${target.origin}`);
+  logger(
+    `[auth] gateway listening on ${tls ? "https" : "http"}://${host}:${actualPort}, proxying to ${target.origin}`,
+  );
 
   return {
     server,

@@ -43,6 +43,8 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
     browserMcp: true,
     browserPanel: true,
     browserDebugPort: 9222,
+    tls: false,
+    tlsHosts: [],
     trustProxy: false,
     workspace: DEFAULT_WORKSPACE,
     dataDir: DEFAULT_DATA_DIR,
@@ -116,6 +118,41 @@ test("ZCLOUDIUM_TRUST_PROXY defaults to off and is only on when explicitly asked
   assert.equal(parseTrustProxy(null), false);
 });
 
+test("ZCLOUDIUM_TLS is off unless it is asked for, and then the certificate is made", () => {
+  assert.equal(parseEnv({}).tls, false, "TLS is off by default: a reverse proxy in front must keep doing it");
+  for (const value of ["on", "true", "1", "yes", " ON "]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_TLS: value }).tls, true, `"${value}"`);
+  }
+  for (const value of ["off", "0", "no", "false", "maybe"]) {
+    assert.equal(parseEnv({ ZCLOUDIUM_TLS: value }).tls, false, `"${value}" keeps the default`);
+  }
+});
+
+test("with TLS on, the certificate is loaded before the gateway and handed to it", async () => {
+  const asked = [];
+  const { gatewayCalls, logs } = await runStart(
+    { HOME: "/data", ZCLOUDIUM_TLS: "on" },
+    {
+      certificate: async (options) => {
+        asked.push(options);
+        return { cert: "fake certificate", key: "fake key" };
+      },
+    },
+  );
+  assert.equal(asked.length, 1, "the certificate must be loaded exactly once");
+  assert.equal(asked[0].dataDir, "/data", "it lives on the data volume, so it survives a restart");
+  assert.deepEqual(
+    gatewayCalls[0].tls,
+    { cert: "fake certificate", key: "fake key" },
+    "the gateway must serve the certificate that was loaded",
+  );
+  assert.equal(
+    logs.some((line) => /listening on https:\/\//.test(line)),
+    true,
+    `the startup line has to say https, got ${JSON.stringify(logs.filter((l) => /listening/.test(l)))}`,
+  );
+});
+
 test("only an explicit ZCLOUDIUM_AUTH=off disables the gateway", () => {
   for (const value of ["off", "OFF", " off "]) {
     assert.equal(parseEnv({ ZCLOUDIUM_AUTH: value }).authEnabled, false, value);
@@ -182,6 +219,7 @@ test("the gateway options point at the loopback address the runtime was given", 
     upstreamUrl: "http://127.0.0.1:3131",
     sessionTtlMs: DEFAULT_SESSION_TTL_MS,
     trustProxy: false,
+    tls: false,
   });
 
   const args = runtimeArgs(config);
@@ -260,6 +298,7 @@ async function runStart(
     browser = fakeBrowser(),
     probe = async () => ({ reachable: true, version: { Browser: "Chrome/153.0.8010.52" } }),
     prepare = async () => ({ status: "no-lock" }),
+    certificate = async () => ({ cert: "fake certificate", key: "fake key" }),
   } = {},
 ) {
   const child = fakeChild();
@@ -301,6 +340,9 @@ async function runStart(
       profilePreparations.push({ dir, options });
       return prepare(dir, options);
     },
+    // The real one would call openssl, which the unit container does not have:
+    // what the tests check is the wiring, and a real container run checks the rest.
+    loadOrCreateCertificateFn: (options) => certificate(options),
     launchBrowserFn: (options) => {
       browserSpawns.push(options);
       return browser;
@@ -363,6 +405,7 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
         upstreamUrl: "http://127.0.0.1:3131",
         sessionTtlMs: DEFAULT_SESSION_TTL_MS,
         trustProxy: false,
+        tls: null,
         debugUrl: null,
       },
     ],

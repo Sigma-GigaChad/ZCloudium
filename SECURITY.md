@@ -87,6 +87,39 @@ already is root of the machine, and the gateway decides only who reaches it.
   the tool would be degraded without containing anything, since the VM
   filesystem stays mounted.
 
+## TLS: what the gateway's own certificate is worth
+
+`ZCLOUDIUM_TLS=on` makes the gateway serve https with a certificate it generates
+itself. Stated plainly, because the difference matters more than the padlock:
+
+**It encrypts the connection and it does not authenticate the server.** Nobody
+signed that certificate, so a browser warns once and the operator accepts it. An
+attacker who can intercept the connection can present their own certificate and
+the browser will warn in the same way: the warning becomes the only signal, and a
+user trained to click through it has no signal at all. Against a passive observer
+on the network it is a real improvement over plain http; against an active one it
+is not a defence unless the certificate is pinned or signed by something the
+browser already trusts.
+
+**What it does buy, and why it is worth turning on anyway**: an https origin is a
+secure context, which the platform withholds over plain http on anything but
+localhost. That is what the clipboard, service workers, and the SHA-256 used to
+hash an attachment before upload need (see README.md, and app-script.mjs for the
+polyfill this makes unnecessary). Encryption of the traffic is the second benefit,
+not the first.
+
+**Where it must stay off**: anywhere something in front already terminates TLS. A
+reverse proxy, a WireGuard or Tailscale tunnel, a NAS with its own certificate:
+turning this on there breaks that setup, and the proxy usually does the job
+better, with a certificate the browser actually trusts.
+
+**The names are the trap.** A certificate generated inside the container cannot
+name the address the browser uses, and a browser refuses a name the certificate
+does not carry even after the warning is accepted. `ZCLOUDIUM_TLS_HOSTS` is how the
+operator declares them, and the certificate is regenerated when the list changes.
+An operator who turns TLS on without declaring the address they browse to gets a
+connection refused, not a warning, which is why this paragraph exists.
+
 ## The gateway, honestly
 
 What it does: it authenticates a browser session (password plus TOTP), it keeps

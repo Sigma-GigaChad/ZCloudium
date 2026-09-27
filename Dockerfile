@@ -82,13 +82,18 @@ RUN for value in "$ZCODIUM_VERSION" "$TARBALL_URL" "$TARBALL_SHA256" "$CHROMIUM_
     done
 
 # git/curl: the agent runs real shell commands in its workspace and uses them
-# constantly. less/procps: convenience (pagers, ps).
+# constantly. less/procps: convenience (pagers, ps). openssl: the gateway
+# terminates TLS with a certificate it generates, and a certificate is not
+# something to hand-roll in Node.
 # chromium: the browser the MCP server drives, pinned in chromium.version and
 # installed at that exact version, companion package included so apt cannot pair
 # a pinned chromium with another chromium-common. `chromium --version` is
 # compared to the manifest right after: a distribution point release silently
 # changing the browser is what broke the operator viewport between two builds of
 # one commit.
+# openssl: the gateway terminates TLS with a certificate it generates itself, and
+# a certificate is not something to hand-roll in Node. It is the only reason this
+# package is here: the runtime brings its own TLS libraries.
 # fonts-*: with --no-install-recommends no font is installed at all, and
 # Chromium would then render every page with empty boxes. CJK fonts are
 # deliberately left out (tens of megabytes): install fonts-noto-cjk in a derived
@@ -104,6 +109,7 @@ RUN apt-get update \
       fonts-noto-color-emoji \
       git \
       less \
+      openssl \
       procps \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /data /workspace \
@@ -173,13 +179,16 @@ USER node
 EXPOSE 3030
 
 # /_auth/health is served by the gateway and answers without a session, which is
-# exactly what a probe needs. With ZCLOUDIUM_AUTH=off there is no gateway and this
+# exactly what a probe needs. With ZCLOUDIUM_TLS=on the port speaks TLS only, so
+# the probe does too, and it cannot verify a certificate nobody signed: the
+# variable is read from the environment rather than guessed, and the http branch
+# is unchanged, so an existing container keeps probing what it always probed. With ZCLOUDIUM_AUTH=off there is no gateway and this
 # path falls through to the web app, which answers 200 with the interface shell
 # (measured), so the container still reports healthy while the probe no longer
 # tests anything: override the healthcheck to probe /api/server-info, both compose
 # files show how.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "const on=['on','true','1','yes'].includes(String(process.env.ZCLOUDIUM_TLS||'').trim().toLowerCase()); if(!on){fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));} else {require('node:https').get({host:'127.0.0.1',port:3030,path:'/_auth/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));}"
 
 # The entrypoint starts the runtime on loopback, merges the browser MCP server
 # into the agent configuration, and puts the gateway on the published port. It is
