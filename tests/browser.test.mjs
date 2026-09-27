@@ -92,6 +92,18 @@ test("the launch arguments refuse to run without a profile directory", () => {
   }
 });
 
+test("the browser is told which certificate to accept, and only when there is one", () => {
+  const args = browserArgs({ userDataDir: "/data/browser-profile", trustedSpki: "spki-value" });
+  assert.ok(args.includes("--ignore-certificate-errors-spki-list=spki-value"));
+  // Nothing to trust when the gateway serves plain http, and nothing that weakens
+  // verification in general: a fingerprint list is the narrow flag, and
+  // --ignore-certificate-errors must never appear here.
+  const plain = browserArgs({ userDataDir: "/data/browser-profile" });
+  assert.equal(plain.some((arg) => arg.includes("spki-list")), false);
+  assert.equal(plain.some((arg) => arg.includes("ignore-certificate-errors")), false);
+  assert.equal(args.some((arg) => arg === "--ignore-certificate-errors"), false);
+});
+
 test("ZCLOUDIUM_BROWSER_PANEL is on unless it is explicitly turned off", () => {
   assert.equal(parseBrowserPanel(undefined), true, "the default is on: the browser is the point of the tool");
   assert.equal(parseBrowserPanel(null), true);

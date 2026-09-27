@@ -31,7 +31,7 @@ import {
 import { applyBrowserMcp, browserServerEntry } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
-import { certificateHosts, loadOrCreateCertificate } from "./lib/tls.mjs";
+import { certificateHosts, certificateSpki, loadOrCreateCertificate } from "./lib/tls.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
@@ -308,6 +308,32 @@ export async function start({
   // watches it are the point of the tool: ZCLOUDIUM_BROWSER_PANEL=off restores the
   // shape the image shipped before, with nothing here running and no debug port
   // announced to the gateway.
+  // Loaded before the browser starts, because the browser has to be told which
+  // certificate to accept: it opens the gateway's own pages, over https by default.
+  let tls = null;
+  if (config.authEnabled && config.tls) {
+    // What the machine answers to, plus what the operator declared: the two
+    // together are what the certificate has to name.
+    tls = await loadOrCreateCertificateFn({
+      dataDir: config.dataDir,
+      logger,
+      hosts: [...new Set([...certificateHosts(), ...config.tlsHosts])].sort(),
+    });
+  }
+
+  /** The fingerprint to trust, or null with a line saying why there is none. */
+  const trustedSpkiOf = (certificate) => {
+    try {
+      return certificateSpki(certificate);
+    } catch (error) {
+      logger(
+        `[start] the certificate could not be read to pin it (${error.message}): the agent's browser will warn ` +
+          "on the gateway's own pages",
+      );
+      return null;
+    }
+  };
+
   const debugUrl = browserDebugUrl(config.browserDebugPort);
   let browser = null;
   let browserStop = null;
@@ -349,7 +375,15 @@ export async function start({
       logger(`[start] the browser profile could not be prepared: ${error.message}`);
     }
     browser = launchBrowserFn({
-      args: browserArgs({ port: config.browserDebugPort, userDataDir: profile }),
+      args: browserArgs({
+        port: config.browserDebugPort,
+        userDataDir: profile,
+        // A certificate this code cannot read is not fatal: the browser is then
+        // not told to accept it, the agent's browser will show its warning for the
+        // gateway's own pages, and the container still starts. Saying so is what
+        // keeps that from being a silent downgrade.
+        trustedSpki: tls ? trustedSpkiOf(tls.cert) : null,
+      }),
       env,
       logger,
       onExit: (code, signal, error) =>
@@ -469,17 +503,6 @@ export async function start({
    * purpose: an operator who asked for TLS must not end up with an unencrypted
    * listener because a file could not be read. The module says which file and why.
    */
-  let tls = null;
-  if (config.authEnabled && config.tls) {
-    // What the machine answers to, plus what the operator declared: the two
-    // together are what the certificate has to name.
-    tls = await loadOrCreateCertificateFn({
-      dataDir: config.dataDir,
-      logger,
-      hosts: [...new Set([...certificateHosts(), ...config.tlsHosts])].sort(),
-    });
-  }
-
   if (config.authEnabled) {
     // The logger travels with the options, so the gateway reports its own
     // startup and every authentication event through the same sink as the rest

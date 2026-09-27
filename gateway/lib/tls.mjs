@@ -32,7 +32,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { networkInterfaces, hostname as systemHostname } from "node:os";
 import { join } from "node:path";
-import { X509Certificate } from "node:crypto";
+import { X509Certificate, createHash } from "node:crypto";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -127,6 +127,22 @@ export function opensslArgs({ cert, key, hosts, days = TLS_DAYS } = {}) {
     "-addext",
     `subjectAltName=${subjectAltNames(hosts)}`,
   ];
+}
+
+/**
+ * The certificate's public key fingerprint, in the form Chromium takes.
+ *
+ * `--ignore-certificate-errors-spki-list` is how a browser is told to accept one
+ * certificate without giving up verification of every other site. That is what the
+ * browser inside the container needs: it drives the gateway's own pages (the panel
+ * and the DevTools frontend, which opens a socket back to this gateway), and the
+ * certificate is one nobody signed. Pinning the fingerprint allows exactly that
+ * certificate and nothing else, where `--ignore-certificate-errors` would accept
+ * any certificate for any site the agent visits.
+ */
+export function certificateSpki(certificate) {
+  const publicKey = new X509Certificate(certificate).publicKey;
+  return createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("base64");
 }
 
 /** Whether the file exists, without throwing on the many ways it cannot. */

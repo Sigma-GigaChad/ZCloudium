@@ -98,7 +98,12 @@ export function browserDebugUrl(port = BROWSER_DEBUG_PORT, host = BROWSER_DEBUG_
  *   and cookies survive a container restart and nothing is written to the
  *   read-only root filesystem.
  */
-export function browserArgs({ port = BROWSER_DEBUG_PORT, userDataDir, address = BROWSER_DEBUG_ADDRESS } = {}) {
+export function browserArgs({
+  port = BROWSER_DEBUG_PORT,
+  userDataDir,
+  address = BROWSER_DEBUG_ADDRESS,
+  trustedSpki = null,
+} = {}) {
   if (typeof userDataDir !== "string" || userDataDir.trim() === "") {
     throw new Error("browserArgs requires a userDataDir: without one Chromium writes to a read-only root filesystem");
   }
@@ -111,6 +116,13 @@ export function browserArgs({ port = BROWSER_DEBUG_PORT, userDataDir, address = 
     `--remote-debugging-port=${port}`,
     `--remote-debugging-address=${address}`,
     `--user-data-dir=${userDataDir}`,
+    // The gateway's own certificate, when it serves https: the agent's browser
+    // opens the panel and the DevTools frontend, and those pages come from this
+    // gateway. Nothing else is trusted, which is why this is a fingerprint and not
+    // --ignore-certificate-errors.
+    ...(typeof trustedSpki === "string" && trustedSpki !== ""
+      ? [`--ignore-certificate-errors-spki-list=${trustedSpki}`]
+      : []),
     "about:blank",
   ];
 }
