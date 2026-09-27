@@ -605,7 +605,13 @@ test("the panel's socket goes to this gateway, to a browser route path, and nowh
 test("the DevTools button points at the proxied frontend for this target", () => {
   assert.equal(
     devtoolsUrlFor("8B04", { host: "panel.example:3040" }),
-    "/_browser/devtools/inspector.html?ws=panel.example:3040/_browser/devtools/page/8B04",
+    "/_browser/devtools/inspector.html?ws=ws://panel.example:3040/_browser/devtools/page/8B04",
+  );
+  // Told the page is https, it has to say wss: a ws:// socket from an https page is
+  // mixed content, which browsers block, and the gateway serves https by default.
+  assert.equal(
+    devtoolsUrlFor("8B04", { host: "panel.example:3040", protocol: "https:" }),
+    "/_browser/devtools/inspector.html?ws=wss://panel.example:3040/_browser/devtools/page/8B04",
   );
   // Only a target id can end up in the URL.
   for (const hostile of ["../../etc/passwd", "8B04?ws=evil.example", "8B04/../x", "", undefined, "8B 04"]) {

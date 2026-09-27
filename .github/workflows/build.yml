@@ -115,7 +115,7 @@ jobs:
       - name: Wait for the gateway to answer
         run: |
           for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null http://127.0.0.1:3030/_auth/health; then
+            if curl -fsSk -o /dev/null https://127.0.0.1:3030/_auth/health; then
               echo "The gateway answers after ${i} attempts."
               exit 0
             fi
@@ -127,8 +127,8 @@ jobs:
 
       - name: Check that the interface sits behind the gateway
         run: |
-          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3030/)"
-          location="$(curl -s -o /dev/null -D - http://127.0.0.1:3030/ | tr -d '\r' | grep -i '^location:')"
+          code="$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:3030/)"
+          location="$(curl -sk -o /dev/null -D - https://127.0.0.1:3030/ | tr -d '\r' | grep -i '^location:')"
           echo "GET / -> ${code} ${location}"
           test "$code" = "302"
           echo "$location" | grep -q '/_auth/login'
@@ -171,7 +171,7 @@ jobs:
             docker logs smoke >&2
             exit 1
           }
-          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3030/_browser/)"
+          code="$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:3030/_browser/)"
           test "$code" = "302"
           echo "GET /_browser/ -> ${code}, which is the sign in page: the panel is behind the session"
 

@@ -8,6 +8,7 @@
  */
 
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 /** The path the interface connects to, read from a live run: ws://host/ws. */
 export const WEBSOCKET_PATH = "/ws";
@@ -33,14 +34,21 @@ export function upgradeRequest(baseURL, { cookie, path = WEBSOCKET_PATH } = {}) 
     headers.Cookie = cookie;
   }
 
+  // The gateway serves https by default, so the handshake has to be made the same
+  // way a browser makes it: over TLS, and accepting the certificate it generated
+  // itself, because the suite drives that deployment rather than testing it.
+  const secure = target.protocol === "https:";
+  const request = secure ? httpsRequest : httpRequest;
+
   return new Promise((resolve, reject) => {
-    const client = httpRequest(
+    const client = request(
       {
         hostname: target.hostname,
-        port: target.port || 80,
+        port: target.port || (secure ? 443 : 80),
         path,
         method: "GET",
         headers,
+        ...(secure ? { rejectUnauthorized: false } : {}),
       },
       (response) => {
         response.resume();

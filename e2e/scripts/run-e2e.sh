@@ -38,7 +38,7 @@ if [ ! -d "$here/node_modules/@playwright/test" ]; then
   echo "The suite is not installed: run 'npm ci' in $here first." >&2
   status=1
 else
-  (cd "$here" && E2E_BASE_URL="http://127.0.0.1:$PORT" npx playwright test) || status=$?
+  (cd "$here" && E2E_BASE_URL="https://127.0.0.1:$PORT" npx playwright test) || status=$?
 fi
 
 if [ "${KEEP:-0}" = "1" ]; then

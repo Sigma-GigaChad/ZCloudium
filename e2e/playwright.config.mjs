@@ -13,7 +13,7 @@
 
 import { defineConfig, devices } from "@playwright/test";
 
-const baseURL = process.env.E2E_BASE_URL ?? "http://127.0.0.1:3032";
+const baseURL = process.env.E2E_BASE_URL ?? "https://127.0.0.1:3032";
 
 export default defineConfig({
   testDir: "./tests",
@@ -29,6 +29,10 @@ export default defineConfig({
   outputDir: "test-results",
   use: {
     baseURL,
+    // The gateway serves https by default, with a certificate it generated itself
+    // and nobody signed. The suite drives that deployment, so it accepts it: what
+    // is under test is the product, not the certificate.
+    ignoreHTTPSErrors: true,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",

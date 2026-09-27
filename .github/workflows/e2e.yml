@@ -101,7 +101,7 @@ jobs:
       - name: Run the suite
         working-directory: e2e
         env:
-          E2E_BASE_URL: http://127.0.0.1:${{ env.PORT }}
+          E2E_BASE_URL: https://127.0.0.1:${{ env.PORT }}
         run: npx playwright test
 
       # The report on its own answers "what failed"; the screenshots, videos and
@@ -192,7 +192,7 @@ jobs:
       - name: Run the suite against the panel container
         working-directory: e2e
         env:
-          E2E_BASE_URL: http://127.0.0.1:${{ env.PORT }}
+          E2E_BASE_URL: https://127.0.0.1:${{ env.PORT }}
         run: npx playwright test
 
       - name: Upload the report and the traces

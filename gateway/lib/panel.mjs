@@ -395,14 +395,19 @@ export function socketUrlFor(url, { host, protocol } = {}) {
  * one Phase 0 opened the Elements tree, the console and the network waterfall
  * through.
  */
-export function devtoolsUrlFor(targetId, { host } = {}) {
+export function devtoolsUrlFor(targetId, { host, protocol = "http:" } = {}) {
   if (typeof targetId !== "string" || !/^[A-Za-z0-9]{1,64}$/.test(targetId)) {
     return null;
   }
   if (typeof host !== "string" || host.trim() === "") {
     return null;
   }
-  return `${PANEL_PREFIX}devtools/inspector.html?ws=${host.trim()}${PANEL_PREFIX}devtools/page/${targetId}`;
+  // The scheme is part of the answer: the frontend takes this `ws=` value as is,
+  // and a ws:// socket opened from an https page is mixed content, which every
+  // browser blocks. The gateway serves https by default, so saying nothing here
+  // would break the button on the default deployment.
+  const scheme = protocol === "https:" ? "wss://" : "ws://";
+  return `${PANEL_PREFIX}devtools/inspector.html?ws=${scheme}${host.trim()}${PANEL_PREFIX}devtools/page/${targetId}`;
 }
 
 /**
@@ -825,7 +830,7 @@ function connect(targetId) {
   if (target && document.activeElement !== addressEl) {
     addressEl.value = target.url;
   }
-  devtoolsEl.href = devtoolsUrlFor(targetId, { host: location.host }) || "#";
+  devtoolsEl.href = devtoolsUrlFor(targetId, { host: location.host, protocol: location.protocol }) || "#";
   targetEl.value = targetId;
   const url = socketUrlFor(PANEL_PREFIX + "devtools/page/" + targetId, { host: location.host, protocol: location.protocol });
   if (!url) {

@@ -73,8 +73,8 @@ echo "==> Waiting for the gateway to answer on /_auth/health"
 for attempt in $(seq 1 60); do
   # Silence curl: while the runtime is still starting, the connection is reset
   # rather than refused, and that is expected on the first attempts.
-  if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/_auth/health" 2>/dev/null; then
-    echo "==> $CONTAINER is up after $attempt attempt(s): http://127.0.0.1:$PORT"
+  if curl -fsSk -o /dev/null "https://127.0.0.1:$PORT/_auth/health" 2>/dev/null; then
+    echo "==> $CONTAINER is up after $attempt attempt(s): https://127.0.0.1:$PORT"
     exit 0
   fi
   sleep 2
