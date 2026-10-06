@@ -8,26 +8,31 @@ Nothing here can fix the behaviour of ZCode itself: that is third party code
 which does not depend on this project. Everything below is about the Docker
 wrapper and the gateway shipped with the image.
 
-## Three profiles
+## Two profiles
 
-| | `compose.yml` (restricted) | `compose.full-access.yml` (full access) | `compose.unsafe.yml` (unsafe) |
-| --- | --- | --- | --- |
-| User | `1000:1000` (unprivileged) | `root` | `root` |
-| Filesystem view | `/workspace` plus the `/data` volume | the whole VM mounted on `/host` | the whole VM, plus its processes and Docker |
-| Container rootfs | `read_only` plus tmpfs `/tmp` | writable (see below) | writable (see below) |
-| Capabilities | none (`cap_drop: ALL`) | 7 administration capabilities | all of them (`privileged`) |
-| Machine namespaces | no (`pid` isolated) | no | shared (`pid: "host"`) |
-| Machine's Docker socket | no | commented out | mounted, active |
-| Reach of a compromise | the workspace | the whole VM | the whole machine, host included |
-| Authentication | on by default | on by default, and it matters most here | on by default, and it matters most here |
+| | `compose.yml` (restricted) | `compose.full-access.yml` (full access) |
+| --- | --- | --- |
+| User | `1000:1000` (unprivileged) | `root` |
+| Filesystem view | `/workspace` plus the `/data` volume | the whole VM mounted on `/host` |
+| Container rootfs | `read_only` plus tmpfs `/tmp` | writable (see below) |
+| Capabilities | none (`cap_drop: ALL`) | 7 administration capabilities |
+| Machine namespaces | no (`pid` isolated) | no |
+| Machine's Docker socket | no | commented out |
+| Reach of a compromise | the workspace | the whole VM |
+| Authentication | on by default | on by default, and it matters most here |
 
 The restricted profile is enough for most uses. Full access is a deliberate
-choice, with the consequences described further down. The unsafe profile
-removes the container boundary itself: `privileged` plus `pid: "host"` means
-the agent runs commands on the machine through `nsenter`, installs packages
-with the machine's package manager, and controls the machine's containers
-through the socket. On that profile there is nothing to elevate to: the agent
-already is root of the machine, and the gateway decides only who reaches it.
+choice, with the consequences described further down.
+
+A third profile that used to ship, `compose.unsafe.yml` (`privileged` plus
+`pid: "host"` plus the Docker socket mounted), has been **removed**. It
+dissolved the container boundary itself — the agent ran commands on the machine
+through `nsenter`, installed packages with the machine's package manager, and
+controlled the machine's containers through the socket; there was nothing left
+to elevate to, the agent already was root of the machine, and the gateway
+decided only who reaches it. Its legitimate uses are covered by the deployment
+doctrine in README.md instead: the container stays a sandbox, and the work that
+needs a machine happens on a dedicated machine reached over SSH.
 
 ## What is hardened
 

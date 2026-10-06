@@ -6,7 +6,7 @@
 #
 #   ./check-restricted.sh
 #
-# Unlike check-unsafe.sh and check-full-access.sh, this script does not start a
+# Unlike check-full-access.sh, this script does not start a
 # container: the restricted profile runs as an unprivileged user with a
 # read-only rootfs and named volumes, so the runtime probes would require a
 # full setup wizard run. The static assertion is enough to catch the drift the
