@@ -12,16 +12,6 @@
 # the wizard runs once per data volume, so a clean one is what makes the first
 # connection testable at all.
 #
-# E2E_PANEL=on adds ZCLOUDIUM_BROWSER_PANEL=on. The panel specs of the suite need
-# it, and they skip with a reason when the container they are pointed at has the
-# panel off. Nothing else about the container changes, so one suite covers both
-# positions of the switch.
-#
-# The switch is passed in both cases, on and off, because the image runs the panel
-# on by default: a run that wants the off position has to ask for it, and that is
-# what keeps the two CI jobs on two known positions rather than on whatever the
-# image defaults to on the day it is built.
-#
 # The hardening flags are the ones the compose files use and are not weakened
 # here: read-only root filesystem, a tmpfs for /tmp, no new privileges, no
 # capability, and the port published on loopback only.
@@ -31,7 +21,6 @@ set -euo pipefail
 IMAGE="${1:-ghcr.io/sigma-gigachad/z-cloudium:latest}"
 PORT="${2:-3032}"
 PREFIX="${3:-zcloudium-e2e-pw}"
-E2E_PANEL="${E2E_PANEL:-off}"
 
 CONTAINER="$PREFIX"
 DATA_VOLUME="$PREFIX-data"
@@ -48,15 +37,7 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || true
 docker volume rm "$WS_VOLUME" >/dev/null 2>&1 || true
 
-if [ "$E2E_PANEL" = "on" ]; then
-  echo "==> Starting $CONTAINER from $IMAGE on 127.0.0.1:$PORT, browser panel on"
-  # Split on purpose into two arguments by the unquoted expansion below, so an
-  # empty value adds nothing at all.
-  PANEL_ARGS="-e ZCLOUDIUM_BROWSER_PANEL=on"
-else
-  echo "==> Starting $CONTAINER from $IMAGE on 127.0.0.1:$PORT, browser panel off"
-  PANEL_ARGS="-e ZCLOUDIUM_BROWSER_PANEL=off"
-fi
+echo "==> Starting $CONTAINER from $IMAGE on 127.0.0.1:$PORT"
 docker run -d \
   --name "$CONTAINER" \
   -p "127.0.0.1:$PORT:3030" \
@@ -66,7 +47,6 @@ docker run -d \
   --tmpfs /tmp:size=512m \
   --security-opt no-new-privileges:true \
   --cap-drop ALL \
-  ${PANEL_ARGS} \
   "$IMAGE" >/dev/null
 
 echo "==> Waiting for the gateway to answer on /_auth/health"

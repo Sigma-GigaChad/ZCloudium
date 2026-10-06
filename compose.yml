@@ -12,8 +12,8 @@
 #
 # There is no `command:` block any more. The image entrypoint
 # (/opt/cloudium/gateway/start.mjs) starts the runtime on 127.0.0.1:3131 with
-# --no-token, merges the browser MCP server into the agent configuration, and
-# serves the published port 3030 through the authentication gateway.
+# --no-token, and serves the published port 3030 through the authentication
+# gateway.
 
 services:
   z-cloudium:
@@ -63,18 +63,6 @@ services:
       # ZCLOUDIUM_AUTH=off publishes the runtime directly, without any
       # authentication, which is only acceptable on a trusted network.
       ZCLOUDIUM_AUTH: "on"
-      # Browser automation through the MCP server baked into the image. "off"
-      # leaves the agent configuration untouched.
-      ZCLOUDIUM_BROWSER_MCP: "on"
-      # The browser panel: the agent's browser with a live view, a viewport
-      # control, and the keyboard and the mouse, served on /_browser/ behind
-      # this session. On by default, because that browser is the point of the web
-      # build; "off" restores the previous shape, where no browser is started for
-      # the panel and nothing observable changes. Whoever holds a session holds
-      # that browser, sessions and cookies included, so read the panel section of
-      # SECURITY.md before exposing this port to anyone else. It also needs
-      # ZCLOUDIUM_BROWSER_MCP.
-      # ZCLOUDIUM_BROWSER_PANEL: "off"
       # TLS is ON by default: the gateway terminates it with a self-signed
       # certificate it generates on first start, broad enough to cover the private
       # hostname families. Turn it OFF behind a reverse proxy, a WireGuard or
@@ -95,23 +83,19 @@ services:
 
     ## ---------- Hardening ----------
     # The container root filesystem cannot be modified: a compromise does not
-    # persist, and the image tooling (node, git, chromium) cannot be altered
+    # persist, and the image tooling (node, git) cannot be altered
     # from the inside. The gateway only writes into the /data volume, which is
     # why this keeps working. Legitimate writes go to /data, /workspace and /tmp.
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777
-    # Prevents any elevation through a setuid binary or a file capability, which
-    # is also what makes Chromium's setuid sandbox helper unusable (see
-    # SECURITY.md for the consequence, it is stated there and not hidden).
+    # Prevents any elevation through a setuid binary or a file capability.
     security_opt:
       - no-new-privileges:true
     # No capability: uid 1000 needs none for its work.
     cap_drop:
       - ALL
-    # Resource guards (adjust to the machine). Browser automation adds a handful
-    # of Chromium processes and its own memory; raise pids_limit and mem_limit if
-    # a heavy page hits them.
+    # Resource guards (adjust to the machine).
     pids_limit: 512
     mem_limit: 4g
     cpus: 2

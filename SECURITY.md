@@ -41,11 +41,9 @@ already is root of the machine, and the gateway decides only who reaches it.
 - **Build refused if the third party runtime carries a setuid/setgid binary.**
   The tarball is third party code: a setuid there would be an elevation vector,
   so the build stops when `find ... -perm -4000 -o -perm -2000` reports
-  something. The scan covers the runtime directory on purpose: Chromium's setuid
-  helper is distribution packaged, and `no-new-privileges` neutralises it anyway.
+  something.
 - **No build toolchain** in the final image: no pnpm, no compiler, no Electron.
-  Less surface, fewer CVEs to follow. The browser MCP server is installed at
-  build time, so no package manager is needed at runtime either.
+  Less surface, fewer CVEs to follow.
 - **Unprivileged `node` user by default.** The full access profile replaces it
   with root explicitly: that is a launch decision, not a default inherited from
   the image.
@@ -53,9 +51,7 @@ already is root of the machine, and the gateway decides only who reaches it.
   application change: a separate process, which owns `/_auth/*`, requires a
   password plus a TOTP code, and proxies everything else. The runtime is bound
   to loopback inside the container, so the gateway is the only way in.
-- **Telemetry forced off** (`ZCODE_MODEL_TELEMETRY_ENABLED=0`), and the browser
-  MCP server is started with `--no-usage-statistics --no-performance-crux`,
-  which disables the upstream defaults that would send data to Google.
+- **Telemetry forced off** (`ZCODE_MODEL_TELEMETRY_ENABLED=0`).
 - `APT` without recommendations, lists removed, `pipefail` active in the build
   shell.
 
@@ -68,9 +64,7 @@ already is root of the machine, and the gateway decides only who reaches it.
   (packet forgery), `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `MKNOD`, `SETFCAP`,
   `AUDIT_WRITE`, `SYS_CHROOT`.
 - **Resource limits**: `pids_limit` (anti fork bomb), `mem_limit`, `cpus`. An
-  agent that runs away must not take the VM down. Browser automation adds a
-  handful of Chromium processes and its own memory: raise these two when a heavy
-  page reaches them.
+  agent that runs away must not take the VM down.
 - **No `privileged`, no Docker socket by default.** The socket is commented out:
   mounting it is equivalent to root on the host.
 - **Port published on a single private interface.** Never `3030:3030`.
@@ -103,8 +97,7 @@ browser already trusts.
 **What it does buy, and why it is worth turning on anyway**: an https origin is a
 secure context, which the platform withholds over plain http on anything but
 localhost. That is what the clipboard, service workers, and the SHA-256 used to
-hash an attachment before upload need (see README.md, and app-script.mjs for the
-polyfill this makes unnecessary). Encryption of the traffic is the second benefit,
+hash an attachment before upload need. Encryption of the traffic is the second benefit,
 not the first.
 
 **Where it must be turned off**: anywhere something in front already terminates
@@ -123,22 +116,35 @@ connection refused, not a warning, which is why this paragraph exists.
 ## The gateway, honestly
 
 What it does: it authenticates a browser session (password plus TOTP), it keeps
-the runtime off every published interface, and it owns the session cookies.
+the runtime off every published interface, and it owns the session cookies. It
+is a pure pass-through towards the application: it never edits an answer of the
+runtime, so the page the operator loads is exactly the page the runtime sends.
 
-**It also edits one answer: the application's own document.** A script block is
-appended before `</body>` of the html the runtime sends, which supplies the
-SHA-256 a browser withholds on a non-secure origin (without it, sending a file
-fails with `fault.attachment.checksumUnavailable` on every plain `http://` address
-except `localhost`). What that means in security terms, stated plainly: the
-gateway is not a pure pass-through towards the application's document, the page
-the operator loads carries code this project wrote, and that code runs with the
-application's own privileges in that tab. It is our own code, it is served from
-the same origin behind the same session, it is the only such edit the gateway
-makes, and it is asserted by tests that also assert the negative case (with
-`insecureHelpers: false`, the document reaches the browser byte for byte). It
-grants no new power to anyone: whoever reaches that page already has the panel,
-the browser and the whole session. What it does rule out is a claim that the
-application's document is untouched, and that claim is not made anywhere any more.
+Every page of its own carries a closed content security policy
+(`default-src 'none'`, the one inline script allowed by its sha256 hash,
+`frame-ancestors 'none'`), `X-Content-Type-Options`, `Referrer-Policy` and
+`X-Frame-Options`: an injected script on a gateway page has to defeat the
+browser's enforcement, not only ours.
+
+**Recovery codes, stated plainly: each one is a password.** A sheet of ten is
+shown once at enrolment, stored hashed, single use; that single use is enforced
+on write, not under a lock, so concurrent requests race the marking the same
+way the TOTP step's last accepted step does. Anyone holding the sheet
+signs in without the TOTP code, so the sheet is worth exactly what the instance
+is worth; treat a saved screenshot of the enrolment page like a written
+password. The clear codes exist only inside the wizard's pending window: they
+are rendered on the enrolment page whenever the signed, HttpOnly, ten-minute
+pending cookie is presented, and they travel inside that cookie; outside that
+window, only hashes exist. Two limits, deliberate: no "generate more
+codes" route: a used-up sheet means the operator rotates the account, and a
+password change does not invalidate a sheet either — the two are independent
+credentials, and a leaked sheet is only retired by deleting the account.
+
+**Changing a password ends every session, by design.** The route asks for the
+current password even to a signed-in operator, and rotates the session signing
+key on success, so a cookie stolen before the change stops verifying at that
+moment. That is also why the route is throttled like a sign in: it rekeys the
+door.
 
 **The one window where it protects nothing: before the wizard is finished.** With
 no `/data/auth/users.json`, `POST /_auth/setup` needs no session at all, because
@@ -164,16 +170,27 @@ What it does not do:
 
 - it is not a sandbox: once you are authenticated, you get exactly what the
   runtime offers, including a shell through the agent;
-- it is not a multi-user system: one instance, one account. There is no account
-  management interface, no password reset, no audit log of what the agent does;
-- it only speaks HTTP over a plain socket. **Put TLS in front of it** if the port
-  is reachable from a network you do not fully trust (a reverse proxy, a
-  WireGuard or Tailscale interface); otherwise the password and the TOTP code
-  travel in clear text;
+- it is not a multi-role system: several accounts can exist, but one of them
+  (the first wizard's) owns account management and every account holds the same
+  rights over the instance. There is no per-user audit log of what the agent
+  does;
+- there is no password recovery without a credential: changing the password
+  requires the current one, a recovery code covers a lost authenticator (not a
+  lost password), and the last resort remains deleting `/data/auth`, which
+  reopens the ownership window;
+- it terminates TLS with a certificate it generates itself, which encrypts but
+  does not authenticate the server (see the TLS section above). For a certificate
+  the browser actually trusts, put a reverse proxy in front and set
+  `ZCLOUDIUM_TLS=off`;
 - its accounts live in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
-  mode 0600) and its signing key in `/data/auth/secret.key`. Anyone who can read
-  the volume can run the instance, and can also add an account;
-- the failure counter is in memory: restarting the container resets it.
+  hashed recovery sheets, mode 0600), its signing key in
+  `/data/auth/secret.key`, and its failure budget in
+  `/data/auth/failures.json`. Anyone who can read the volume can run the
+  instance, add an account, or wipe the failure budget: the volume is the trust
+  boundary, and the budget being on disk is what makes a restart not reset it;
+- the failure counter is persisted with every change, so restarting no longer
+  clears it; a block still ends after five minutes and the budget still starts
+  again after it, as before.
 
 Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
 to change it, a positive number of hours, anything else is refused and replaced
@@ -247,138 +264,6 @@ behaviour of the previous image can be restored with one variable, without
 rebuilding anything. On a trusted network, with a restrictive bind address, it
 is a reasonable choice. Anywhere else, it is not.
 
-## Browser automation: the sandbox is weakened, and here is the price
-
-Inside the container, Chromium is started with `--no-sandbox`. That is not a
-preference, it is the consequence of the hardening applied above, verified in
-the built image:
-
-```
-$ chromium --headless --screenshot=... about:blank
-[...] No usable sandbox! If this is a Debian system, please install the
-chromium-sandbox package to solve this problem. [...]
-```
-
-- capabilities are dropped (`cap_drop: ALL`), so the setuid helper cannot gain
-  anything;
-- `no-new-privileges` disables the setuid transition and the namespace sandbox
-  route, even if a helper is present;
-- with the sandbox on, Chromium simply refuses to start, so without
-  `--no-sandbox` there is no browser at all.
-
-**What that costs**: a malicious page can escape the renderer and run code as
-the container user, without passing through Chromium's own sandbox.
-
-**Why it is nonetheless contained**: that code lands as uid 1000, with no
-capability, no-new-privileges, a read-only root filesystem in the restricted
-profile, and a writable area limited to `/data`, `/workspace` and `/tmp`. In
-other words, exactly the rights the agent already has through its own shell
-tool: the browser does not grant new reach. What changes is that a page becomes
-as dangerous as a command, so the rule to keep is simple: **do not point the
-browser at untrusted pages**, and keep network egress under control (the real
-exfiltration control is the network: VLAN, firewall rules), because the browser
-and the agent can both reach everything the machine reaches.
-
-In the full access profile the calculus is different and worse: code that escapes
-the renderer runs as root, with the machine's filesystem mounted on `/host`. The
-escape itself is harder to reach through a browser than a shell command, but the
-profile already grants that level of power to the agent, so the browser does not
-change the class of risk: it adds a path that a web page, not a prompt, can
-exercise. Keep that machine disposable.
-
-## The browser panel
-
-The browser panel serves `/_browser/` behind the session: a live view of the
-browser the agent drives, a viewport control, and the keyboard and the mouse. It
-is on by default, and `ZCLOUDIUM_BROWSER_PANEL=off` turns it off. Stated plainly,
-without softening it:
-
-**It hands the agent's browser, with its logged in sessions, to whoever holds a
-session.** Not a picture of it: the page itself, its cookies, its open
-authenticated tabs, and the ability to type into them. If that browser is signed
-into something important, then so is anyone who can sign in to this container. On
-the full access and unsafe profiles the session cookie is already worth root, so
-the browser adds no new class of power there; on the restricted profile it is the
-first capability that reaches outwards with the agent's own credentials rather
-than through a shell the agent would have to be asked to run.
-
-**On by default because it is the tool, and one variable turns it off.** The
-browser the agent drives, and the panel that watches it, are the point of the web
-build rather than an option, so a deployment that exposes this port to anyone but
-its operator should say `ZCLOUDIUM_BROWSER_PANEL=off` (both compose files carry
-the line, commented) and keep the session as the only thing standing between a
-stranger and the agent's browser. With it off no browser is started for the panel,
-`/_browser/...` is ordinary application traffic, and nothing observable changes:
-the same image carries the same Chromium and the same gateway either way. The
-switch decides whether the entrypoint starts a browser, whether the agent's MCP
-entry attaches to it instead of launching its own, and whether the gateway knows
-the route exists. Enabling it does not add a port: the debug endpoint is bound to
-loopback inside the container, and the gateway is the only way in.
-
-### The Origin rule, exactly
-
-The panel is a browser route, so two checks stand in front of it: the session (302
-to the sign in page for HTTP, 401 before any upgrade for the WebSocket) and the
-Origin.
-
-1. **A request with no `Origin` header is allowed.** Only a browser context sends
-   one, and the clients that must keep working send none: the MCP server, the
-   automation harness, curl. Refusing them would break the agent, so their absence
-   is not treated as a browser that failed to identify itself.
-2. **A request that carries one must name the origin of the gateway it arrived
-   at**: the scheme comes from the socket, the authority from the `Host` header,
-   and both are compared as strings once the authority has been normalised (the
-   host lower cased, the scheme's default port dropped, see the next point).
-   Another name, another port, another scheme (unless point 3 applies), a path, or
-   the literal `null` of an opaque origin are refused with 403. The reason this
-   check exists at all: every other service on the operator's loopback is
-   same-site, so its pages arrive with the session cookie attached (`SameSite=Lax`
-   counts loopback to loopback as same-site), and without a check one of those
-   pages could open a control channel into the browser that holds the agent's
-   sessions.
-3. **Behind a TLS terminating proxy, `ZCLOUDIUM_TRUST_PROXY=on` also accepts the
-   `https` variant of the request's own authority.** The proxy speaks TLS to the
-   browser and plain HTTP to the container, so the browser sends `https` while the
-   gateway serializes `http`, and without the flag the panel would refuse its own
-   frontend in the deployment the README recommends. The flag already means "a
-   proxy I control is in front", and it widens nothing else: the authority still
-   has to be the request's own authority, so a different name or a different port
-   is refused with the flag on exactly as with it off. Only the spelling is
-   forgiven, and only the two that a browser and a proxy disagree about, because
-   `normalizeAuthority` lower cases the host and drops the port that is the
-   default for the scheme (`:80` on http, `:443` on https): a proxy configured with
-   `$host:$server_port` on an https server appends `:443`, which the browser never
-   spells out. With the flag off, the behaviour is exactly the one before the flag
-   existed.
-
-**Why the check lives in the gateway and not inside Chromium.** Chromium has its
-own defence, and it stays fully closed behind the gateway: it refuses any Origin
-it did not generate, which is why the gateway strips the header on the last hop,
-where the request comes from the gateway rather than from a page.
-`--remote-allow-origins` would be the wrong layer: it names trusted origins
-*inside* the browser, so every page served from those origins, including a
-compromised one, would reach the debug port directly. The gateway check only lets
-through what arrived as its own frontend.
-
-**An established panel connection outlives the session that opened it.** The
-gateway checks the session when the WebSocket upgrade is made, not afterwards, so a
-panel that is already open keeps working after the cookie expires, until the tab is
-closed or the container restarts. What its holder keeps is everything a valid
-session has, and it is more than the visible page: the socket carries the browser
-level CDP session, so the cookies and the logged in pages of the browser the agent
-drives are reachable through it. This is the same property as the application's own
-WebSocket, which is authorised once and then left alone, and it is tracked as
-follow-up issue #8 rather than fixed here: closing an established connection when
-its session ends belongs to the gateway and would change the behaviour of the
-application's own socket too.
-
-**What the panel does not change.** It does not patch the application, does not
-add a dependency, and does not widen the container's reach: it uses the same
-Chromium, the same uid and the same volumes as the rest of the agent's work. The
-one thing it adds to the filesystem is the browser profile (see the README for
-where that lands per profile), and the one thing it removes on startup is
-Chromium's own `SingletonLock` when it names another machine.
-
 ## Residual risks
 
 Read this before launching the full access profile.
@@ -412,9 +297,7 @@ Read this before launching the full access profile.
    reused elsewhere. If it falls, nothing else does.
 5. **Files owned by root in your home.** Verified in testing: run as root, the
    agent creates root owned files in `$HOME/.zcode`
-   (`v2/provider_config.json`, sqlite databases, certificates), and the entrypoint
-   merges the browser MCP entry into `$HOME/.zcode/cli/config.json` (keeping a
-   `config.json.zcloudium-backup` copy of the previous file). Your VM user will
+   (`v2/provider_config.json`, sqlite databases, certificates). Your VM user will
    no longer be able to modify them without `sudo`. That is the price of uid 0,
    not a bug.
 6. **Network egress is not filtered.** The agent can reach everything the VM
@@ -427,21 +310,10 @@ Read this before launching the full access profile.
 8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.
-9. **Web mode has no multi-user management**: no accounts beyond the single
-   gateway account, no audit log of the agent's actions, no per-user isolation.
-8. **The browser sandbox is off** (see the previous section). Point the browser
-   at pages you trust, or do not enable it.
-9. **The baked browser MCP server is third party code** (`chrome-devtools-mcp`,
-   pinned version), driven by the agent over stdio. It shares the container with
-   the agent, and therefore has the same rights. Its published defaults that send
-   usage statistics and performance data to Google are disabled at launch.
-10. **With the browser panel on, a session is the agent's browser.** The panel is
-   off by default; turned on, it gives `/_browser/` to anyone who signs in, and
-   through it the live page, the cookies and the logged in sessions of the browser
-   the agent drives. The Origin rule above keeps other services on the same
-   loopback from reaching it, but it does not change what a session is worth: see
-   the panel section for the exact boundary and for the one file it removes on
-   startup (Chromium's `SingletonLock`, only when it names another machine).
+9. **Web mode has no per-user isolation**: several accounts can exist, but they
+   all hold the same rights over the one agent and the one workspace, and there
+   is no audit log of the agent's actions. The only distinction is account
+   management, which the owner account alone can do.
 
 ## Recommendations
 
@@ -460,14 +332,10 @@ Read this before launching the full access profile.
 - Leave `ZCLOUDIUM_TRUST_PROXY` off unless a reverse proxy you control overwrites
   `x-forwarded-for`, and remember that with it off every client behind the same
   last hop shares one block.
-- Keep `ZCLOUDIUM_BROWSER_PANEL` on only where the session is as protected as the
-  browser it exposes, and turn it off where it is not: it makes a stolen cookie
-  worth the agent's logged in sessions, and behind a TLS terminating proxy it
-  needs `ZCLOUDIUM_TRUST_PROXY=on` to accept the panel's own frontend.
 - Mount `docker.sock` only if the agent must drive containers, and knowing that
   it is equivalent to root on the host.
-- Put TLS in front of the port if the network is not fully trusted: the gateway
-  has no TLS of its own.
+- Keep the gateway's own TLS on unless something in front already terminates it,
+  and know what a self-signed certificate is worth (see the TLS section).
 
 ## Reproducible checks
 

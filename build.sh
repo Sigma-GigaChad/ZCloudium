@@ -8,8 +8,7 @@
 #   RUNTIME_URL=<another tarball> ./build.sh
 #
 # Neither pnpm, nor Node, nor any build dependency is needed on the machine that
-# runs this script: the image only downloads, verifies and extracts. Chromium,
-# the fonts and the browser MCP server are installed by the Dockerfile itself.
+# runs this script: the image only downloads, verifies and extracts.
 #
 # Nothing else is required: the arguments of the runtime, the addresses and the
 # gateway are decided by the image entrypoint.
@@ -19,11 +18,6 @@ cd "$(dirname "$0")"
 
 VERSION_TAG="$(tr -d '[:space:]' < zcode.version)"
 EXPECTED_SHA="$(tr -d '[:space:]' < zcode.sha256)"
-## The browser is pinned in its own file, sourced so the three values travel
-## under one name each. The Dockerfile refuses a build without them, so a
-## forgotten field fails here rather than in the middle of a build.
-# shellcheck source=chromium.version
-. ./chromium.version
 ## Full lowercase name: GHCR requires it, and the compose files pull exactly the
 ## same reference, so a local build satisfies the compose files as is.
 IMAGE="${IMAGE:-ghcr.io/sigma-gigachad/z-cloudium}"
@@ -38,8 +32,8 @@ for arg in "$@"; do
   esac
 done
 
-if [ -z "$VERSION_TAG" ] || [ -z "$EXPECTED_SHA" ] || [ -z "$chromium_package" ] || [ -z "$chromium_common" ] || [ -z "$chromium_upstream" ]; then
-  echo "zcode.version, zcode.sha256 or chromium.version is empty, or missing a field." >&2
+if [ -z "$VERSION_TAG" ] || [ -z "$EXPECTED_SHA" ]; then
+  echo "zcode.version or zcode.sha256 is empty." >&2
   exit 1
 fi
 
@@ -48,15 +42,11 @@ VERSION="${VERSION_TAG#v}"
 echo "==> $IMAGE:$VERSION"
 echo "    runtime : $RUNTIME_URL"
 echo "    sha256  : $EXPECTED_SHA"
-echo "    browser : chromium ${chromium_package} (upstream ${chromium_upstream})"
 
 docker build \
   --build-arg "ZCODIUM_VERSION=$VERSION_TAG" \
   --build-arg "TARBALL_URL=$RUNTIME_URL" \
   --build-arg "TARBALL_SHA256=$EXPECTED_SHA" \
-  --build-arg "CHROMIUM_PACKAGE=$chromium_package" \
-  --build-arg "CHROMIUM_COMMON_PACKAGE=$chromium_common" \
-  --build-arg "CHROMIUM_UPSTREAM=$chromium_upstream" \
   --tag "$IMAGE:$VERSION" \
   --tag "$IMAGE:latest" \
   .

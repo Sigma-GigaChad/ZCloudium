@@ -78,19 +78,6 @@ services:
       # reaching the port means owning the machine. ZCLOUDIUM_AUTH=off is
       # possible and documented, and it is a decision, not an accident.
       ZCLOUDIUM_AUTH: "on"
-      # Browser automation through the MCP server baked into the image: the
-      # entrypoint adds it to $HOME/.zcode/cli/config.json, the home of the
-      # machine, after keeping a copy of the previous file in
-      # config.json.zcloudium-backup. Set "off" to leave that file alone.
-      ZCLOUDIUM_BROWSER_MCP: "on"
-      # The browser panel: the agent's browser with a live view, a viewport
-      # control, and the keyboard and the mouse, served on /_browser/ behind this
-      # session. On by default. On this profile the browser profile lands in the
-      # home of the machine, in ~/browser-profile, next to the agent's own
-      # state, and a stolen session then reaches the sessions that profile holds.
-      # Read the panel section of SECURITY.md, and turn it off here with "off" if
-      # this machine is shared.
-      # ZCLOUDIUM_BROWSER_PANEL: "off"
       # How long a session lasts, in hours. 12 by default, which is also the
       # window during which a stolen cookie stays usable: on this profile that
       # cookie is worth root on the machine, so raise it only with that in mind.
@@ -111,8 +98,7 @@ services:
     #
     # Capabilities reduced to the strict minimum of administration. Deliberately
     # absent: NET_RAW (packet forgery), SYS_ADMIN, SYS_MODULE, SYS_PTRACE,
-    # MKNOD, SETFCAP, AUDIT_WRITE, SYS_CHROOT. Note that dropping capabilities
-    # also disables Chromium's sandbox, see SECURITY.md.
+    # MKNOD, SETFCAP, AUDIT_WRITE, SYS_CHROOT.
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -126,8 +112,7 @@ services:
       - SETGID
       - SETUID
     # Resource guards: an agent that runs away must not take the machine down.
-    # Adjust to its size, in particular mem_limit once browser automation is in
-    # use.
+    # Adjust to its size.
     pids_limit: 1024
     mem_limit: 8g
     cpus: 4

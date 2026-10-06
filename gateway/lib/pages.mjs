@@ -10,6 +10,8 @@
  * The stylesheet is inline: no external asset, so nothing has to be proxied.
  */
 
+import { createHash } from "node:crypto";
+
 const STYLE = `
 :root {
   color-scheme: dark;
@@ -151,7 +153,30 @@ button.ghost:hover { background: var(--surface); color: var(--foreground); }
   max-height: 74px;
   overflow: hidden;
 }
+.recovery-sheet { letter-spacing: .18em; line-height: 1.9; text-align: center; }
+.user-list { margin: 0 0 18px; padding: 0 0 0 18px; color: var(--foreground); font-size: 14px; }
 `;
+
+/**
+ * The one inline script the pages carry, as a constant so its hash can be
+ * computed for the Content-Security-Policy header: the policy allows exactly
+ * this script and nothing else, rather than allowing every inline script.
+ */
+const COPY_SCRIPT = `
+document.getElementById("copy-secret").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  try {
+    await navigator.clipboard.writeText(button.dataset.secret);
+    button.textContent = "Copied";
+  } catch {
+    button.textContent = "Copy failed";
+  }
+});
+`;
+
+export const COPY_SCRIPT_SHA256 = createHash("sha256")
+  .update(COPY_SCRIPT)
+  .digest("base64");
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -214,13 +239,13 @@ export function verifyPage({ error } = {}) {
     title: "Two-factor code",
     body: `
 <h1>Two-factor code</h1>
-<p class="lead">Enter the 6-digit code from your authenticator app.</p>
+<p class="lead">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
 ${errorBlock(error)}
 <form method="post" action="/_auth/verify">
   <div class="field">
     <label for="code">Verification code</label>
-    <input id="code" class="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
-           pattern="[0-9]*" maxlength="6" autofocus required>
+    <input id="code" class="code" name="code" type="text" autocomplete="one-time-code"
+           maxlength="10" autofocus required>
   </div>
   <button class="primary" type="submit">Sign in</button>
 </form>
@@ -256,8 +281,16 @@ ${errorBlock(error)}
   });
 }
 
-export function setupTotpPage({ secret, uri, account, error } = {}) {
+export function setupTotpPage({ secret, uri, account, recoveryCodes, error } = {}) {
   const grouped = String(secret ?? "").replace(/(.{4})/g, "$1 ").trim();
+  const recovery =
+    Array.isArray(recoveryCodes) && recoveryCodes.length > 0
+      ? `
+<h1 style="margin-top:26px">Recovery codes</h1>
+<p class="lead">If you lose the authenticator, each of these codes signs you in once. Save them now: they are never shown again.</p>
+<code class="secret recovery-sheet">${recoveryCodes.map((code) => escapeHtml(code)).join("<br>")}</code>
+<p class="hint">Codes are single use, and each one also works in place of the code field at sign in.</p>`
+      : "";
   return layout({
     title: "Enrol the authenticator",
     body: `
@@ -268,6 +301,7 @@ ${errorBlock(error)}
 <code class="secret" id="otp-secret">${escapeHtml(grouped)}</code>
 <p class="hint">Paste this key into your app if you prefer manual entry.</p>
 <p class="uri">${escapeHtml(uri ?? "")}</p>
+${recovery}
 <form method="post" action="/_auth/setup/totp">
   <div class="field">
     <label for="code">Code from the app</label>
@@ -278,18 +312,92 @@ ${errorBlock(error)}
 </form>
 <p class="hint" style="margin-top:14px">Account: ${escapeHtml(account ?? "")}</p>
 <button class="ghost" type="button" id="copy-secret" data-secret="${escapeHtml(secret ?? "")}">Copy key</button>
-<script>
-document.getElementById("copy-secret").addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  try {
-    await navigator.clipboard.writeText(button.dataset.secret);
-    button.textContent = "Copied";
-  } catch {
-    button.textContent = "Copy failed";
-  }
-});
-</script>`,
+<script>${COPY_SCRIPT}</script>`,
   });
+}
+
+export function passwordPage({ error } = {}) {
+  return layout({
+    title: "Change the password",
+    body: `
+<h1>Change the password</h1>
+<p class="lead">Every session ends when the password changes, this one included: you will sign in again.</p>
+${errorBlock(error)}
+<form method="post" action="/_auth/password" autocomplete="off">
+  <div class="field">
+    <label for="current">Current password</label>
+    <input id="current" name="current" type="password" autocomplete="current-password" autofocus required>
+  </div>
+  <div class="field">
+    <label for="password">New password</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" required>
+  </div>
+  <div class="field">
+    <label for="password2">Confirm new password</label>
+    <input id="password2" name="password2" type="password" autocomplete="new-password" required>
+  </div>
+  <button class="primary" type="submit">Change and sign out everywhere</button>
+</form>`,
+  });
+}
+
+export function usersPage({ usernames, owner, created, error } = {}) {
+  const list = (usernames ?? [])
+    .map(
+      (name) =>
+        `<li>${escapeHtml(name)}${name === owner ? ' <span class="hint" style="display:inline">owner</span>' : ""}</li>`,
+    )
+    .join("");
+  const createdBlock = created
+    ? `<p class="hint">Account "${escapeHtml(created)}" is created: hand over its authenticator secret and recovery codes, which were shown on the enrolment page.</p>`
+    : "";
+  return layout({
+    title: "Accounts",
+    body: `
+<h1>Accounts</h1>
+<p class="lead">Everyone listed here can sign in to this instance. Only the owner can add accounts.</p>
+${errorBlock(error)}
+${createdBlock}
+<ul class="user-list">${list}</ul>
+<form method="post" action="/_auth/users" autocomplete="off">
+  <div class="field">
+    <label for="username">New username</label>
+    <input id="username" name="username" type="text" autocomplete="off" required>
+  </div>
+  <div class="field">
+    <label for="password">Password (12 characters minimum)</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" required>
+  </div>
+  <div class="field">
+    <label for="password2">Confirm password</label>
+    <input id="password2" name="password2" type="password" autocomplete="new-password" required>
+  </div>
+  <button class="primary" type="submit">Create and enrol</button>
+</form>
+<p class="hint">The next page shows the new account's authenticator secret and recovery codes: relay them to their owner, then they sign in and change the password themselves.</p>`,
+  });
+}
+
+export function badGatewayPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="refresh" content="10">
+<title>Not answering | ZCloudium</title>
+<style>${STYLE}</style>
+</head>
+<body>
+<main>
+<div class="brand"><span class="dot"></span><span>ZCloudium</span></div>
+<h1>The application is not answering</h1>
+<p class="lead">The gateway is up, but the runtime behind it is not. This page reloads itself every 10 seconds; if it stays here, read the container logs.</p>
+</main>
+</body>
+</html>
+`;
 }
 
 export function messagePage({ title, heading, message }) {

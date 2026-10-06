@@ -12,26 +12,12 @@
  */
 
 import { spawn } from "node:child_process";
-import { constants, homedir } from "node:os";
+import { constants } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  BROWSER_PREFIX,
-  browserArgs,
-  browserDebugUrl,
-  browserProfileDir,
-  launchBrowser,
-  parseBrowserDebugPort,
-  parseBrowserPanel,
-  prepareBrowserProfile,
-  resolveBrowserMode,
-  stopBrowser,
-  waitForBrowser,
-} from "./lib/browser.mjs";
-import { applyBrowserMcp, browserServerEntry } from "./lib/mcp-config.mjs";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
-import { certificateHosts, certificateSpki, loadOrCreateCertificate } from "./lib/tls.mjs";
+import { certificateHosts, loadOrCreateCertificate } from "./lib/tls.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
@@ -144,9 +130,6 @@ export function parseEnv(env = process.env) {
   const sessionTtlHours = parseSessionTtlHours(env.ZCLOUDIUM_SESSION_TTL_HOURS);
   return {
     authEnabled: !isOff(env.ZCLOUDIUM_AUTH),
-    browserMcp: !isOff(env.ZCLOUDIUM_BROWSER_MCP),
-    browserPanel: parseBrowserPanel(env.ZCLOUDIUM_BROWSER_PANEL),
-    browserDebugPort: parseBrowserDebugPort(env.ZCLOUDIUM_BROWSER_DEBUG_PORT),
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     tls: parseTls(env.ZCLOUDIUM_TLS),
     tlsHosts: parseTlsHosts(env.ZCLOUDIUM_TLS_HOSTS),
@@ -197,11 +180,6 @@ export function gatewayOptions({
   };
 }
 
-/** The agent configuration lives under $HOME, which both compose profiles set. */
-export function homeOf(env = process.env) {
-  return envValue(env, "HOME", homedir());
-}
-
 /** Conventional shell exit code: 128 + the signal number when the child was killed. */
 export function exitCodeFor(code, signal) {
   if (typeof code === "number") {
@@ -209,19 +187,6 @@ export function exitCodeFor(code, signal) {
   }
   const number = signal ? constants.signals[signal] : undefined;
   return typeof number === "number" ? 128 + number : 1;
-}
-
-function describeMerge(result) {
-  switch (result?.status) {
-    case "created":
-      return `wrote ${result.configPath}`;
-    case "updated":
-      return `added to ${result.configPath} (previous file kept in ${result.backupPath})`;
-    case "unchanged":
-      return `already configured in ${result.configPath}`;
-    default:
-      return `left the configuration untouched: ${result?.message ?? "unknown result"}`;
-  }
 }
 
 /**
@@ -236,20 +201,15 @@ export async function start({
   signals = process,
   spawnRuntime = (file, args, options) => spawn(file, args, options),
   createGatewayFn = createGateway,
-  applyMcpConfigFn = applyBrowserMcp,
-  launchBrowserFn = launchBrowser,
-  probeBrowserFn = waitForBrowser,
-  stopBrowserFn = stopBrowser,
-  prepareProfileFn = prepareBrowserProfile,
   loadOrCreateCertificateFn = loadOrCreateCertificate,
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
   const args = runtimeArgs(config);
 
-  // The addresses, the workspace and the data directory come from the
-  // environment. A leftover command line is appended to this script and does
-  // nothing, so say so instead of ignoring it in silence.
+  // The addresses and the workspace come from the environment. A leftover
+  // command line is appended to this script and does nothing, so say so instead
+  // of ignoring it in silence.
   const extra = argv.slice(2);
   if (extra.length > 0) {
     logger(
@@ -288,8 +248,8 @@ export async function start({
     config.tls
       ? "[start] TLS on (ZCLOUDIUM_TLS=on): the gateway serves https with its own certificate. A browser will warn " +
           "once, because a self-signed certificate is not signed by an authority it knows"
-      : "[start] TLS off (default): the gateway serves plain http. Turn ZCLOUDIUM_TLS=on for https from the gateway, " +
-          "or keep a reverse proxy in front doing it",
+      : "[start] TLS off (ZCLOUDIUM_TLS=off): the gateway serves plain http. Keep a reverse proxy in front doing " +
+          "it, or turn ZCLOUDIUM_TLS back on",
   );
   logger(
     config.trustProxy
@@ -299,17 +259,13 @@ export async function start({
           "proxy that sets x-forwarded-for itself",
   );
 
-  // Before the runtime starts, so that it reads a configuration that already
-  // contains the browser server instead of writing its own state over it.
-  //
-  // Phase 0 of issue #5: the container launches one Chromium with a debug port on
-  // loopback first, and the agent's MCP server attaches to it instead of launching
-  // its own browser. On by default, because that browser and the panel that
-  // watches it are the point of the tool: ZCLOUDIUM_BROWSER_PANEL=off restores the
-  // shape the image shipped before, with nothing here running and no debug port
-  // announced to the gateway.
-  // Loaded before the browser starts, because the browser has to be told which
-  // certificate to accept: it opens the gateway's own pages, over https by default.
+  /**
+   * The certificate, when TLS is asked for.
+   *
+   * It is loaded before the gateway starts, and a failure here is fatal on
+   * purpose: an operator who asked for TLS must not end up with an unencrypted
+   * listener because a file could not be read. The module says which file and why.
+   */
   let tls = null;
   if (config.authEnabled && config.tls) {
     // What the machine answers to, plus what the operator declared: the two
@@ -319,126 +275,6 @@ export async function start({
       logger,
       hosts: [...new Set([...certificateHosts(), ...config.tlsHosts])].sort(),
     });
-  }
-
-  /** The fingerprint to trust, or null with a line saying why there is none. */
-  const trustedSpkiOf = (certificate) => {
-    try {
-      return certificateSpki(certificate);
-    } catch (error) {
-      logger(
-        `[start] the certificate could not be read to pin it (${error.message}): the agent's browser will warn ` +
-          "on the gateway's own pages",
-      );
-      return null;
-    }
-  };
-
-  const debugUrl = browserDebugUrl(config.browserDebugPort);
-  let browser = null;
-  let browserStop = null;
-
-  /** Asks the browser to stop once, whatever asked for it. */
-  const stopBrowserOnce = (reason) => {
-    if (!browser) {
-      return Promise.resolve("no-browser");
-    }
-    if (!browserStop) {
-      logger(`[start] stopping the browser (${reason})`);
-      browserStop = Promise.resolve(stopBrowserFn(browser, { logger })).then((outcome) => {
-        logger(`[start] browser stopped: ${outcome}`);
-        return outcome;
-      });
-    }
-    return browserStop;
-  };
-
-  if (config.browserPanel && !config.browserMcp) {
-    // The panel is the agent's browser made visible. With no browser MCP server
-    // there is no agent browser, so a browser here would be a stray process.
-    logger(
-      "[start] the browser panel is on but the browser MCP server is off (ZCLOUDIUM_BROWSER_MCP=off): no browser is " +
-        "started, because nothing would drive it",
-    );
-  } else if (config.browserPanel) {
-    const profile = browserProfileDir(config.dataDir);
-    // Before the browser starts: a container that was killed rather than stopped
-    // leaves a lock naming another machine, and Chromium refuses to start on it.
-    // Failing to unlock is reported and the browser is still launched, so the
-    // fallback covers it.
-    try {
-      const prepared = await prepareProfileFn(profile, { logger });
-      if (prepared.status === "unlocked") {
-        logger(`[start] browser profile prepared: released a lock from ${prepared.target}`);
-      }
-    } catch (error) {
-      logger(`[start] the browser profile could not be prepared: ${error.message}`);
-    }
-    browser = launchBrowserFn({
-      args: browserArgs({
-        port: config.browserDebugPort,
-        userDataDir: profile,
-        // A certificate this code cannot read is not fatal: the browser is then
-        // not told to accept it, the agent's browser will show its warning for the
-        // gateway's own pages, and the container still starts. Saying so is what
-        // keeps that from being a silent downgrade.
-        trustedSpki: tls ? trustedSpkiOf(tls.cert) : null,
-      }),
-      env,
-      logger,
-      onExit: (code, signal, error) =>
-        logger(
-          `[start] the browser exited (code ${code}, signal ${signal ?? "none"}${error ? `, ${error}` : ""})`,
-        ),
-    });
-
-    const probe = await probeBrowserFn({ debugUrl });
-    if (resolveBrowserMode({ panelEnabled: true, debugUrl, reachable: probe.reachable }) === "attach") {
-      // Where the panel can be reached depends on the gateway existing: with
-      // ZCLOUDIUM_AUTH=off the runtime is published directly and nothing serves
-      // the browser prefix, so saying the panel is on /_browser/ there would be a
-      // promise the deployment cannot keep.
-      const where = config.authEnabled
-        ? `The panel is on ${BROWSER_PREFIX}/ behind the session, and Chromium's own DevTools frontend on ` +
-          `${BROWSER_PREFIX}/devtools/inspector.html.`
-        : `With ZCLOUDIUM_AUTH=off no gateway serves ${BROWSER_PREFIX}/, so the panel is not reachable: the browser ` +
-          "runs for the agent only.";
-      logger(
-        `[start] browser panel: the agent attaches to ${debugUrl} (pid ${browser.pid}), profile ${profile}. ${where}`,
-      );
-    } else {
-      // A browser that never opened its debug port is no use to anyone: the
-      // agent falls back to launching its own, and this one is stopped rather
-      // than left running and invisible.
-      logger(
-        `[start] browser panel: ${debugUrl} did not answer its discovery endpoint, so the agent falls back to the ` +
-          "browser it launches itself",
-      );
-      await stopBrowserOnce("the debug port did not answer");
-      browser = null;
-    }
-  } else {
-    logger(
-      "[start] the browser panel is off (ZCLOUDIUM_BROWSER_PANEL=off): the agent launches its own headless browser",
-    );
-  }
-
-  const attached = browser !== null;
-
-  if (config.browserMcp) {
-    const home = homeOf(env);
-    try {
-      const result = await applyMcpConfigFn({
-        home,
-        entry: browserServerEntry({ browserUrl: attached ? debugUrl : null }),
-      });
-      logger(`[start] browser MCP ${describeMerge(result)}`);
-    } catch (error) {
-      // A configuration problem must not keep the interface from starting.
-      logger(`[start] browser MCP configuration left untouched: ${error.message}`);
-    }
-  } else {
-    logger("[start] browser MCP disabled (ZCLOUDIUM_BROWSER_MCP=off)");
   }
 
   const child = spawnRuntime(process.execPath, [RUNTIME_ENTRY, ...args], {
@@ -451,10 +287,6 @@ export async function start({
     if (!child.kill(signal)) {
       logger(`[start] the runtime did not accept ${signal}`);
     }
-    // The browser is stopped on the same signal. Chromium flushes its profile on
-    // the way out, and that profile holds the agent's sessions, so it must not be
-    // left to a kill from the runtime's own shutdown.
-    void stopBrowserOnce(signal);
   };
   signals.on("SIGTERM", () => forward("SIGTERM"));
   signals.on("SIGINT", () => forward("SIGINT"));
@@ -466,7 +298,6 @@ export async function start({
     const current = gateway;
     gateway = null;
     if (!current) {
-      await stopBrowserOnce("the runtime exited");
       return;
     }
     try {
@@ -474,7 +305,6 @@ export async function start({
     } catch (error) {
       logger(`[start] gateway shutdown failed: ${error.message}`);
     }
-    await stopBrowserOnce("the runtime exited");
   };
 
   child.on("exit", (code, signal) => {
@@ -496,13 +326,6 @@ export async function start({
     void stop().finally(() => onExit(1));
   });
 
-  /**
-   * The certificate, when TLS is asked for.
-   *
-   * It is loaded before the gateway starts, and a failure here is fatal on
-   * purpose: an operator who asked for TLS must not end up with an unencrypted
-   * listener because a file could not be read. The module says which file and why.
-   */
   if (config.authEnabled) {
     // The logger travels with the options, so the gateway reports its own
     // startup and every authentication event through the same sink as the rest
@@ -511,13 +334,11 @@ export async function start({
     // is exactly what an operator needs after a suspicious connection.
     gateway = await createGatewayFn({
       ...gatewayOptions({ ...config, tls }),
-      debugUrl: attached ? debugUrl : null,
       logger,
     });
     logger(
-      `[start] gateway listening on ${config.tls ? "https" : "http"}://${PUBLISHED_HOST}:${gateway.port} (authentication on), ` +
-        `runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})` +
-        (attached ? `, browser panel proxied on ${BROWSER_PREFIX}/` : ""),
+      `[start] gateway listening on ${config.tls ? "https" : "http"}://${PUBLISHED_HOST}:${gateway.port} ` +
+        `(authentication on), runtime confined to ${UPSTREAM_HOST}:${UPSTREAM_PORT} (pid ${child.pid})`,
     );
   } else {
     logger(

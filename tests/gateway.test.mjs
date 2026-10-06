@@ -648,575 +648,268 @@ test("a backslash in next cannot turn a successful sign in into an open redirect
   }));
 
 /**
- * Phase 0 of issue #5: the debug port behind the gateway.
- *
- * The panel hypothesis is that an authenticated operator can open Chromium's own
- * DevTools frontend against the agent's page, through the gateway, with no panel
- * code. These tests cover the gateway's half of that: the route, the refusal
- * without a session, the path mapping, and the discovery documents that would
- * otherwise send the frontend to 127.0.0.1.
+ * The security headers of every page the gateway itself serves. The policy is
+ * closed: no source of anything, inline styles for the theme, and the one inline
+ * script by its hash, so an injected script of any other shape is the browser's
+ * problem to refuse, not only ours.
  */
-
-/** Stub of the browser debug port: discovery JSON, frontend assets, one upgrade. */
-async function startDebugStub() {
-  const requests = [];
-  const sockets = new Set();
-  let port = 0;
-  const server = createServer((req, res) => {
-    requests.push({ method: req.method, path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
-    const authority = `127.0.0.1:${port}`;
-    if (req.url.startsWith("/json/version")) {
-      const body = JSON.stringify({
-        Browser: "Chrome/153.0.8010.52",
-        webSocketDebuggerUrl: `ws://${authority}/devtools/browser/b1d98492`,
-      });
-      res.writeHead(200, { "content-type": "application/json; charset=UTF-8", "content-length": Buffer.byteLength(body) });
-      res.end(body);
-      return;
-    }
-    if (req.url.startsWith("/json/list")) {
-      const body = JSON.stringify([
-        { id: "8B04", type: "page", url: "about:blank", webSocketDebuggerUrl: `ws://${authority}/devtools/page/8B04` },
-      ]);
-      res.writeHead(200, { "content-type": "application/json; charset=UTF-8", "content-length": Buffer.byteLength(body) });
-      res.end(body);
-      return;
-    }
-    if (req.url.startsWith("/devtools/")) {
-      const body = "<!DOCTYPE html><html><title>DevTools</title></html>";
-      res.writeHead(200, { "content-type": "text/html", "content-length": Buffer.byteLength(body) });
-      res.end(body);
-      return;
-    }
-    res.writeHead(404, { "content-type": "text/plain" });
-    res.end("debug: not found");
-  });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    // A test that provokes a reset mid-answer makes this side see the reset, which
-    // is the point of the test: the stub must not turn it into an uncaught error.
-    socket.on("error", () => sockets.delete(socket));
-  });
-  server.on("upgrade", (req, socket) => {
-    requests.push({ method: "UPGRADE", path: req.url, host: req.headers.host, origin: req.headers.origin ?? null });
-    if (req.url.includes("GONE")) {
-      // What the real debug port does when the target is not there any more: a
-      // plain HTTP answer instead of a handshake.
-      const body = "no such target";
-      socket.write(`HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: ${body.length}\r\n\r\n${body}`);
-      return;
-    }
-    if (req.url.includes("BIG")) {
-      // An answer whose body is still being written when the operator goes away.
-      const body = "x".repeat(64 * 1024);
-      socket.write(`HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: ${body.length * 4}\r\n\r\n`);
-      socket.write(body);
-      return;
-    }
-    const accept = createHash("sha1")
-      .update(String(req.headers["sec-websocket-key"]) + WS_GUID)
-      .digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  port = server.address().port;
-  return {
-    server,
-    url: `http://127.0.0.1:${port}`,
-    authority: `127.0.0.1:${port}`,
-    requests,
-    destroy: () => {
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      sockets.clear();
-    },
-  };
-}
-
-/** A gateway with a debug port behind it: the panel switch on. */
-async function withPanelGateway(run, options = {}) {
-  const debug = await startDebugStub();
-  try {
-    await withGateway((context) => run({ ...context, debug }), { debugUrl: debug.url, ...options });
-  } finally {
-    debug.destroy();
-    // The sockets-only destroy above is not enough: server.close() is what
-    // releases the listener, and leaking it kept node --test alive forever
-    // (issue #7). This mirrors the upstream stub's teardown in withGateway.
-    await new Promise((resolve) => debug.server.close(resolve));
-    // Regression guard for issue #7: if this ever fires, the teardown above
-    // has regressed and a listening server survives the test.
-    assert.equal(debug.server.listening, false, "the debug stub must not survive its test (issue #7 leak guard)");
-  }
-}
-
-test("with the panel off, /_browser is ordinary application traffic", () =>
+test("every gateway page carries a closed content security policy", () =>
   withGateway(async ({ base }) => {
-    const anonymous = await fetch(`${base}/_browser/json/version`, { redirect: "manual" });
-    assert.equal(anonymous.status, 302, "no session, so the login page, exactly like any other path");
-    assert.match(String(anonymous.headers.get("location")), /^\/_auth\/login/);
+    const response = await fetch(`${base}/_auth/login`);
+    const policy = response.headers.get("content-security-policy") ?? "";
+    assert.match(policy, /default-src 'none'/);
+    assert.match(policy, /script-src 'sha256-[A-Za-z0-9+/=]{43,44}'/, "the one script is allowed by hash, not by 'unsafe-inline'");
+    assert.match(policy, /form-action 'self'/);
+    assert.match(policy, /frame-ancestors 'none'/);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(response.headers.get("x-frame-options"), "DENY");
 
-    const { session } = await completeSetup(base);
-    const proxied = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
-    assert.equal(await proxied.text(), "UPSTREAM /_browser/json/version", "with the panel off it reaches the application, untouched");
-  }));
-
-test("an unauthenticated /_browser request is refused exactly like the rest of the gateway", () =>
-  withPanelGateway(async ({ base }) => {
-    for (const path of ["/_browser", "/_browser/", "/_browser/json/version", "/_browser/json/list", "/_browser/devtools/inspector.html"]) {
-      const response = await fetch(`${base}${path}`, { redirect: "manual" });
-      assert.equal(response.status, 302, `${path} must not be served without a session`);
-      assert.equal(response.headers.get("location"), `/_auth/login?next=${encodeURIComponent(path)}`, path);
-      const body = await response.text();
-      assert.equal(/webSocketDebuggerUrl|DevTools/.test(body), false, `${path} must leak nothing before authentication`);
-    }
-  }));
-
-test("the debug port is proxied behind the session, and the discovery JSON points back at the gateway", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    const response = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
-    assert.equal(response.status, 200);
-    assert.match(String(response.headers.get("content-type")), /application\/json/);
-
-    const body = await response.json();
-    assert.equal(body.Browser, "Chrome/153.0.8010.52", "the debug document must arrive intact");
-    assert.equal(
-      body.webSocketDebuggerUrl,
-      `ws://127.0.0.1:${port}/_browser/devtools/browser/b1d98492`,
-      "the frontend must be told to reach the gateway, not the loopback debug port",
-    );
-    assert.equal(JSON.stringify(body).includes(debug.authority), false, "the loopback authority must not survive the rewrite");
-    assert.equal(response.headers.get("cache-control"), "no-store", "a rewritten document is per origin and must not be cached");
-
-    const list = await fetch(`${base}/_browser/json/list`, { headers: { cookie: session } });
-    const targets = await list.json();
-    assert.equal(targets[0].webSocketDebuggerUrl, `ws://127.0.0.1:${port}/_browser/devtools/page/8B04`);
-    assert.equal(targets[0].id, "8B04");
-  }));
-
-test("the debug port is asked with the loopback Host it insists on", () =>
-  withPanelGateway(async ({ base, debug }) => {
-    const { session } = await completeSetup(base);
-    await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
-    const seen = debug.requests.at(-1);
-    assert.equal(seen.path, "/json/version", "the proxy prefix must be stripped, the rest kept");
-    assert.equal(seen.host, debug.authority, "Chromium answers 500 to any other Host, so the proxy must rewrite it");
-  }));
-
-test("the frontend assets and the query string cross the proxy untouched", () =>
-  withPanelGateway(async ({ base, debug }) => {
-    const { session } = await completeSetup(base);
-    const response = await fetch(`${base}/_browser/devtools/inspector.html?ws=panel.example/_browser/devtools/page/8B04`, {
-      headers: { cookie: session },
-    });
-    assert.equal(response.status, 200);
-    assert.match(await response.text(), /DevTools/);
-    const seen = debug.requests.at(-1);
-    assert.equal(seen.path, "/devtools/inspector.html?ws=panel.example/_browser/devtools/page/8B04");
-  }));
-
-/**
- * The panel itself, served by the gateway at the prefix root.
- *
- * This is the change Phase 1 makes to the route Phase 0 built: `/_browser/` used
- * to map to the debug port's root (a 404, nothing is invented for it) and is now
- * the operator panel. The debug port must not be reached for it, the page must
- * carry nothing secret, and the same Origin rule applies, because the panel is
- * the page that opens the control channel.
- */
-test("the application's document carries the insecure-origin helpers, and nothing else does", () =>
-  withGateway(async ({ base }) => {
-    const { session } = await completeSetup(base);
-
-    const document = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "text/html" } });
-    assert.equal(document.status, 200);
-    const html = await document.text();
-    // What the reported failure needed: the SHA-256 an insecure origin withholds.
-    assert.match(html, /gateway: insecure-origin helpers/);
-    assert.match(html, /SHA-256/);
-    assert.equal(html.includes("UPSTREAM"), false, "the document is the runtime's, the gateway only appends");
-    assert.match(html, /<div id=root><\/div>/, "the body the runtime sent is still there");
-
-    // An answer that is not a document crosses untouched.
-    const plain = await fetch(`${base}/api/server-info`, { headers: { cookie: session, accept: "text/html" } });
-    assert.equal(await plain.text(), "UPSTREAM /api/server-info");
-
-    // A request that does not ask for a document is not edited either: the
-    // document has to arrive uncompressed for the edit to be possible, and that
-    // negotiation is limited to the requests that need it.
-    const notADocument = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "application/json" } });
-    assert.equal(await notADocument.text(), "<!doctype html><html><body><div id=root></div></body></html>");
-  }));
-
-test("the helpers can be turned off, and then the document is the runtime's byte for byte", () =>
-  withGateway(
-    async ({ base }) => {
-      const { session } = await completeSetup(base);
-      const document = await fetch(`${base}/index.html`, { headers: { cookie: session, accept: "text/html" } });
-      assert.equal(await document.text(), "<!doctype html><html><body><div id=root></div></body></html>");
-    },
-    { insecureHelpers: false },
-  ));
-
-test("the panel is served at the prefix root, with no session and no debug port involved", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    for (const path of ["/_browser", "/_browser/"]) {
-      const anonymous = await fetch(`${base}${path}`, { redirect: "manual" });
-      assert.equal(anonymous.status, 302, `${path} must not be served without a session`);
-      assert.equal(anonymous.headers.get("location"), `/_auth/login?next=${encodeURIComponent(path)}`, path);
-    }
-    assert.equal(debug.requests.length, 0, "the panel is the gateway's own page: nothing may reach the debug port for it");
-
-    const { session } = await completeSetup(base);
-    const response = await fetch(`${base}/_browser/`, { headers: { cookie: session } });
-    assert.equal(response.status, 200);
-    assert.match(String(response.headers.get("content-type")), /text\/html/);
-    assert.equal(response.headers.get("cache-control"), "no-store");
-    const body = await response.text();
-    assert.match(body, /Page\.startScreencast/, "the live view is the screencast");
-    // The viewport and the page are the gateway's now (issue #9): the panel asks
-    // its own endpoints instead of carrying the emulation call, and the browser
-    // is driven from one place.
-    assert.match(body, /PANEL_PREFIX \+ path/, "the panel talks to the gateway's own endpoints");
-    assert.match(body, /askPanel\("viewport",/, "the viewport control goes through the gateway");
-    assert.match(body, /askPanel\("page",/, "the address bar and the history buttons go through the gateway");
-    assert.equal(
-      /Emulation\.setDeviceMetricsOverride/.test(body),
-      false,
-      "the page must not pose an override on a session of its own",
-    );
-    assert.match(body, /Shared with the agent/, "the indicator that the page is shared with the agent");
-    // The button's URL is built at runtime from the same prefix, so what can be
-    // asserted on the served page is the frontend path it points at.
-    assert.match(body, /devtools\/inspector\.html/, "the DevTools button points at the proxied frontend");
-    // The page holds no secret and no target id: it reads the target list from
-    // the proxied discovery document, behind the session, when it opens.
-    assert.equal(/webSocketDebuggerUrl|[0-9A-F]{32}/.test(body), false, "the panel must not carry a target id or a socket url");
-    assert.equal(debug.requests.length, 0, "serving the panel must not touch the debug port");
-
-    // The panel is a browser route, so the Origin rule applies to it too.
-    const foreign = await rawGet(port, "/_browser/", { host: `127.0.0.1:${port}`, origin: "http://127.0.0.1:3038", cookie: session });
-    assert.match(foreign.split("\r\n")[0], /403/, "another origin must not read the panel");
-    const own = await rawGet(port, "/_browser/", { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, cookie: session });
-    assert.match(own.split("\r\n")[0], /200/, "this origin serves its own panel");
-  }));
-
-test("an upgrade to the panel path is refused, and reaches neither the debug port nor the application", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    for (const path of ["/_browser", "/_browser/"]) {
-      const status = await wsStatusLine(port, path, session);
-      assert.notEqual(status, "TIMEOUT", `${path} must get an answer, not a hung socket`);
-      assert.match(status, /400/, `${path} is a page, not a socket, got "${status}"`);
-    }
-    assert.equal(debug.requests.length, 0, "the debug port must not be reached");
-  }));
-
-test("a browser WebSocket upgrade without a session is refused", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    await completeSetup(base);
-    const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", null);
-    assert.equal(/101/.test(status), false, `expected no upgrade, got "${status}"`);
-    assert.equal(debug.requests.some((request) => request.method === "UPGRADE"), false, "the debug port must not be reached at all");
-  }));
-
-test("with a session, the browser upgrade is proxied, without the Origin Chromium would reject", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", session);
-    assert.match(status, /101/, `expected a 101, got "${status}"`);
-    const upgrade = debug.requests.find((request) => request.method === "UPGRADE");
-    assert.ok(upgrade, "the debug port must have received the upgrade");
-    assert.equal(upgrade.path, "/devtools/page/8B04");
-    assert.equal(upgrade.host, debug.authority);
-    // Chromium refuses a WebSocket handshake carrying a foreign Origin, which is
-    // its defence against a page controlling its own browser. The gateway is the
-    // authenticated way in, so it strips the header instead of loosening Chrome.
-    assert.equal(upgrade.origin, null, "the operator browser's Origin must not reach the debug port");
-  }));
-
-test("an unauthenticated browser upgrade is refused before the debug port is touched", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    await completeSetup(base);
-    for (const path of ["/_browser", "/_browser/json/version", "/_browser/devtools/page/8B04"]) {
-      const status = await wsStatusLine(port, path, null);
-      assert.equal(/101/.test(status), false, path);
-    }
-    assert.equal(debug.requests.length, 0, "nothing may reach the debug port without a session");
-  }));
-
-/** Raw HTTP/1.1 request: the only way to send a Host or an Origin of one's choosing. */
-function rawGet(port, path, { host, cookie, origin } = {}) {
-  return new Promise((resolve, reject) => {
-    const socket = connect(port, "127.0.0.1", () => {
-      socket.write(
-        [
-          `GET ${path} HTTP/1.1`,
-          `Host: ${host}`,
-          "Connection: close",
-          ...(origin === undefined ? [] : [`Origin: ${origin}`]),
-          ...(cookie ? [`Cookie: ${cookie}`] : []),
-          "",
-          "",
-        ].join("\r\n"),
-      );
-    });
-    let received = "";
-    socket.on("data", (chunk) => {
-      received += chunk.toString("latin1");
-    });
-    socket.on("end", () => resolve(received));
-    socket.on("error", reject);
-    setTimeout(() => {
-      socket.destroy();
-      resolve(received);
-    }, 3000).unref();
-  });
-}
-
-test("a Host header that is not an authority is refused, never echoed into the discovery document", () =>
-  withPanelGateway(async ({ base, port }) => {
-    const { session } = await completeSetup(base);
-    for (const hostile of ["evil.example/../x", "user:pass@host", "host name", "evil.example"]) {
-      const response = await rawGet(port, "/_browser/json/version", { host: hostile, cookie: session });
-      const [status] = response.split("\r\n");
-      if (hostile === "evil.example") {
-        // A plain hostname is a valid authority: it is rewritten like any other,
-        // and the frontend it is served to is the one that asked for it.
-        assert.match(status, /200/, hostile);
-        assert.match(response, /ws:\/\/evil\.example\/_browser\/devtools\/browser/, hostile);
-        continue;
-      }
-      assert.match(status, /400/, `${hostile} must be refused, got "${status}"`);
-      assert.equal(response.includes("ws://"), false, `nothing may be rewritten from ${hostile}`);
-    }
-  }));
-
-/**
- * The Origin check, which is the difference between "a session is required" and
- * "a session is enough".
- *
- * Any other service on the operator's loopback is same-site, so a page served by
- * one of them arrives with the gateway session cookie attached. Without this
- * check that page could open the browser route, and the gateway would then delete
- * the Origin that Chromium uses to refuse a handshake it did not generate, which
- * is what hands the whole browser over. The check belongs to the gateway because
- * the gateway is the authenticated boundary; the strip upstream stays, because
- * Chromium refuses any origin at all on that hop.
- */
-test("a hostile Origin is refused on the browser route, with a session", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-
-    // The session is checked first, as on every other path: without one there is
-    // no browser route, whatever the Origin says.
-    const anonymous = await rawGet(port, "/_browser/json/version", { host: `127.0.0.1:${port}`, origin: "http://127.0.0.1:3038" });
-    assert.match(anonymous.split("\r\n")[0], /302/, "no session means the sign in page, before any origin rule");
-
-    for (const hostile of ["http://127.0.0.1:3038", "http://127.0.0.1:3030", "http://evil.example", `https://127.0.0.1:${port}`, "null"]) {
-      for (const path of ["/_browser", "/_browser/json/version", "/_browser/json/list", "/_browser/devtools/inspector.html"]) {
-        const response = await rawGet(port, path, { host: `127.0.0.1:${port}`, origin: hostile, cookie: session });
-        assert.match(response.split("\r\n")[0], /403/, `${path} from ${hostile} must be refused, got "${response.split("\r\n")[0]}"`);
-        assert.equal(response.includes("webSocketDebuggerUrl"), false, `${path} from ${hostile} must leak nothing`);
-      }
-    }
-    assert.equal(debug.requests.length, 0, "the debug port must not be reached at all");
-  }));
-
-test("the gateway's own origin passes, and so does a request that carries none", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    const own = await rawGet(port, "/_browser/json/version", { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, cookie: session });
-    assert.match(own.split("\r\n")[0], /200/, "the frontend served by this gateway is this origin");
-    assert.match(own, /ws:\/\/127\.0\.0\.1:\d+\/_browser\/devtools\/browser/, "and the document is still rewritten");
-
-    const absent = await fetch(`${base}/_browser/json/version`, { headers: { cookie: session } });
-    assert.equal(absent.status, 200, "a client that is not a page sends no Origin, and keeps working");
-
-    // A real browser sends an Origin on a WebSocket handshake, so the upgrade is
-    // checked too: this one is refused, the one below is not.
-    const refused = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { origin: `http://127.0.0.1:3038` });
-    assert.equal(/101/.test(refused), false, `a foreign origin must not upgrade, got "${refused}"`);
-    assert.match(refused, /403/);
-
-    const allowed = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { origin: `http://127.0.0.1:${port}` });
-    assert.match(allowed, /101/, `this origin must upgrade, got "${allowed}"`);
-    assert.equal(
-      debug.requests.filter((request) => request.method === "UPGRADE").length,
-      1,
-      "only the allowed handshake may reach the debug port",
-    );
-  }));
-
-/**
- * The TLS terminating proxy, which is a deployment the README recommends.
- *
- * The proxy terminates TLS and forwards plain http, so the browser sends an
- * `https` Origin while the gateway's own origin, as it computes it from the
- * socket, is `http`. The checked case above would refuse the panel there.
- * ZCLOUDIUM_TRUST_PROXY is the flag that already means "a proxy I control is in
- * front", so it is the one that says the https variant of this exact authority
- * may pass. The authority still has to match exactly, and the flag off path is
- * unchanged, which the hostile origin test above pins.
- */
-test("behind a trusted proxy, an https Origin of this exact authority is accepted", () =>
-  withPanelGateway(
-    async ({ base, port, debug }) => {
-      const { session } = await completeSetup(base);
-      const host = `panel.example:${port}`;
-
-      const accepted = await rawGet(port, "/_browser/json/version", { host, origin: `https://${host}`, cookie: session });
-      assert.match(accepted.split("\r\n")[0], /200/, "the https variant of this exact authority is this gateway's frontend");
-      assert.match(accepted, /ws:\/\/panel\.example:\d+\/_browser\/devtools\/browser/, "and the document is rewritten to the host the browser used");
-
-      // The spelling a reverse proxy actually produces, and the reason the
-      // comparison normalises the authority first: `proxy_set_header Host
-      // $host:$server_port` on the https server hands the container
-      // `panel.example:443`, while the browser's Origin carries no port at all,
-      // because 443 is the default for https. Refusing this would break the
-      // deployment the README recommends, with the flag on.
-      const proxied = await rawGet(port, "/_browser/json/version", { host: "panel.example:443", origin: "https://panel.example", cookie: session });
-      assert.match(proxied.split("\r\n")[0], /200/, `the proxy's Host spelling must be accepted, got "${proxied.split("\r\n")[0]}"`);
-      const upper = await rawGet(port, "/_browser/json/version", { host: "PANEL.EXAMPLE:443", origin: "https://panel.example", cookie: session });
-      assert.match(upper.split("\r\n")[0], /200/, `an uppercase host in the Host header must be accepted, got "${upper.split("\r\n")[0]}"`);
-      // A port that is not the scheme's default is still another origin.
-      const otherPort = await rawGet(port, "/_browser/json/version", { host: "panel.example:3041", origin: "https://panel.example", cookie: session });
-      assert.match(otherPort.split("\r\n")[0], /403/, "another port is another origin");
-      const proxiedUpgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host: "panel.example:443", origin: "https://panel.example" });
-      assert.match(proxiedUpgrade, /101/, `the panel's own handshake must be allowed through that spelling too, got "${proxiedUpgrade}"`);
-
-      // After normalisation the authority is still compared as a whole: the port
-      // matters when it is not the scheme's default, and the name always does. The
-      // first entry here is the trap the normalisation could have opened, since
-      // `panel.example:3042` and `panel.example:443` differ only in the port.
-      for (const foreign of ["https://panel.example:3042", "https://panel.example", "https://evil.example", "https://127.0.0.1:3041"]) {
-        const response = await rawGet(port, "/_browser/json/version", { host, origin: foreign, cookie: session });
-        assert.match(response.split("\r\n")[0], /403/, `${foreign} must be refused, got "${response.split("\r\n")[0]}"`);
-        assert.equal(response.includes("webSocketDebuggerUrl"), false, `${foreign} must leak nothing`);
-      }
-
-      // The upgrade is the path that matters: it carries the control channel, and
-      // it is the one the panel itself opens.
-      const upgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host, origin: `https://${host}` });
-      assert.match(upgrade, /101/, `the frontend's own handshake must be allowed, got "${upgrade}"`);
-      const refusedUpgrade = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host, origin: "https://evil.example" });
-      assert.match(refusedUpgrade, /403/, `a foreign https origin must not upgrade, got "${refusedUpgrade}"`);
-      assert.equal(
-        debug.requests.filter((request) => request.method === "UPGRADE").length,
-        2,
-        "only the two accepted handshakes (this authority, and the proxy's spelling of it) may reach the debug port",
-      );
-    },
-    { trustProxy: true },
-  ));
-
-test("an upgrade the debug port answers with an HTTP response does not hang the operator", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    // A tab that was closed under the operator, or a stale target id in a URL a
-    // browser kept: the debug port answers a plain 404 instead of upgrading, and
-    // that answer has to reach the operator rather than leave the socket hanging
-    // until the browser gives up.
-    const status = await wsStatusLine(port, "/_browser/devtools/page/GONE", session);
-    assert.notEqual(status, "TIMEOUT", "the socket must get an answer, not hang");
-    assert.match(status, /404/, `the debug port's own answer must reach the operator, got "${status}"`);
-    assert.equal(
-      debug.requests.filter((request) => request.method === "UPGRADE" && request.path.includes("GONE")).length,
-      1,
-      "the debug port must have been asked, and asked once",
-    );
-  }));
-
-test("the application upgrade path is not the browser route, and its answer is not relayed", () =>
-  withPanelGateway(async ({ base, port }) => {
-    const { session } = await completeSetup(base);
-    // The panel is on, so a browser route exists, and `/ws/GONE` is not one: the
-    // runtime's answer to an upgrade must stay where it was, unrelayed, which is
-    // the behaviour before the panel existed and the one the switch must not
-    // change on any other path.
-    const status = await wsStatusLine(port, "/ws/GONE", session);
-    assert.equal(status, "TIMEOUT", `the application path must behave exactly as before, got "${status}"`);
-  }));
-
-test("with the panel off, an application upgrade is untouched", () =>
-  withGateway(async ({ base, port }) => {
-    const { session } = await completeSetup(base);
-    const status = await wsStatusLine(port, "/ws/GONE", session);
-    assert.equal(status, "TIMEOUT", `with the panel off nothing may change on an application path, got "${status}"`);
-  }));
-
-test("an operator that resets in the middle of a relayed answer does not take the gateway with it", () =>
-  withPanelGateway(async ({ base, port }) => {
-    const { session } = await completeSetup(base);
-    // The debug port is streaming a body, the operator's tab closes: the gateway
-    // must survive the reset and keep answering.
-    await new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (!settled) {
-          settled = true;
-          resolve();
-        }
-      };
-      const client = connect(port, "127.0.0.1", () => {
-        client.write(
-          [
-            "GET /_browser/devtools/page/BIG HTTP/1.1",
-            `Host: 127.0.0.1:${port}`,
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
-            "Sec-WebSocket-Version: 13",
-            `Cookie: ${session}`,
-            "",
-            "",
-          ].join("\r\n"),
-        );
-      });
-      // A reset after the client is gone is what this test provokes, so an error
-      // here is expected and not a failure.
-      client.on("error", finish);
-      client.on("data", () => {
-        client.destroy();
-        finish();
-      });
-      setTimeout(() => {
-        client.destroy();
-        finish();
-      }, 5000).unref();
-    });
-    await new Promise((resolve) => setTimeout(resolve, 300));
     const health = await fetch(`${base}/_auth/health`);
-    assert.equal(health.status, 200, "the gateway must still answer after an operator reset mid-answer");
+    assert.equal(health.headers.get("x-content-type-options"), "nosniff", "the plain answers carry it too");
   }));
 
-test("the application route keeps its own model: the origin check is the browser route's", () =>
-  withPanelGateway(async ({ base }) => {
-    const { session } = await completeSetup(base);
-    // Deliberate scope. The application's upstream decides what it accepts, and
-    // with the switch off the gateway must behave exactly as it did before the
-    // panel existed, so no Origin rule is imposed on the application path here.
-    const response = await fetch(`${base}/api/server-info`, {
-      headers: { cookie: session, origin: "http://evil.example" },
-    });
-    assert.equal(response.status, 200);
-    assert.match(await response.text(), /^UPSTREAM \/api\/server-info$/);
+/**
+ * The sign-in code field must be able to carry a recovery code: nine
+ * characters, letters included. A six character maxlength truncates one and a
+ * numeric pattern refuses it, and a field that cannot carry the recovery shape
+ * ships a dead feature: the browser blocks exactly the value the server
+ * accepts.
+ */
+test("the sign-in code field can carry a recovery code", () =>
+  withGateway(async ({ base, now }) => {
+    await completeSetup(base, now);
+    const login = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const response = await fetch(`${base}/_auth/verify`, { headers: { cookie: loginCookie } });
+    const html = await response.text();
+    assert.equal(html.includes('maxlength="10"'), true, "the field is long enough for a nine character recovery code");
+    assert.equal(html.includes('pattern="[0-9]*"'), false, "a numeric pattern would refuse the letters of a recovery code");
   }));
 
-test("a browser upgrade with an unusable Host is refused, not thrown out of the listener", () =>
-  withPanelGateway(async ({ base, port, debug }) => {
-    const { session } = await completeSetup(base);
-    for (const hostile of ["", "   ", "host name", "user:pass@host", "evil.example/../x"]) {
-      const status = await wsStatusLine(port, "/_browser/devtools/page/8B04", session, { host: hostile, origin: `http://127.0.0.1:${port}` });
-      assert.notEqual(status, "TIMEOUT", `${JSON.stringify(hostile)} must get an answer, not a hung socket`);
-      assert.match(status, /400/, `${JSON.stringify(hostile)} must be refused, got "${status}"`);
+/**
+ * Recovery codes, end to end: shown once at enrolment, stored hashed, each one
+ * a single sign in.
+ */
+test("enrolment shows a sheet of recovery codes, and only their hashes persist", () =>
+  withGateway(async ({ base, dataDir, now }) => {
+    const step1 = await post(base, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(step1, "zc_setup");
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const shown = page.match(/class="secret recovery-sheet">([\s\S]*?)<\/code>/)?.[1] ?? "";
+    const codes = [...shown.matchAll(/[A-Z2-9]{4}-[A-Z2-9]{4}/g)].map((match) => match[0]);
+    assert.equal(codes.length, 10, "the whole sheet is on the enrolment page");
+
+    const code = totp(page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, ""), { at: now() });
+    await post(base, "/_auth/setup/totp", { code }, setupCookie);
+
+    const stored = JSON.parse(await readFile(join(dataDir, "auth", "users.json"), "utf8"));
+    const sheet = stored.users[USERNAME].recoveryCodes;
+    assert.equal(sheet.length, 10);
+    assert.equal(sheet.every((entry) => /^[0-9a-f]{64}$/.test(entry.hash) && entry.used === false), true,
+      "only hashes are stored, all unused");
+    assert.equal(JSON.stringify(stored).includes(codes[0]), false, "the clear text codes never persist");
+  }));
+
+test("a recovery code signs in once, and the same code is refused afterwards", () =>
+  withGateway(async ({ base, now }) => {
+    const step1 = await post(base, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(step1, "zc_setup");
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const recovery = page.match(/[A-Z2-9]{4}-[A-Z2-9]{4}/)?.[0];
+    const secret = page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+
+    // Password accepted, then the recovery code instead of a TOTP code.
+    const login = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const first = await post(base, "/_auth/verify", { code: recovery.toLowerCase() }, loginCookie);
+    assert.equal(first.status, 303, "a recovery code in any spelling completes the sign in");
+    assert.ok(cookieFrom(first, "zc_sess"), "it issues a session");
+
+    const second = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const secondLoginCookie = cookieFrom(second, "zc_login");
+    const replay = await post(base, "/_auth/verify", { code: recovery }, secondLoginCookie);
+    assert.equal(replay.status, 401, "the same code is not a way in twice");
+  }));
+
+/**
+ * The password change: guarded by the current password, and it ends every
+ * session by rotating the signing key.
+ */
+test("changing the password requires the current one and kills every session", () =>
+  withGateway(async ({ base, now, dataDir }) => {
+    const { session } = await completeSetup(base, now);
+    const keyBefore = await readFile(join(dataDir, "auth", "secret.key"));
+
+    const anonymous = await fetch(`${base}/_auth/password`, { redirect: "manual" });
+    assert.equal(anonymous.status, 302, "the form asks for a session first");
+
+    const wrong = await post(base, "/_auth/password", { current: "not-the-password", password: "another-horse-battery-2", password2: "another-horse-battery-2" }, session);
+    assert.equal(wrong.status, 401, "a wrong current password is refused");
+
+    const weak = await post(base, "/_auth/password", { current: PASSWORD, password: "short", password2: "short" }, session);
+    assert.equal(weak.status, 400, "the strength rules apply to the new password too");
+
+    const changed = await post(base, "/_auth/password", { current: PASSWORD, password: "another-horse-battery-2", password2: "another-horse-battery-2" }, session);
+    assert.equal(changed.status, 303);
+    assert.equal(changed.headers.get("location"), "/_auth/login?next=%2F");
+    assert.equal(cookieFrom(changed, "zc_sess"), "zc_sess=", "the changing session itself is cleared");
+
+    const keyAfter = await readFile(join(dataDir, "auth", "secret.key"));
+    assert.notEqual(keyBefore.equals(keyAfter), true, "the signing key rotated");
+
+    const stale = await fetch(`${base}/some/path`, { headers: { cookie: session }, redirect: "manual" });
+    assert.equal(stale.status, 302, "a cookie signed with the old key authorises nothing");
+    assert.match(stale.headers.get("location"), /\/_auth\/login/);
+
+    const fresh = await post(base, "/_auth/login", { username: USERNAME, password: "another-horse-battery-2" });
+    assert.equal(fresh.status, 303, "the new password signs in");
+  }));
+
+/**
+ * The failure budget survives the process: the counter is persisted, so a
+ * container restart must not hand back a fresh budget. A gateway that dies under
+ * a brute force attempt, or a container that crash loops, keeps the blocks and
+ * the counts it had.
+ */
+test("the failure block survives a gateway restart", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
+  let clock = Date.now();
+  const now = () => clock;
+  const first = await createGateway({ upstreamUrl: "http://127.0.0.1:1", dataDir, logger: () => {}, now });
+  try {
+    for (let index = 0; index < MAX_FAILURES; index += 1) {
+      clock += 1_000;
+      const response = await post(`http://127.0.0.1:${first.port}`, "/_auth/login", { username: USERNAME, password: "wrong" });
+      assert.equal(response.status, 401);
     }
-    assert.equal(debug.requests.length, 0, "the debug port must not be reached");
+    const blocked = await post(`http://127.0.0.1:${first.port}`, "/_auth/login", { username: USERNAME, password: "wrong" });
+    assert.equal(blocked.status, 429, "the eighth failure blocks, as always");
+  } finally {
+    await first.close();
+  }
+
+  const stored = JSON.parse(await readFile(join(dataDir, "auth", "failures.json"), "utf8"));
+  assert.equal(Object.values(stored).some((entry) => entry.blockedUntil > clock), true,
+    "the block is on disk before the second start");
+
+  const second = await createGateway({ upstreamUrl: "http://127.0.0.1:1", dataDir, logger: () => {}, now });
+  try {
+    const afterRestart = await post(`http://127.0.0.1:${second.port}`, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(afterRestart.status, 429, "a restarted gateway keeps the block it was left");
+  } finally {
+    await second.close();
+  }
+  await rm(dataDir, { recursive: true, force: true });
+});
+
+/**
+ * Metrics: behind the session, in the Prometheus text format, and the numbers
+ * are the ones the gateway actually counted.
+ */
+test("metrics sit behind the session and count what happened", () =>
+  withGateway(async ({ base, now }) => {
+    const anonymous = await fetch(`${base}/_auth/metrics`, { redirect: "manual" });
+    assert.equal(anonymous.status, 302, "a stranger is sent to the sign in page");
+
+    await post(base, "/_auth/login", { username: USERNAME, password: "wrong" });
+    const { session } = await completeSetup(base, now);
+    const page = await (await fetch(`${base}/_auth/metrics`, { headers: { cookie: session } })).text();
+
+    assert.match(page, /^gateway_auth_failures_total 1$/m, "the wrong password was counted");
+    assert.match(page, /^gateway_sessions_issued_total 1$/m);
+    assert.match(page, /^gateway_recovery_codes_used_total 0$/m);
+    assert.match(page, /# TYPE gateway_auth_blocks_total counter/);
+    const proxied = await fetch(`${base}/anything`, { headers: { cookie: session } });
+    await proxied.text();
+    const after = await (await fetch(`${base}/_auth/metrics`, { headers: { cookie: session } })).text();
+    assert.match(after, /^gateway_upstream_requests_total 1$/m, "a proxied request was counted");
   }));
+
+/**
+ * Owner and accounts: the first account owns the instance, creates the others,
+ * and nobody else can.
+ */
+test("the owner creates a second account, which signs in on its own credentials", () =>
+  withGateway(async ({ base, now, advance }) => {
+    const { session } = await completeSetup(base, now);
+
+    const created = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+    assert.equal(created.status, 303);
+    assert.equal(created.headers.get("location"), "/_auth/setup/totp");
+    const setupCookie = cookieFrom(created, "zc_setup");
+
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const secret = page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    assert.ok(secret, "the new account's enrolment page shows its own secret");
+
+    const confirmed = await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+    assert.equal(confirmed.status, 303);
+    assert.equal(confirmed.headers.get("location"), "/_auth/users?created=colleague",
+      "the operator is taken back to the account list, not signed in as the new user");
+    assert.equal(cookieFrom(confirmed, "zc_sess"), null, "no session is issued for the new user in the operator's browser");
+
+    // A different TOTP step than the one the enrolment consumed, which is the
+    // replay rule every sign in lives by.
+    advance(30_000);
+    const login = await post(base, "/_auth/login", { username: "colleague", password: "a-fine-long-passphrase" });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const verified = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, loginCookie);
+    const colleagueSession = cookieFrom(verified, "zc_sess");
+    assert.ok(colleagueSession, "the new account signs in with its own credentials");
+
+    const list = await fetch(`${base}/_auth/users`, { headers: { cookie: session } });
+    assert.equal(list.status, 200);
+    assert.match(await list.text(), /colleague/);
+
+    const refused = await fetch(`${base}/_auth/users`, { headers: { cookie: colleagueSession } });
+    assert.equal(refused.status, 403, "only the owner manages accounts");
+
+    const duplicate = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+    assert.equal(duplicate.status, 303);
+    assert.match(duplicate.headers.get("location"), /error=That%20username%20already%20exists/);
+  }));
+
+test("the first-run wizard stays exclusive once an account exists", () =>
+  withGateway(async ({ base, now }) => {
+    await completeSetup(base, now);
+    const attempt = await post(base, "/_auth/setup", { username: "intruder", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" });
+    assert.equal(attempt.status, 409, "with an owner present, the wizard answers for the owner only");
+  }));
+
+/**
+ * The 502 page: an operator whose runtime is down gets a page that explains
+ * itself and retries, not a bare string.
+ */
+test("a dead upstream answers with an html page that reloads itself", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
+  const gateway = await createGateway({
+    // Port 1 on loopback: nothing listens there, so every proxied request fails.
+    upstreamUrl: "http://127.0.0.1:1",
+    dataDir,
+    logger: () => {},
+  });
+  try {
+    const setupStep = await post(`http://127.0.0.1:${gateway.port}`, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(setupStep, "zc_setup");
+    const enroll = await fetch(`http://127.0.0.1:${gateway.port}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const secret = (await enroll.text()).match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    const confirmed = await post(`http://127.0.0.1:${gateway.port}`, "/_auth/setup/totp", { code: totp(secret, { at: Date.now() }) }, setupCookie);
+    const session = cookieFrom(confirmed, "zc_sess");
+
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/`, { headers: { cookie: session } });
+    assert.equal(response.status, 502);
+    assert.match(response.headers.get("content-type") ?? "", /text\/html/);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    const body = await response.text();
+    assert.match(body, /http-equiv="refresh" content="10"/, "the page retries on its own");
+    assert.match(body, /not answering/i);
+  } finally {
+    await gateway.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
