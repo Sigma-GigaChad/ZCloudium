@@ -1,22 +1,27 @@
 # syntax=docker/dockerfile:1
 
-# ZCode Web, built FROM THE UPSTREAM SOURCES (zai-org/ZCode).
+# ZCode Web, built FROM THE UPSTREAM SOURCES.
 #
-# The "I only trust the original vendor" path: the open source snapshot is
-# compiled here, without a fork and without a third party binary. The price is a
-# long build (15 to 30 minutes, a few GB), with pnpm and Node present in the
-# builder stage only.
+# The "I build the runtime myself" path: the sources are compiled here instead
+# of downloading the published tarball. Validated on the ZCodium fork's v3.14.7
+# (2026-10-06): the build completes and the runtime it produces starts and
+# answers /api/server-info. Cold build measured at about 5 minutes on a capable
+# machine, against about 8 seconds for the precompiled path.
 #
-# STATUS: this path is NOT validated. As is, it fails on
-# "Missing @zcode/shared dist files": the upstream source build does not produce
-# packages/shared/dist, while the SEA asset collector requires it. The
-# `pnpm run build:bootstrap` step added below is the official sequence of the
-# project (scripts/bootstrap.mjs) and should produce that dist, but it has not
-# been verified. Using Dockerfile (precompiled runtime) is the tested path.
+# What building from source does NOT buy, measured:
+#   - the sha256 of the tarball it produces (d928ae31...) differs from the
+#     official release's (81d0961f...): tarballs carry mtimes, so the build is
+#     not bit for bit reproducible against the published artifact;
+#   - upstream zai-org/ZCode stops at v3.14.3: every tag after that exists only
+#     on the ZCodium fork, so building "only from the original vendor" means
+#     staying several releases behind, and building current versions means
+#     building this fork's git anyway.
 #
-# This file also predates the authentication gateway: it does not ship the
-# gateway entrypoint, and its runtime lives in /opt/zcode rather than
-# /opt/zcodium. Wiring it is part of validating this path.
+# STATUS: the build is validated, the image it produces is NOT the product: it
+# still predates the authentication gateway (no /_auth/, no TLS, no entrypoint),
+# so running it publishes the runtime unauthenticated on port 3030. Wiring the
+# gateway in is the remaining work, and the e2e suite would have to pass against
+# it before this path could ship.
 #
 # glibc base is mandatory (bookworm, not alpine): the runtime package embeds the
 # precompiled node-pty binaries (@lydell/node-pty-linux-x64) and no musl variant
@@ -58,14 +63,23 @@ RUN git init -q . \
 RUN pnpm install --frozen-lockfile \
  && pnpm prepare:desktop-runtime || true
 
-# build:bootstrap is the official sequence of scripts/bootstrap.mjs: it builds
-# every packages/* (including @zcode/shared, which build:zcode leaves out).
-RUN pnpm run build:bootstrap
+# The vendor's own release workflow (ZCodium .github/workflows/release.yml) builds
+# the tarball with exactly three steps: install --frozen-lockfile, then
+# `pnpm typecheck`, then `pnpm build:zcode`. `typecheck` is `tsc -b` over the
+# project references: it is what emits packages/shared/dist/index.js, which has no
+# build script of its own and which the SEA asset collector requires. The
+# build:bootstrap sequence that used to be here does not produce it, and the
+# build died on "Missing @zcode/shared dist files" (measured, twice: on the fork's
+# v3.14.7 and on upstream's v3.14.3, which is where that tag series stops).
+RUN pnpm typecheck
 
 # --base-url only feeds the generated install.sh, which is not used here.
+# The fork's tarball is named zcodium-<version>.tar.gz (upstream named it
+# zcode-*.tar.gz) and its top directory is zcodium/, so the extraction strips
+# the component exactly like the precompiled path does with the official one.
 RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
- && mkdir -p /out \
- && tar -xzf "$(ls dist/zcode/releases/*/zcode-*.tar.gz | head -n 1)" -C /out \
+ && mkdir -p /out/zcode \
+ && tar -xzf "$(ls dist/zcode/releases/*/*.tar.gz | head -n 1)" --strip-components=1 -C /out/zcode \
  && test -f /out/zcode/bin/zcode.mjs \
  && test -f /out/zcode/server/entry-http.js
 

@@ -591,20 +591,30 @@ forces `ZCODE_MODEL_TELEMETRY_ENABLED=0` (the upstream OTLP exporter is inactive
 anyway without `OTEL_EXPORTER_OTLP_ENDPOINT`).
 
 If you want to depend only on the original vendor, `Dockerfile.from-source`
-compiles upstream yourself, at the price of a long build, and it is not
-validated yet (see below).
+compiles the sources yourself. Read its header first: the build is validated,
+but the image it produces is not the product (see below), and the original
+vendor's tag series lags the fork the precompiled runtime comes from.
 
-## Dockerfile.from-source (not validated)
+## Dockerfile.from-source (build validated, not wired to the gateway)
 
-Compiles upstream `zai-org/ZCode` instead of using the precompiled runtime.
+Compiles the runtime from the git sources instead of using the published
+tarball. Validated on the ZCodium fork's `v3.14.7` (2026-10-06): the build
+completes with the vendor's own release sequence (`pnpm install
+--frozen-lockfile`, `pnpm typecheck`, `pnpm build:zcode` — the `typecheck`
+step is what emits `packages/shared/dist`, which the SEA collector requires),
+and the runtime it produces starts and answers `/api/server-info`.
 
-**That path does not work as is yet.** Finding of 2026-09-24: `pnpm build:zcode`
-fails on `Missing @zcode/shared dist files`, because `packages/shared` has no
-build script and is never compiled by `build:zcode`, while the SEA asset
-collector (`sea-runtime-package-resolution.mjs`) requires
-`packages/shared/dist/index.js`. The official sequence of the project
-(`scripts/bootstrap.mjs` then `pnpm run build:bootstrap`) was added to that
-Dockerfile and should produce that `dist`, but it has not been tested.
+What it costs and what it does not buy, measured:
+
+- about 5 minutes of cold build on a capable machine, against about 8 seconds
+  for the precompiled path;
+- the tarball it builds does not reproduce the official one bit for bit
+  (different sha256: tarballs carry mtimes);
+- upstream `zai-org/ZCode` stops at `v3.14.3`: building only from the original
+  vendor means staying several releases behind, and building current versions
+  means building the fork's git anyway;
+- the image it produces has no gateway, no TLS and no entrypoint: it is not the
+  product, and wiring it would have to pass the e2e suite before shipping.
 
 ## Limits of web mode
 
