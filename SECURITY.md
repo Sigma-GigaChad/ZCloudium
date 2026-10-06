@@ -310,8 +310,12 @@ Read this before launching the full access profile.
    level (VLAN, outbound firewall rules), not inside the container.
 7. **The runtime comes from a third party** (the ZCodium fork). Integrity is
    verified by a pinned hash, the presence of setuid binaries is checked, but the
-   code has not been audited. If that is not acceptable, `Dockerfile.from-source`
-   compiles the original upstream, a path that is not validated to this day.
+   code has not been audited. If that is not acceptable, `./build.sh
+   --from-source` compiles the fork's sources in your builder and applies the
+   small patch series in `patches/` (documented, reviewed, and what enables
+   Remote SSH from the web client and Cloud Environments) — the trade is the
+   vendor's published artefact for your own build of reviewed sources, which
+   costs minutes and stops being bit-for-bit reproducible.
 8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.
