@@ -517,7 +517,7 @@ Tested by actually running things, not only written. The measurements below date
 from the run that made them: where one names a version, that is the version it
 was measured on, while `zcode.version` is what a build carries today.
 
-- **test suite**: 100 tests, 100 pass, 0 fail (`node --test --test-force-exit`,
+- **test suite**: 101 tests, 101 pass, 0 fail (`node --test --test-force-exit`,
   which prints the count and exits on its own). The new features carry their own
   tests: the recovery sheet arithmetic, the single-use rule end to end, the
   password change and the key rotation it forces, the failure budget surviving a
