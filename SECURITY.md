@@ -120,6 +120,29 @@ the runtime off every published interface, and it owns the session cookies. It
 is a pure pass-through towards the application: it never edits an answer of the
 runtime, so the page the operator loads is exactly the page the runtime sends.
 
+Every page of its own carries a closed content security policy
+(`default-src 'none'`, the one inline script allowed by its sha256 hash,
+`frame-ancestors 'none'`), `X-Content-Type-Options`, `Referrer-Policy` and
+`X-Frame-Options`: an injected script on a gateway page has to defeat the
+browser's enforcement, not only ours.
+
+**Recovery codes, stated plainly: each one is a password.** A sheet of ten is
+shown once at enrolment, stored hashed, single use. Anyone holding the sheet
+signs in without the TOTP code, so the sheet is worth exactly what the instance
+is worth; treat a saved screenshot of the enrolment page like a written
+password. The clear codes exist in two places only, once each: the enrolment
+page, and the signed, HttpOnly, ten-minute pending cookie that carries the
+wizard from one step to the next. Two limits, deliberate: no "generate more
+codes" route: a used-up sheet means the operator rotates the account, and a
+password change does not invalidate a sheet either — the two are independent
+credentials, and a leaked sheet is only retired by deleting the account.
+
+**Changing a password ends every session, by design.** The route asks for the
+current password even to a signed-in operator, and rotates the session signing
+key on success, so a cookie stolen before the change stops verifying at that
+moment. That is also why the route is throttled like a sign in: it rekeys the
+door.
+
 **The one window where it protects nothing: before the wizard is finished.** With
 no `/data/auth/users.json`, `POST /_auth/setup` needs no session at all, because
 that is what creates the first account. Between the moment the container starts
@@ -144,16 +167,27 @@ What it does not do:
 
 - it is not a sandbox: once you are authenticated, you get exactly what the
   runtime offers, including a shell through the agent;
-- it is not a multi-user system: one instance, one account. There is no account
-  management interface, no password reset, no audit log of what the agent does;
+- it is not a multi-role system: several accounts can exist, but one of them
+  (the first wizard's) owns account management and every account holds the same
+  rights over the instance. There is no per-user audit log of what the agent
+  does;
+- there is no password recovery without a credential: changing the password
+  requires the current one, a recovery code covers a lost authenticator (not a
+  lost password), and the last resort remains deleting `/data/auth`, which
+  reopens the ownership window;
 - it terminates TLS with a certificate it generates itself, which encrypts but
   does not authenticate the server (see the TLS section above). For a certificate
   the browser actually trusts, put a reverse proxy in front and set
   `ZCLOUDIUM_TLS=off`;
 - its accounts live in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
-  mode 0600) and its signing key in `/data/auth/secret.key`. Anyone who can read
-  the volume can run the instance, and can also add an account;
-- the failure counter is in memory: restarting the container resets it.
+  hashed recovery sheets, mode 0600), its signing key in
+  `/data/auth/secret.key`, and its failure budget in
+  `/data/auth/failures.json`. Anyone who can read the volume can run the
+  instance, add an account, or wipe the failure budget: the volume is the trust
+  boundary, and the budget being on disk is what makes a restart not reset it;
+- the failure counter is persisted with every change, so restarting no longer
+  clears it; a block still ends after five minutes and the budget still starts
+  again after it, as before.
 
 Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
 to change it, a positive number of hours, anything else is refused and replaced
@@ -273,8 +307,10 @@ Read this before launching the full access profile.
 8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.
-9. **Web mode has no multi-user management**: no accounts beyond the single
-   gateway account, no audit log of the agent's actions, no per-user isolation.
+9. **Web mode has no per-user isolation**: several accounts can exist, but they
+   all hold the same rights over the one agent and the one workspace, and there
+   is no audit log of the agent's actions. The only distinction is account
+   management, which the owner account alone can do.
 
 ## Recommendations
 

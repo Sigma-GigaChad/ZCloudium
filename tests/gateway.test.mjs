@@ -646,3 +646,252 @@ test("a backslash in next cannot turn a successful sign in into an open redirect
       assert.equal(step2.headers.get("location"), "/", `next=${next} must land on the root of this origin`);
     }
   }));
+
+/**
+ * The security headers of every page the gateway itself serves. The policy is
+ * closed: no source of anything, inline styles for the theme, and the one inline
+ * script by its hash, so an injected script of any other shape is the browser's
+ * problem to refuse, not only ours.
+ */
+test("every gateway page carries a closed content security policy", () =>
+  withGateway(async ({ base }) => {
+    const response = await fetch(`${base}/_auth/login`);
+    const policy = response.headers.get("content-security-policy") ?? "";
+    assert.match(policy, /default-src 'none'/);
+    assert.match(policy, /script-src 'sha256-[A-Za-z0-9+/=]{43,44}'/, "the one script is allowed by hash, not by 'unsafe-inline'");
+    assert.match(policy, /form-action 'self'/);
+    assert.match(policy, /frame-ancestors 'none'/);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(response.headers.get("x-frame-options"), "DENY");
+
+    const health = await fetch(`${base}/_auth/health`);
+    assert.equal(health.headers.get("x-content-type-options"), "nosniff", "the plain answers carry it too");
+  }));
+
+/**
+ * Recovery codes, end to end: shown once at enrolment, stored hashed, each one
+ * a single sign in.
+ */
+test("enrolment shows a sheet of recovery codes, and only their hashes persist", () =>
+  withGateway(async ({ base, dataDir, now }) => {
+    const step1 = await post(base, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(step1, "zc_setup");
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const shown = page.match(/class="secret recovery-sheet">([\s\S]*?)<\/code>/)?.[1] ?? "";
+    const codes = [...shown.matchAll(/[A-Z2-9]{4}-[A-Z2-9]{4}/g)].map((match) => match[0]);
+    assert.equal(codes.length, 10, "the whole sheet is on the enrolment page");
+
+    const code = totp(page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, ""), { at: now() });
+    await post(base, "/_auth/setup/totp", { code }, setupCookie);
+
+    const stored = JSON.parse(await readFile(join(dataDir, "auth", "users.json"), "utf8"));
+    const sheet = stored.users[USERNAME].recoveryCodes;
+    assert.equal(sheet.length, 10);
+    assert.equal(sheet.every((entry) => /^[0-9a-f]{64}$/.test(entry.hash) && entry.used === false), true,
+      "only hashes are stored, all unused");
+    assert.equal(JSON.stringify(stored).includes(codes[0]), false, "the clear text codes never persist");
+  }));
+
+test("a recovery code signs in once, and the same code is refused afterwards", () =>
+  withGateway(async ({ base, now }) => {
+    const step1 = await post(base, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(step1, "zc_setup");
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const recovery = page.match(/[A-Z2-9]{4}-[A-Z2-9]{4}/)?.[0];
+    const secret = page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+
+    // Password accepted, then the recovery code instead of a TOTP code.
+    const login = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const first = await post(base, "/_auth/verify", { code: recovery.toLowerCase() }, loginCookie);
+    assert.equal(first.status, 303, "a recovery code in any spelling completes the sign in");
+    assert.ok(cookieFrom(first, "zc_sess"), "it issues a session");
+
+    const second = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const secondLoginCookie = cookieFrom(second, "zc_login");
+    const replay = await post(base, "/_auth/verify", { code: recovery }, secondLoginCookie);
+    assert.equal(replay.status, 401, "the same code is not a way in twice");
+  }));
+
+/**
+ * The password change: guarded by the current password, and it ends every
+ * session by rotating the signing key.
+ */
+test("changing the password requires the current one and kills every session", () =>
+  withGateway(async ({ base, now, dataDir }) => {
+    const { session } = await completeSetup(base, now);
+    const keyBefore = await readFile(join(dataDir, "auth", "secret.key"));
+
+    const anonymous = await fetch(`${base}/_auth/password`, { redirect: "manual" });
+    assert.equal(anonymous.status, 302, "the form asks for a session first");
+
+    const wrong = await post(base, "/_auth/password", { current: "not-the-password", password: "another-horse-battery-2", password2: "another-horse-battery-2" }, session);
+    assert.equal(wrong.status, 401, "a wrong current password is refused");
+
+    const weak = await post(base, "/_auth/password", { current: PASSWORD, password: "short", password2: "short" }, session);
+    assert.equal(weak.status, 400, "the strength rules apply to the new password too");
+
+    const changed = await post(base, "/_auth/password", { current: PASSWORD, password: "another-horse-battery-2", password2: "another-horse-battery-2" }, session);
+    assert.equal(changed.status, 303);
+    assert.equal(changed.headers.get("location"), "/_auth/login?next=%2F");
+    assert.equal(cookieFrom(changed, "zc_sess"), "zc_sess=", "the changing session itself is cleared");
+
+    const keyAfter = await readFile(join(dataDir, "auth", "secret.key"));
+    assert.notEqual(keyBefore.equals(keyAfter), true, "the signing key rotated");
+
+    const stale = await fetch(`${base}/some/path`, { headers: { cookie: session }, redirect: "manual" });
+    assert.equal(stale.status, 302, "a cookie signed with the old key authorises nothing");
+    assert.match(stale.headers.get("location"), /\/_auth\/login/);
+
+    const fresh = await post(base, "/_auth/login", { username: USERNAME, password: "another-horse-battery-2" });
+    assert.equal(fresh.status, 303, "the new password signs in");
+  }));
+
+/**
+ * The failure budget survives the process: the counter is persisted, so a
+ * container restart must not hand back a fresh budget. A gateway that dies under
+ * a brute force attempt, or a container that crash loops, keeps the blocks and
+ * the counts it had.
+ */
+test("the failure block survives a gateway restart", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
+  let clock = Date.now();
+  const now = () => clock;
+  const first = await createGateway({ upstreamUrl: "http://127.0.0.1:1", dataDir, logger: () => {}, now });
+  try {
+    for (let index = 0; index < MAX_FAILURES; index += 1) {
+      clock += 1_000;
+      const response = await post(`http://127.0.0.1:${first.port}`, "/_auth/login", { username: USERNAME, password: "wrong" });
+      assert.equal(response.status, 401);
+    }
+    const blocked = await post(`http://127.0.0.1:${first.port}`, "/_auth/login", { username: USERNAME, password: "wrong" });
+    assert.equal(blocked.status, 429, "the eighth failure blocks, as always");
+  } finally {
+    await first.close();
+  }
+
+  const stored = JSON.parse(await readFile(join(dataDir, "auth", "failures.json"), "utf8"));
+  assert.equal(Object.values(stored).some((entry) => entry.blockedUntil > clock), true,
+    "the block is on disk before the second start");
+
+  const second = await createGateway({ upstreamUrl: "http://127.0.0.1:1", dataDir, logger: () => {}, now });
+  try {
+    const afterRestart = await post(`http://127.0.0.1:${second.port}`, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    assert.equal(afterRestart.status, 429, "a restarted gateway keeps the block it was left");
+  } finally {
+    await second.close();
+  }
+  await rm(dataDir, { recursive: true, force: true });
+});
+
+/**
+ * Metrics: behind the session, in the Prometheus text format, and the numbers
+ * are the ones the gateway actually counted.
+ */
+test("metrics sit behind the session and count what happened", () =>
+  withGateway(async ({ base, now }) => {
+    const anonymous = await fetch(`${base}/_auth/metrics`, { redirect: "manual" });
+    assert.equal(anonymous.status, 302, "a stranger is sent to the sign in page");
+
+    await post(base, "/_auth/login", { username: USERNAME, password: "wrong" });
+    const { session } = await completeSetup(base, now);
+    const page = await (await fetch(`${base}/_auth/metrics`, { headers: { cookie: session } })).text();
+
+    assert.match(page, /^gateway_auth_failures_total 1$/m, "the wrong password was counted");
+    assert.match(page, /^gateway_sessions_issued_total 1$/m);
+    assert.match(page, /^gateway_recovery_codes_used_total 0$/m);
+    assert.match(page, /# TYPE gateway_auth_blocks_total counter/);
+    const proxied = await fetch(`${base}/anything`, { headers: { cookie: session } });
+    await proxied.text();
+    const after = await (await fetch(`${base}/_auth/metrics`, { headers: { cookie: session } })).text();
+    assert.match(after, /^gateway_upstream_requests_total 1$/m, "a proxied request was counted");
+  }));
+
+/**
+ * Owner and accounts: the first account owns the instance, creates the others,
+ * and nobody else can.
+ */
+test("the owner creates a second account, which signs in on its own credentials", () =>
+  withGateway(async ({ base, now, advance }) => {
+    const { session } = await completeSetup(base, now);
+
+    const created = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+    assert.equal(created.status, 303);
+    assert.equal(created.headers.get("location"), "/_auth/setup/totp");
+    const setupCookie = cookieFrom(created, "zc_setup");
+
+    const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const page = await enroll.text();
+    const secret = page.match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    assert.ok(secret, "the new account's enrolment page shows its own secret");
+
+    const confirmed = await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+    assert.equal(confirmed.status, 303);
+    assert.equal(confirmed.headers.get("location"), "/_auth/users?created=colleague",
+      "the operator is taken back to the account list, not signed in as the new user");
+    assert.equal(cookieFrom(confirmed, "zc_sess"), null, "no session is issued for the new user in the operator's browser");
+
+    // A different TOTP step than the one the enrolment consumed, which is the
+    // replay rule every sign in lives by.
+    advance(30_000);
+    const login = await post(base, "/_auth/login", { username: "colleague", password: "a-fine-long-passphrase" });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const verified = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, loginCookie);
+    const colleagueSession = cookieFrom(verified, "zc_sess");
+    assert.ok(colleagueSession, "the new account signs in with its own credentials");
+
+    const list = await fetch(`${base}/_auth/users`, { headers: { cookie: session } });
+    assert.equal(list.status, 200);
+    assert.match(await list.text(), /colleague/);
+
+    const refused = await fetch(`${base}/_auth/users`, { headers: { cookie: colleagueSession } });
+    assert.equal(refused.status, 403, "only the owner manages accounts");
+
+    const duplicate = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+    assert.equal(duplicate.status, 303);
+    assert.match(duplicate.headers.get("location"), /error=That%20username%20already%20exists/);
+  }));
+
+test("the first-run wizard stays exclusive once an account exists", () =>
+  withGateway(async ({ base, now }) => {
+    await completeSetup(base, now);
+    const attempt = await post(base, "/_auth/setup", { username: "intruder", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" });
+    assert.equal(attempt.status, 409, "with an owner present, the wizard answers for the owner only");
+  }));
+
+/**
+ * The 502 page: an operator whose runtime is down gets a page that explains
+ * itself and retries, not a bare string.
+ */
+test("a dead upstream answers with an html page that reloads itself", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
+  const gateway = await createGateway({
+    // Port 1 on loopback: nothing listens there, so every proxied request fails.
+    upstreamUrl: "http://127.0.0.1:1",
+    dataDir,
+    logger: () => {},
+  });
+  try {
+    const setupStep = await post(`http://127.0.0.1:${gateway.port}`, "/_auth/setup", { username: USERNAME, password: PASSWORD, password2: PASSWORD });
+    const setupCookie = cookieFrom(setupStep, "zc_setup");
+    const enroll = await fetch(`http://127.0.0.1:${gateway.port}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+    const secret = (await enroll.text()).match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+    const confirmed = await post(`http://127.0.0.1:${gateway.port}`, "/_auth/setup/totp", { code: totp(secret, { at: Date.now() }) }, setupCookie);
+    const session = cookieFrom(confirmed, "zc_sess");
+
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/`, { headers: { cookie: session } });
+    assert.equal(response.status, 502);
+    assert.match(response.headers.get("content-type") ?? "", /text\/html/);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    const body = await response.text();
+    assert.match(body, /http-equiv="refresh" content="10"/, "the page retries on its own");
+    assert.match(body, /not answering/i);
+  } finally {
+    await gateway.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});

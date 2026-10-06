@@ -9,6 +9,32 @@ project exists because upstream `zai-org/ZCode` **publishes no server binary**
 (desktop installers only), which would otherwise mean compiling the whole
 monorepo for every version.
 
+```text
+                published port 3030 (https by default)
+  operator ─────────────────────────────────────────────┐
+  browser                                             ┌─┴──────────────┐
+   │ password + TOTP                                  │     gateway    │
+   └────────────────────────────────────────────────► │  /_auth/* own  │
+                                                      │  pages, CSP    │
+                                                      │  sessions,     │
+                                                      │  rate limit    │
+                                                      └───────┬────────┘
+                                           proxies everything else
+                                                      ┌───────▼────────┐
+                                                      │  ZCode runtime │
+                                                      │  on 127.0.0.1  │
+                                                      │  :3131 only    │
+                                                      └───┬────────┬───┘
+                                                 ┌────────┘        └─────────┐
+                                            /data volume       /workspace volume
+                                    accounts, session key,   the agent's files:
+                                    TLS cert, settings,      projects, git repos
+                                    skills, agent config
+```
+
+The gateway is an additive layer: it imports no application code, never edits a
+runtime answer, and an upstream update cannot break it.
+
 ## Quick start
 
 No clone, no login: the image is public. Save this as `compose.yaml` in an
@@ -122,6 +148,24 @@ container runs as uid 1000):
 - /srv/z-cloudium/workspace:/workspace
 ```
 
+### Backing up and restoring /data
+
+`/data` holds the accounts, the session signing key, the TLS certificate, the
+settings, the skills and the agent configuration: it is the instance.
+`backup-data.sh` snapshots it through a throwaway container and restores it
+back:
+
+```bash
+./backup-data.sh                                      # -> ./z-cloudium-data-<timestamp>.tar.gz
+./backup-data.sh --list                               # the backups of the directory
+./backup-data.sh --restore z-cloudium-data-...tar.gz  # replaces the volume (stop the container first)
+```
+
+The archive is **not encrypted** (it contains scrypt hashes and TOTP secrets):
+store it where you would store the volume itself. On another name than
+`z-cloudium-data`, pass the volume as the first argument or set
+`ZCLOUDIUM_DATA_VOLUME`.
+
 ## Authentication
 
 The published port is served by an authentication gateway, which comes with the
@@ -131,8 +175,37 @@ is reachable only through that gateway.
 - **First connection**: the setup wizard asks for a username, a password (at
   least 12 characters), then the enrolment of a TOTP code (RFC 6238), displayed
   as a QR code and as an `otpauth://` URI for your authenticator application.
+  The enrolment page also shows **ten recovery codes**: each one signs in once
+  in place of the TOTP code. Save them when they are shown, because they are
+  never displayed again, and only their hashes are stored (in
+  `/data/auth/users.json`, single use, each one marked as it is spent).
 - **Later connections**: username and password, then the six digit code. A code
-  cannot be replayed: the last accepted step is stored server side.
+  cannot be replayed: the last accepted step is stored server side. A recovery
+  code (in any spelling: dashes, spaces, lower case) is accepted in the same
+  field and works exactly once.
+- **Password change**: `/_auth/password`, behind the session, asks for the
+  current password. On success the session signing key is rotated, so **every**
+  session ends at that moment, including the one that made the change and any
+  cookie stolen before it: the answer to a leaked cookie is to change the
+  password. There is still no "forgot password" route that works without the
+  current credentials; the last resorts are a recovery code (if the
+  authenticator, not the password, was lost) or deleting `/data/auth`.
+- **Accounts**: the account created by the first wizard is the **owner**, and
+  only it can create further accounts (`/_auth/users`, behind its session). The
+  owner enrols the new account and relays its authenticator secret and recovery
+  codes; the new user then signs in and is expected to change the password. Any
+  account can use the interface with the same rights; there are no per-account
+  roles or restrictions beyond account management being owner-only. Stored in
+  `/data/auth/users.json` (scrypt hashes, TOTP secrets, hashed recovery sheets,
+  owner flag, mode 0600). The session signing key is `/data/auth/secret.key`.
+  Removing `/data/auth` resets the whole thing and the wizard runs again, which
+  reopens the first connection window: until the wizard is finished again,
+  anyone can claim the instance.
+- **Metrics**: `/_auth/metrics`, behind the session, answers the Prometheus
+  text format: failed attempts, blocks applied, sessions issued, recovery codes
+  used, requests proxied to the runtime and cumulative proxying time. It is for
+  an operator reading it (or scraping it) rather than a dashboard: plain
+  counters, no labels, no histograms.
 - **Sessions**: an HMAC signed cookie, **12 hours by default**. The lifetime is
   the window during which a stolen cookie stays usable, so it is short on
   purpose, and on the full access profile that cookie is worth root on the
@@ -143,16 +216,17 @@ is reachable only through that gateway.
   `/data/auth/secret.key` to invalidate every session at once (the next start
   creates a new signing key, so every existing cookie stops verifying), or
   `/data/auth` to reset the account and the sessions together, which brings the
-  setup wizard back. There is no password change route: resetting the account is
-  how you rotate the credentials.
+  setup wizard back. Changing a password rotates the key automatically.
 - **Failures**: eight failed attempts from the same key block that key for five
-  minutes, and the limit applies to all three steps (the password, the six digit
-  code, and the TOTP enrolment of the first connection), so a known password does
-  not leave the code open to be walked through. The block is a real bound: the
-  failure budget expires with it, so the first failure after a block ends starts
-  a fresh count and eight new failures are needed before the key is blocked
-  again. A failed attempt every five minutes therefore cannot keep a key blocked
-  for good. The key is the connecting socket address: the `x-forwarded-for`
+  minutes, and the limit applies to every gated step (the password, the six digit
+  code, the TOTP enrolment of the first connection, and the current password of
+  the change form), so a known password does not leave the code open to be
+  walked through. The block is a real bound: the failure budget expires with it,
+  so the first failure after a block ends starts a fresh count and eight new
+  failures are needed before the key is blocked again. A failed attempt every
+  five minutes therefore cannot keep a key blocked for good. The budget is
+  persisted in `/data/auth/failures.json`, so restarting the container does not
+  reset it. The key is the connecting socket address: the `x-forwarded-for`
   header is ignored unless you set `ZCLOUDIUM_TRUST_PROXY=on`, which is only
   correct behind a proxy that overwrites that header. Behind the Docker port
   mapping every client shares one socket address, so the block is global: eight
@@ -166,11 +240,6 @@ is reachable only through that gateway.
   interface shell: the container still reports healthy, but the probe no longer
   tests the gateway (both compose files carry a commented override that probes
   `/api/server-info` instead).
-- **Accounts**: stored in `/data/auth/users.json` (scrypt hashes, TOTP secrets,
-  mode 0600). The session signing key is `/data/auth/secret.key`. Removing
-  `/data/auth` resets the whole thing and the wizard runs again, which reopens
-  the first connection window: until the wizard is finished again, anyone can
-  claim the instance.
 
 ### Turning authentication off
 
@@ -229,7 +298,11 @@ it.
 
 **The gateway serves https by default**, with a certificate it generates on first
 start into `<data>/tls/` and keeps afterwards (it is replaced when it expires, when
-it stops naming a host, or when it cannot be read). Nobody has to ask for an
+it stops naming a host, or when it cannot be read). The certificate is **ECDSA
+P-256**: the handshakes are markedly cheaper in CPU than RSA's for a curve every
+browser agrees on. A certificate that is already on a volume and still names its
+hosts is kept whatever its algorithm, so an RSA certificate from an older
+deployment is not force-replaced. Nobody has to ask for an
 encrypted connection, and nobody has to think about it.
 
 What that buys, and it is more than encryption: an https origin is a **secure
@@ -467,8 +540,11 @@ Tested by actually running things, not only written. The measurements below date
 from the run that made them: where one names a version, that is the version it
 was measured on, while `zcode.version` is what a build carries today.
 
-- **test suite**: 85 tests, 85 pass, 0 fail (`node --test --test-force-exit`,
-  which prints the count and exits on its own)
+- **test suite**: 100 tests, 100 pass, 0 fail (`node --test --test-force-exit`,
+  which prints the count and exits on its own). The new features carry their own
+  tests: the recovery sheet arithmetic, the single-use rule end to end, the
+  password change and the key rotation it forces, the failure budget surviving a
+  restart, the metrics counters, the owner flow, and the 502 page
 - **image build**: 0.89 GB, and the image agrees with its own tag: the runtime
   answers the version `zcode.version` pins, and the OCI labels carry the tag
   and the pinned sha256
@@ -571,6 +647,10 @@ was measured on, while `zcode.version` is what a build carries today.
   bind mount, remember `chown 1000:1000` on the host.
 - **`server-info` announces `3.14.0`** while the release tag is `v3.14.3`: the
   image tag is what counts.
+- **x64 only, for now**: the runtime tarball embeds prebuilt `node-pty` binaries
+  for `linux-x64` and no `arm64` or `musl` variant, so an arm64 host (Raspberry
+  Pi, NAS, ARM Mac) has nothing to run. Serving arm64 means compiling node-pty
+  for it, which means the from-source path.
 - **Gateway files** live in `/opt/cloudium/gateway`, outside `/opt/zcodium`, so
   the third party runtime directory stays exactly as it was extracted. The
   gateway imports no application code: it is an additive layer, and an upstream

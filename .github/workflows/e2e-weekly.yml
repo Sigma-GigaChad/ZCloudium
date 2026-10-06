@@ -1,0 +1,75 @@
+name: e2e-weekly
+
+# The published image, tested on a schedule.
+#
+# The e2e workflow proves that the code in a push works as an image it builds
+# itself. Once that image is published and the repository moves on, nothing
+# looked at the artifact again: an image that worked at push time can still be
+# broken by a base image republish or by the registry layer it was tagged from.
+# This job builds nothing: it pulls `latest` from the registry and runs the same
+# suite against it, so a drift between what the repo ships and what the registry
+# serves is caught within a week rather than by an operator.
+#
+# On failure it opens one issue and reuses it while it stays open, so a broken
+# image is a visible, tracked thing rather than a red check nobody watches.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  IMAGE: ghcr.io/sigma-gigachad/z-cloudium:latest
+  PORT: "3032"
+  PREFIX: zcloudium-e2e-weekly
+
+jobs:
+  against-published-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pull the published image
+        run: docker pull "$IMAGE"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install the suite
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install the browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the suite against the published image
+        working-directory: e2e/scripts
+        run: bash ./run-e2e.sh "$IMAGE" "$PORT" "$PREFIX"
+
+      - name: Open an issue when the published image fails
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing="$(gh issue list --state open --search 'in:title Weekly e2e against the published image failed' --json number --jq '.[0].number' || true)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $RUN_URL"
+          else
+            gh issue create \
+              --title "Weekly e2e against the published image failed" \
+              --body "The scheduled run of the e2e suite against the published \`latest\` image failed: $RUN_URL" \
+              --label bug || true
+          fi
+
+      - name: Stop the container
+        if: always()
+        working-directory: e2e/scripts
+        run: bash ./stop-container.sh "$PREFIX" || true

@@ -115,13 +115,15 @@ test("addresses are IP entries and names are DNS entries", () => {
   assert.equal(subjectAltNames(["localhost", "127.0.0.1", "::1", "nas.local"]), "DNS:localhost,IP:127.0.0.1,IP:::1,DNS:nas.local");
 });
 
-test("openssl is asked for a self-signed certificate with those names", () => {
+test("openssl is asked for a self-signed ECDSA certificate with those names", () => {
   const args = opensslArgs({ cert: "/data/tls/cert.pem", key: "/data/tls/key.pem", hosts: ["localhost", "10.0.0.5"], days: 30 });
   assert.deepEqual(args, [
     "req",
     "-x509",
     "-newkey",
-    "rsa:2048",
+    "ec",
+    "-pkeyopt",
+    "ec_paramgen_curve:P-256",
     "-sha256",
     "-days",
     "30",
@@ -135,8 +137,12 @@ test("openssl is asked for a self-signed certificate with those names", () => {
     "-addext",
     "subjectAltName=DNS:localhost,IP:10.0.0.5",
   ]);
+  // P-256 rather than RSA: a handshake is an order of magnitude cheaper to sign,
+  // for a curve everything agrees on. A certificate already on a volume is kept
+  // whatever its algorithm, so the win applies to new certificates only.
+  assert.ok(opensslArgs({ cert: "c", key: "k", hosts: [] }).includes("ec_paramgen_curve:P-256"));
   // The default lifetime is the one the module documents.
-  assert.equal(opensslArgs({ cert: "c", key: "k", hosts: ["localhost"] })[6], String(TLS_DAYS));
+  assert.equal(opensslArgs({ cert: "c", key: "k", hosts: ["localhost"] })[8], String(TLS_DAYS));
   // -nodes is what keeps the key unencrypted, which is what a server needs: a
   // passphrase would have to be stored somewhere, which is worse than a file
   // mode of 600 on a volume only this container can read.

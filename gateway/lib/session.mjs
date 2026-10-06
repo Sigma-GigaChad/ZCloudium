@@ -38,6 +38,22 @@ export async function loadOrCreateSessionKey(filePath) {
   return key;
 }
 
+/**
+ * Writes a fresh signing key and returns it, which ends every existing session
+ * at once: no cookie signed with the old key verifies any more.
+ *
+ * This is what a password change calls, so that a session stolen before the
+ * change cannot outlive it. The caller must reload its copy of the key, and
+ * every pending cookie dies with the sessions.
+ */
+export async function rotateSessionKey(filePath) {
+  const key = createSessionKey();
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, key, { mode: 0o600 });
+  await chmod(filePath, 0o600).catch(() => {});
+  return key;
+}
+
 function sign(body, key) {
   return createHmac("sha256", key).update(body).digest("base64url");
 }

@@ -12,19 +12,35 @@ import { createServer as createSecureServer } from "node:https";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
+  generateRecoveryCodes,
+  hashRecoveryCode,
+  looksLikeRecoveryCode,
+  findUnusedRecoveryCode,
+} from "./recovery.mjs";
+import {
   DEFAULT_SESSION_TTL_MS,
   PENDING_LOGIN_COOKIE,
   PENDING_SETUP_COOKIE,
   SESSION_COOKIE,
   clearedCookie,
   loadOrCreateSessionKey,
+  rotateSessionKey,
   parseCookies,
   pendingCookie,
   sessionCookie,
   signSession,
   verifySession,
 } from "./session.mjs";
-import { findUser, hasUsers, readUsers, sessionKeyPath, writeUsers } from "./store.mjs";
+import {
+  findUser,
+  hasUsers,
+  ownerOf,
+  readFailures,
+  readUsers,
+  sessionKeyPath,
+  writeFailures,
+  writeUsers,
+} from "./store.mjs";
 import * as pages from "./pages.mjs";
 
 const AUTH_PREFIX = "/_auth";
@@ -33,8 +49,9 @@ const ISSUER = "ZCloudium";
 const PENDING_TTL_SECONDS = 600;
 /**
  * Failed attempts allowed from one rate limit key before it is blocked, and how
- * long the block lasts. The limit applies to the password step, the code step and
- * the enrolment step, so a six digit second factor cannot be walked through.
+ * long the block lasts. The limit applies to the password step, the code step,
+ * the enrolment step and the password change, so a six digit second factor
+ * cannot be walked through.
  *
  * The key is the connecting socket address by default. See `trustProxy` below.
  */
@@ -49,12 +66,33 @@ export const BLOCK_MS = 5 * 60 * 1000;
 /** Raised against a fixed origin to prove that a `next` value stays on it. */
 const NEXT_ORIGIN = "http://gateway.invalid";
 
+/**
+ * The headers every page of the gateway's own carries.
+ *
+ * The pages are static html with inline styles, and exactly one inline script
+ * (the copy button of the enrolment page), so the policy can be closed to
+ * everything except that: `default-src 'none'`, inline styles, and the one
+ * script by its sha256 hash. An injected script of any other shape, from any
+ * other source, is refused by the browser rather than by us.
+ */
+function pageHeaders() {
+  return {
+    "content-security-policy":
+      `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${pages.COPY_SCRIPT_SHA256}'; ` +
+      "img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-frame-options": "DENY",
+    "cache-control": "no-store",
+  };
+}
+
 function html(res, status, body) {
   const buffer = Buffer.from(body, "utf8");
   res.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "content-length": buffer.length,
-    "cache-control": "no-store",
+    ...pageHeaders(),
   });
   res.end(buffer);
 }
@@ -134,6 +172,46 @@ export function safeNext(value) {
   }
 }
 
+/**
+ * The counters /_auth/metrics exposes. Plain increments: the page is for an
+ * operator reading it, not for a dashboard that needs histograms, and every
+ * number here is one the gateway already knows.
+ */
+function newCounters() {
+  return {
+    authFailures: 0,
+    authBlocks: 0,
+    sessionsIssued: 0,
+    recoveryCodesUsed: 0,
+    upstreamRequests: 0,
+    upstreamDurationMs: 0,
+  };
+}
+
+function metricsPage(counters) {
+  const lines = [
+    "# HELP gateway_auth_failures_total Failed authentication attempts, every step counted.",
+    "# TYPE gateway_auth_failures_total counter",
+    `gateway_auth_failures_total ${counters.authFailures}`,
+    "# HELP gateway_auth_blocks_total Rate limit blocks applied.",
+    "# TYPE gateway_auth_blocks_total counter",
+    `gateway_auth_blocks_total ${counters.authBlocks}`,
+    "# HELP gateway_sessions_issued_total Sessions issued by sign in and enrolment.",
+    "# TYPE gateway_sessions_issued_total counter",
+    `gateway_sessions_issued_total ${counters.sessionsIssued}`,
+    "# HELP gateway_recovery_codes_used_total Recovery codes consumed at sign in.",
+    "# TYPE gateway_recovery_codes_used_total counter",
+    `gateway_recovery_codes_used_total ${counters.recoveryCodesUsed}`,
+    "# HELP gateway_upstream_requests_total Requests proxied to the runtime.",
+    "# TYPE gateway_upstream_requests_total counter",
+    `gateway_upstream_requests_total ${counters.upstreamRequests}`,
+    "# HELP gateway_upstream_duration_milliseconds_total Cumulative milliseconds spent proxying to the runtime.",
+    "# TYPE gateway_upstream_duration_milliseconds_total counter",
+    `gateway_upstream_duration_milliseconds_total ${counters.upstreamDurationMs}`,
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
 export async function createGateway({
   upstreamUrl,
   dataDir,
@@ -174,9 +252,12 @@ export async function createGateway({
     throw new Error("createGateway requires an upstreamUrl");
   }
 
-  const key = await loadOrCreateSessionKey(sessionKeyPath(dataDir));
+  let key = await loadOrCreateSessionKey(sessionKeyPath(dataDir));
   const target = new URL(upstreamUrl);
-  const failures = new Map();
+  const counters = newCounters();
+  // The budget survives the process: a restarted container keeps the blocks and
+  // the counts it had, which is the whole point of persisting it.
+  const failures = new Map(Object.entries(await readFailures(dataDir)));
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
   const upgradedSockets = new Set();
@@ -195,7 +276,24 @@ export async function createGateway({
     const entry = failures.get(address);
     return Boolean(entry) && entry.blockedUntil > now();
   };
-  const noteFailure = (address) => {
+
+  /**
+   * Persists the budget with every change, minus what has fully expired. A write
+   * per failure is cheap (a map of a few keys) and keeps the file an exact
+   * picture of what the gateway is enforcing.
+   */
+  const persistFailures = () => {
+    const at = now();
+    const remaining = {};
+    for (const [address, entry] of failures) {
+      if (entry.blockedUntil > at || entry.count > 0) {
+        remaining[address] = entry;
+      }
+    }
+    return writeFailures(dataDir, remaining);
+  };
+
+  const noteFailure = async (address) => {
     const at = now();
     const stored = failures.get(address);
     // A block that has ended also ends the budget behind it, so the count starts
@@ -207,11 +305,18 @@ export async function createGateway({
     entry.count += 1;
     if (entry.count >= MAX_FAILURES) {
       entry.blockedUntil = at + BLOCK_MS;
+      counters.authBlocks += 1;
       logger(`[auth] too many failures from ${address}, temporarily blocked`);
     }
     failures.set(address, entry);
+    counters.authFailures += 1;
+    await persistFailures();
   };
-  const noteSuccess = (address) => failures.delete(address);
+  const noteSuccess = (address) => {
+    if (failures.delete(address)) {
+      void persistFailures();
+    }
+  };
 
   const cookiesOf = (req) => parseCookies(req.headers.cookie);
   const sessionOf = (req) => verifySession(cookiesOf(req)[SESSION_COOKIE], key, { at: now() });
@@ -220,6 +325,21 @@ export async function createGateway({
   const pendingLoginOf = (req) =>
     verifySession(cookiesOf(req)[PENDING_LOGIN_COOKIE], key, { at: now() });
 
+  /** A displayed sheet becomes a stored sheet: only the hashes persist. */
+  const recoverySheetOf = (codes) =>
+    (codes ?? []).map((code) => ({ hash: hashRecoveryCode(code), used: false }));
+
+  /**
+   * The enrolment page context of a pending setup: everything its account will
+   * need, with the recovery codes that are shown exactly here.
+   */
+  const enrolmentContext = (pending) => ({
+    secret: pending.totpSecret,
+    uri: otpauthUri({ secret: pending.totpSecret, issuer: ISSUER, account: pending.username }),
+    account: pending.username,
+    recoveryCodes: pending.recoveryCodes,
+  });
+
   async function handleAuth(req, res, url) {
     const { pathname } = url;
     const address = clientAddress(req);
@@ -227,8 +347,31 @@ export async function createGateway({
 
     if (pathname === `${AUTH_PREFIX}/health`) {
       const buffer = Buffer.from("ok\n", "utf8");
-      res.writeHead(200, { "content-type": "text/plain", "content-length": buffer.length });
+      res.writeHead(200, {
+        "content-type": "text/plain",
+        "content-length": buffer.length,
+        "x-content-type-options": "nosniff",
+      });
       res.end(buffer);
+      return;
+    }
+
+    if (pathname === `${AUTH_PREFIX}/metrics`) {
+      // Behind the session like everything else: the counters name no one, but
+      // they describe an instance's authentication, which is not a stranger's
+      // business.
+      if (!sessionOf(req)) {
+        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(pathname)}`);
+        return;
+      }
+      const body = Buffer.from(metricsPage(counters), "utf8");
+      res.writeHead(200, {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        "content-length": body.length,
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+      });
+      res.end(body);
       return;
     }
 
@@ -251,7 +394,7 @@ export async function createGateway({
         const user = findUser(users, String(form.username ?? ""));
         const ok = user ? await verifyPassword(String(form.password ?? ""), user.password) : false;
         if (!ok) {
-          noteFailure(address);
+          await noteFailure(address);
           logger(`[auth] failed password attempt from ${address}`);
           html(res, 401, pages.loginPage({ error: "Incorrect username or password." }));
           return;
@@ -300,19 +443,43 @@ export async function createGateway({
           return;
         }
         const form = await readForm(req, maxBodyBytes);
-        const result = verifyTotp(user.totpSecret, String(form.code ?? ""), {
+        const typed = String(form.code ?? "");
+
+        // A recovery code signs in once: it is the way back in when the
+        // authenticator is lost. Six digits is never a recovery code, and a
+        // recovery shape is never a TOTP code, so the order costs nothing.
+        const result = verifyTotp(user.totpSecret, typed, {
           at: now(),
           lastStep: user.totpLastStep,
         });
+        if (result.ok) {
+          user.totpLastStep = result.step;
+          await writeUsers(dataDir, users);
+        } else if (looksLikeRecoveryCode(typed)) {
+          const sheetIndex = findUnusedRecoveryCode(user.recoveryCodes, typed);
+          if (sheetIndex !== null) {
+            user.recoveryCodes[sheetIndex].used = true;
+            await writeUsers(dataDir, users);
+            counters.recoveryCodesUsed += 1;
+            logger(`[auth] ${pending.user} signed in with a recovery code (${sheetIndex + 1} of the sheet used)`);
+            noteSuccess(address);
+            counters.sessionsIssued += 1;
+            const session = signSession({ user: user.username, exp: now() + sessionTtlMs }, key);
+            seeOther(res, safeNext(pending.next), [
+              sessionCookie(session, { maxAgeSeconds: Math.floor(sessionTtlMs / 1000) }),
+              clearedCookie(PENDING_LOGIN_COOKIE),
+            ]);
+            return;
+          }
+        }
         if (!result.ok) {
-          noteFailure(address);
+          await noteFailure(address);
           logger(`[auth] rejected two-factor code from ${address} (${result.reason})`);
           html(res, 401, pages.verifyPage({ error: "That code is not valid." }));
           return;
         }
-        user.totpLastStep = result.step;
-        await writeUsers(dataDir, users);
         noteSuccess(address);
+        counters.sessionsIssued += 1;
 
         const session = signSession({ user: user.username, exp: now() + sessionTtlMs }, key);
         seeOther(res, safeNext(pending.next), [
@@ -353,11 +520,16 @@ export async function createGateway({
           return;
         }
 
+        // The first account owns the instance: it is the one that will be allowed
+        // to create the others. The recovery codes travel in the pending cookie,
+        // which is signed, HttpOnly and short lived; only their hashes persist.
         const pending = signSession(
           {
             username,
             password: await hashPassword(String(form.password)),
             totpSecret: generateSecret(),
+            recoveryCodes: generateRecoveryCodes(),
+            owner: true,
             exp: now() + PENDING_TTL_SECONDS * 1000,
           },
           key,
@@ -377,12 +549,7 @@ export async function createGateway({
       }
 
       if (req.method === "GET") {
-        html(res, 200, pages.setupTotpPage({
-          secret: pending.totpSecret,
-          uri: otpauthUri({ secret: pending.totpSecret, issuer: ISSUER, account: pending.username }),
-          account: pending.username,
-          error: url.searchParams.get("error"),
-        }));
+        html(res, 200, pages.setupTotpPage({ ...enrolmentContext(pending), error: url.searchParams.get("error") }));
         return;
       }
 
@@ -398,22 +565,34 @@ export async function createGateway({
         const form = await readForm(req, maxBodyBytes);
         const result = verifyTotp(pending.totpSecret, String(form.code ?? ""), { at: now() });
         if (!result.ok) {
-          noteFailure(address);
+          await noteFailure(address);
           html(res, 400, pages.setupTotpPage({
-            secret: pending.totpSecret,
-            uri: otpauthUri({ secret: pending.totpSecret, issuer: ISSUER, account: pending.username }),
-            account: pending.username,
+            ...enrolmentContext(pending),
             error: "That code is not valid. Check the clock on your device and try again.",
           }));
           return;
         }
 
         const fresh = (await readUsers(dataDir)) ?? { version: 1, users: {} };
-        if (hasUsers(fresh)) {
+        // The first-run wizard is exclusive: with an account present, the only
+        // way in is the owner adding one from /_auth/users, which signs its
+        // pending payload with createdBy. A pending cookie that claims neither
+        // position honestly is refused.
+        const createdByOwner =
+          typeof pending.createdBy === "string" && findUser(fresh, pending.createdBy)?.owner === true;
+        if (hasUsers(fresh) && !createdByOwner) {
           html(res, 409, pages.messagePage({
             title: "Already configured",
             heading: "This instance already has an account",
             message: "Setup runs once. Sign in with the existing credentials.",
+          }));
+          return;
+        }
+        if (findUser(fresh, pending.username)) {
+          html(res, 409, pages.messagePage({
+            title: "Name taken",
+            heading: "That username already exists",
+            message: "Go back and choose another name.",
           }));
           return;
         }
@@ -422,15 +601,156 @@ export async function createGateway({
           password: pending.password,
           totpSecret: pending.totpSecret,
           totpLastStep: result.step,
+          recoveryCodes: recoverySheetOf(pending.recoveryCodes),
+          owner: pending.owner === true,
           createdAt: new Date().toISOString(),
         };
         await writeUsers(dataDir, fresh);
-        logger(`[auth] account "${pending.username}" created with two-factor authentication`);
+        logger(
+          `[auth] account "${pending.username}" created${pending.owner === true ? " (owner)" : ""} with two-factor authentication`,
+        );
 
+        if (createdByOwner) {
+          // The operator created this account on someone's behalf: no session is
+          // issued for the new user here, because the browser in front of this
+          // form belongs to the operator. The enrolment page carried the secret
+          // and the recovery codes to relay.
+          seeOther(res, `${AUTH_PREFIX}/users?created=${encodeURIComponent(pending.username)}`, [
+            clearedCookie(PENDING_SETUP_COOKIE),
+          ]);
+          return;
+        }
+        counters.sessionsIssued += 1;
         const session = signSession({ user: pending.username, exp: now() + sessionTtlMs }, key);
         seeOther(res, "/", [
           sessionCookie(session, { maxAgeSeconds: Math.floor(sessionTtlMs / 1000) }),
           clearedCookie(PENDING_SETUP_COOKIE),
+        ]);
+        return;
+      }
+    }
+
+    if (pathname === `${AUTH_PREFIX}/password`) {
+      const session = sessionOf(req);
+      if (!session) {
+        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(`${AUTH_PREFIX}/password`)}`);
+        return;
+      }
+
+      if (req.method === "GET") {
+        html(res, 200, pages.passwordPage({ error: url.searchParams.get("error") }));
+        return;
+      }
+
+      if (req.method === "POST") {
+        // The current password is asked even to a signed-in operator, and a wrong
+        // one costs a failure from the same budget as a wrong sign in: this route
+        // changes the credentials, so it is guarded like the door it rekeys.
+        if (blocked(address)) {
+          html(res, 429, tooManyAttemptsPage());
+          return;
+        }
+        const fresh = await readUsers(dataDir);
+        const user = findUser(fresh, session.user);
+        if (!user) {
+          html(res, 401, pages.messagePage({
+            title: "Unknown account",
+            heading: "Sign in again",
+            message: "This account no longer exists.",
+          }));
+          return;
+        }
+        const form = await readForm(req, maxBodyBytes);
+        const currentOk = await verifyPassword(String(form.current ?? ""), user.password);
+        if (!currentOk) {
+          await noteFailure(address);
+          logger(`[auth] wrong current password on the change form from ${address}`);
+          html(res, 401, pages.passwordPage({ error: "The current password is not correct." }));
+          return;
+        }
+        const problem = checkPasswordStrength(form.password, form.password2);
+        if (problem) {
+          html(res, 400, pages.passwordPage({ error: problem }));
+          return;
+        }
+        user.password = await hashPassword(String(form.password));
+        await writeUsers(dataDir, fresh);
+
+        // Every session ends here, on purpose: a cookie stolen before the change
+        // must not outlive it. The signing key rotates, old cookies stop
+        // verifying, and the operator signs in again with the new password.
+        key = await rotateSessionKey(sessionKeyPath(dataDir));
+        logger(`[auth] password of "${session.user}" changed; every session ended`);
+        seeOther(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent("/")}`, [
+          clearedCookie(SESSION_COOKIE),
+          clearedCookie(PENDING_LOGIN_COOKIE),
+          clearedCookie(PENDING_SETUP_COOKIE),
+        ]);
+        return;
+      }
+    }
+
+    if (pathname === `${AUTH_PREFIX}/users`) {
+      const session = sessionOf(req);
+      if (!session) {
+        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(`${AUTH_PREFIX}/users`)}`);
+        return;
+      }
+      const fresh = await readUsers(dataDir);
+      const owner = ownerOf(fresh);
+      const isOwner = owner !== null && owner.name === session.user;
+
+      if (req.method === "GET") {
+        if (!isOwner) {
+          html(res, 403, pages.messagePage({
+            title: "Not allowed",
+            heading: "Owner only",
+            message: "Only the account that ran the first wizard manages accounts.",
+          }));
+          return;
+        }
+        html(res, 200, pages.usersPage({
+          usernames: Object.keys(fresh.users),
+          owner: owner.name,
+          created: safeNext(url.searchParams.get("created")).slice(1) || null,
+          error: url.searchParams.get("error"),
+        }));
+        return;
+      }
+
+      if (req.method === "POST") {
+        if (!isOwner) {
+          html(res, 403, pages.messagePage({
+            title: "Not allowed",
+            heading: "Owner only",
+            message: "Only the account that ran the first wizard manages accounts.",
+          }));
+          return;
+        }
+        const form = await readForm(req, maxBodyBytes);
+        const username = String(form.username ?? "").trim();
+        const problem = checkPasswordStrength(form.password, form.password2);
+        if (!username || problem) {
+          seeOther(res, `${AUTH_PREFIX}/users?error=${encodeURIComponent(!username ? "A username is required." : problem)}`);
+          return;
+        }
+        if (findUser(fresh, username)) {
+          seeOther(res, `${AUTH_PREFIX}/users?error=${encodeURIComponent("That username already exists.")}`);
+          return;
+        }
+        const pending = signSession(
+          {
+            username,
+            password: await hashPassword(String(form.password)),
+            totpSecret: generateSecret(),
+            recoveryCodes: generateRecoveryCodes(),
+            createdBy: session.user,
+            exp: now() + PENDING_TTL_SECONDS * 1000,
+          },
+          key,
+        );
+        seeOther(res, `${AUTH_PREFIX}/setup/totp`, [
+          pendingCookie(PENDING_SETUP_COOKIE, pending, PENDING_TTL_SECONDS),
         ]);
         return;
       }
@@ -455,6 +775,7 @@ export async function createGateway({
     headers["x-forwarded-for"] = clientAddress(req);
     headers["x-forwarded-proto"] = req.socket.encrypted ? "https" : "http";
     delete headers["connection"];
+    const startedAt = now();
 
     const upstream = httpRequest(
       {
@@ -466,6 +787,8 @@ export async function createGateway({
         headers,
       },
       (response) => {
+        counters.upstreamRequests += 1;
+        counters.upstreamDurationMs += Math.max(0, now() - startedAt);
         res.writeHead(response.statusCode ?? 502, response.headers);
         response.pipe(res);
       },
@@ -473,9 +796,19 @@ export async function createGateway({
     upstream.on("error", (error) => {
       logger(`[auth] upstream error: ${error.message}`);
       if (!res.headersSent) {
-        res.writeHead(502, { "content-type": "text/plain" });
+        // A page rather than a bare string: the operator's browser then shows
+        // something that explains itself and retries, instead of a raw
+        // "Bad gateway" line that says nothing about what to do next.
+        const body = Buffer.from(pages.badGatewayPage(), "utf8");
+        res.writeHead(502, {
+          "content-type": "text/html; charset=utf-8",
+          "content-length": body.length,
+          ...pageHeaders(),
+        });
+        res.end(body);
+        return;
       }
-      res.end("Bad gateway");
+      res.end();
     });
     req.pipe(upstream);
   }

@@ -106,13 +106,22 @@ export function subjectAltNames(hosts) {
  * The argv openssl is called with. Pure, so the test can assert the shape without
  * running anything: a wrong flag here is a certificate that silently misses the
  * names it exists for.
+ *
+ * ECDSA P-256 rather than RSA 2048: the handshakes are markedly cheaper in CPU
+ * (a P-256 signature is an order of magnitude faster to produce than an RSA
+ * one) and the certificate is smaller, for a curve every browser and every
+ * openssl of the last decade agrees on. A certificate that already sits on a
+ * volume and still names its hosts is kept whatever its algorithm: the win is
+ * on new certificates, not on forcing a regeneration.
  */
 export function opensslArgs({ cert, key, hosts, days = TLS_DAYS } = {}) {
   return [
     "req",
     "-x509",
     "-newkey",
-    "rsa:2048",
+    "ec",
+    "-pkeyopt",
+    "ec_paramgen_curve:P-256",
     "-sha256",
     "-days",
     String(days),
