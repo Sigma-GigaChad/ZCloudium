@@ -670,6 +670,24 @@ test("every gateway page carries a closed content security policy", () =>
   }));
 
 /**
+ * The sign-in code field must be able to carry a recovery code: nine
+ * characters, letters included. A six character maxlength truncates one and a
+ * numeric pattern refuses it, and a field that cannot carry the recovery shape
+ * ships a dead feature: the browser blocks exactly the value the server
+ * accepts.
+ */
+test("the sign-in code field can carry a recovery code", () =>
+  withGateway(async ({ base, now }) => {
+    await completeSetup(base, now);
+    const login = await post(base, "/_auth/login", { username: USERNAME, password: PASSWORD });
+    const loginCookie = cookieFrom(login, "zc_login");
+    const response = await fetch(`${base}/_auth/verify`, { headers: { cookie: loginCookie } });
+    const html = await response.text();
+    assert.equal(html.includes('maxlength="10"'), true, "the field is long enough for a nine character recovery code");
+    assert.equal(html.includes('pattern="[0-9]*"'), false, "a numeric pattern would refuse the letters of a recovery code");
+  }));
+
+/**
  * Recovery codes, end to end: shown once at enrolment, stored hashed, each one
  * a single sign in.
  */

@@ -314,7 +314,7 @@ export async function createGateway({
   };
   const noteSuccess = (address) => {
     if (failures.delete(address)) {
-      void persistFailures();
+      persistFailures().catch((error) => logger(`[auth] the failure budget could not be persisted: ${error.message}`));
     }
   };
 

@@ -127,12 +127,15 @@ Every page of its own carries a closed content security policy
 browser's enforcement, not only ours.
 
 **Recovery codes, stated plainly: each one is a password.** A sheet of ten is
-shown once at enrolment, stored hashed, single use. Anyone holding the sheet
+shown once at enrolment, stored hashed, single use; that single use is enforced
+on write, not under a lock, so concurrent requests race the marking the same
+way the TOTP step's last accepted step does. Anyone holding the sheet
 signs in without the TOTP code, so the sheet is worth exactly what the instance
 is worth; treat a saved screenshot of the enrolment page like a written
-password. The clear codes exist in two places only, once each: the enrolment
-page, and the signed, HttpOnly, ten-minute pending cookie that carries the
-wizard from one step to the next. Two limits, deliberate: no "generate more
+password. The clear codes exist only inside the wizard's pending window: they
+are rendered on the enrolment page whenever the signed, HttpOnly, ten-minute
+pending cookie is presented, and they travel inside that cookie; outside that
+window, only hashes exist. Two limits, deliberate: no "generate more
 codes" route: a used-up sheet means the operator rotates the account, and a
 password change does not invalidate a sheet either — the two are independent
 credentials, and a leaked sheet is only retired by deleting the account.

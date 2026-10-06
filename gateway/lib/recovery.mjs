@@ -7,10 +7,11 @@
  * hole the same way every major service does it.
  *
  * The codes are random, not user chosen, so a plain SHA-256 is the right hash:
- * there is no entropy to stretch. They are stored hashed and single use, and the
- * clear text exists in exactly two places, once each: the enrolment page that
- * displays them, and the pending cookie that carries them from one wizard step
- * to the next (signed, HttpOnly, ten minutes).
+ * there is no entropy to stretch. They are stored hashed and single use. The
+ * clear text exists only inside the wizard's pending window: the codes are
+ * rendered on the enrolment page whenever the pending cookie is presented (up
+ * to its ten minute life) and travel inside that signed, HttpOnly cookie;
+ * outside that window, only the hashes exist.
  */
 
 import { createHash, randomBytes } from "node:crypto";

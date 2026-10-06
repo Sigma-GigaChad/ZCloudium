@@ -71,9 +71,12 @@ if [ "$(docker ps -q --filter volume="$VOLUME" | wc -l)" -gt 0 ]; then
 fi
 
 echo "==> Restoring '$FILE' into volume '$VOLUME' (its current content is replaced)"
+# The filename crosses as an environment variable, never interpolated into the
+# shell text, and the wipe is a find so no dotfile shape survives it.
 docker run --rm --network none \
   -v "$VOLUME:/data" \
   -v "$PWD:/backup:ro" \
+  -e BACKUP_FILE="$FILE" \
   alpine:3.20 \
-  sh -c 'rm -rf /data/.[!.]* /data/* 2>/dev/null || true; tar -xzf "/backup/'"$FILE"'" -C /data'
+  sh -c 'find /data -mindepth 1 -delete; tar -xzf "/backup/$BACKUP_FILE" -C /data'
 echo "==> Done. Start the container again: the accounts, the sessions key and the certificate are back."

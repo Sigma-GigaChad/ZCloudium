@@ -239,13 +239,13 @@ export function verifyPage({ error } = {}) {
     title: "Two-factor code",
     body: `
 <h1>Two-factor code</h1>
-<p class="lead">Enter the 6-digit code from your authenticator app.</p>
+<p class="lead">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
 ${errorBlock(error)}
 <form method="post" action="/_auth/verify">
   <div class="field">
     <label for="code">Verification code</label>
-    <input id="code" class="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
-           pattern="[0-9]*" maxlength="6" autofocus required>
+    <input id="code" class="code" name="code" type="text" autocomplete="one-time-code"
+           maxlength="10" autofocus required>
   </div>
   <button class="primary" type="submit">Sign in</button>
 </form>

@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const COOKIE_NAME = "zc_sess";
@@ -49,8 +49,12 @@ export async function loadOrCreateSessionKey(filePath) {
 export async function rotateSessionKey(filePath) {
   const key = createSessionKey();
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, key, { mode: 0o600 });
-  await chmod(filePath, 0o600).catch(() => {});
+  // Atomic write, mode 0600, like every file under /data/auth: a key truncated
+  // by a crash must never become the key on disk.
+  const temporary = `${filePath}.tmp`;
+  await writeFile(temporary, key, { mode: 0o600 });
+  await chmod(temporary, 0o600).catch(() => {});
+  await rename(temporary, filePath);
   return key;
 }
 
