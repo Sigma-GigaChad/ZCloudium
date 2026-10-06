@@ -15,7 +15,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_HOSTS,
-  certificateSpki,
   TLS_DAYS,
   certificateHosts,
   certificatePaths,

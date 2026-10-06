@@ -3,14 +3,14 @@ name: e2e
 # Drives the real interface in a real browser, against a real container started
 # from the image built from this commit.
 #
-# The build workflow's smoke job proves that the gateway answers and that the
-# browser automation is in the image. It cannot see a broken wizard, a session
-# cookie that authorises nothing, or an upgrade proxy that lets an anonymous
-# client through, because none of those are visible to a plain HTTP probe. This
-# workflow is the one that would catch them.
+# The build workflow's smoke job proves that the gateway answers. It cannot see
+# a broken wizard, a session cookie that authorises nothing, or an upgrade
+# proxy that lets an anonymous client through, because none of those are
+# visible to a plain HTTP probe. This workflow is the one that would catch
+# them.
 #
 # It builds its own image rather than pulling one: the point is to test the code
-# in the commit being pushed. Every job here reads the same three pin files as
+# in the commit being pushed. Every job here reads the same pin files as
 # build.yml and passes them as build arguments, because the Dockerfile refuses
 # to build without them.
 
@@ -33,11 +33,6 @@ jobs:
   playwright:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # The panel is on in the image by default, so this job asks for the position
-    # it covers rather than inheriting whatever the image defaults to: off here,
-    # on in the job below.
-    env:
-      E2E_PANEL: "off"
     steps:
       - uses: actions/checkout@v7
 
@@ -49,19 +44,14 @@ jobs:
         run: |
           tag="$(tr -d '[:space:]' < zcode.version)"
           sha="$(tr -d '[:space:]' < zcode.sha256)"
-          # shellcheck source=chromium.version
-          . ./chromium.version
           {
             echo "list<<EOF"
             echo "ZCODIUM_VERSION=${tag}"
             echo "TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/${tag}/zcodium-${tag#v}.tar.gz"
             echo "TARBALL_SHA256=${sha}"
-            echo "CHROMIUM_PACKAGE=${chromium_package}"
-            echo "CHROMIUM_COMMON_PACKAGE=${chromium_common}"
-            echo "CHROMIUM_UPSTREAM=${chromium_upstream}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "Runtime under test: ${tag}, browser ${chromium_upstream}"
+          echo "Runtime under test: ${tag}"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -111,95 +101,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report
-          path: |
-            e2e/playwright-report
-            e2e/test-results
-          retention-days: 7
-
-      - name: Stop the container
-        if: always()
-        working-directory: e2e/scripts
-        run: bash ./stop-container.sh "$PREFIX"
-
-  # The same suite again, against a container started with the browser panel on.
-  #
-  # The panel is off by default, and the run above is the proof that off means
-  # unchanged. This job is the other half: the panel specs of the suite skip when
-  # the container has no browser, so without a job like this one the panel wiring
-  # at the image level (Chromium launched on loopback, the agent attached to it,
-  # `/_browser/` served behind the session, the viewport control, and the
-  # detach and reattach continuity check) would be covered by nothing but a
-  # report. It runs in parallel with the job above, on its own runner, so the
-  # wall clock does not double.
-  playwright-panel:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      PORT: "3033"
-      PREFIX: zcloudium-e2e-ci-panel
-      E2E_PANEL: "on"
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Read the pins
-        id: pins
-        run: |
-          tag="$(tr -d '[:space:]' < zcode.version)"
-          sha="$(tr -d '[:space:]' < zcode.sha256)"
-          # shellcheck source=chromium.version
-          . ./chromium.version
-          {
-            echo "list<<EOF"
-            echo "ZCODIUM_VERSION=${tag}"
-            echo "TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/${tag}/zcodium-${tag#v}.tar.gz"
-            echo "TARBALL_SHA256=${sha}"
-            echo "CHROMIUM_PACKAGE=${chromium_package}"
-            echo "CHROMIUM_COMMON_PACKAGE=${chromium_common}"
-            echo "CHROMIUM_UPSTREAM=${chromium_upstream}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Runtime under test: ${tag}, browser ${chromium_upstream}"
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build the image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          load: true
-          build-args: ${{ steps.pins.outputs.list }}
-          tags: ${{ env.IMAGE }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-
-      - name: Install the suite
-        working-directory: e2e
-        run: npm ci
-
-      - name: Install the browser
-        working-directory: e2e
-        run: npx playwright install --with-deps chromium
-
-      - name: Start the container with the panel on
-        working-directory: e2e/scripts
-        run: bash ./start-container.sh "$IMAGE" "$PORT" "$PREFIX"
-
-      - name: Run the suite against the panel container
-        working-directory: e2e
-        env:
-          E2E_BASE_URL: https://127.0.0.1:${{ env.PORT }}
-        run: npx playwright test
-
-      - name: Upload the report and the traces
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: playwright-report-panel
           path: |
             e2e/playwright-report
             e2e/test-results

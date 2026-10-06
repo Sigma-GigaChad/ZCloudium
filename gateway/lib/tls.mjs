@@ -1,19 +1,18 @@
 /**
  * TLS, terminated by the gateway, with a certificate it can make itself.
  *
- * The gateway speaks plain http today, and the README tells the operator to put
- * something in front of it. That is still the better answer, but it is a decision
- * this project can carry: a self-signed certificate is worth more than no
+ * The gateway serves https by default, with a certificate it generates on first
+ * start. A reverse proxy in front of it is still the better answer, but it is a
+ * decision this project can carry: a self-signed certificate is worth more than no
  * encryption at all, and it also makes the origin a secure context, which the
  * platform withholds over plain http and which a browser needs for the clipboard,
- * for service workers, and for the SHA-256 that attachments are hashed with (see
- * app-script.mjs for that last one).
+ * for service workers, and for the SHA-256 that attachments are hashed with.
  *
  * What this is not: trust. A self-signed certificate is not signed by anybody the
  * browser knows, so the first visit shows a warning and the operator has to accept
- * it. That is why the switch is off by default and the README says when not to use
- * it: a deployment that already has a reverse proxy terminating TLS must keep
- * letting that proxy do it.
+ * it. `ZCLOUDIUM_TLS=off` turns it off, and the README says when to do that: a
+ * deployment that already has a reverse proxy terminating TLS must keep letting
+ * that proxy do it.
  *
  * The certificate carries the names the deployment is reached by (localhost, the
  * loopback addresses, the container's hostname and every address it holds) as
@@ -32,7 +31,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { networkInterfaces, hostname as systemHostname } from "node:os";
 import { join } from "node:path";
-import { X509Certificate, createHash } from "node:crypto";
+import { X509Certificate } from "node:crypto";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -127,22 +126,6 @@ export function opensslArgs({ cert, key, hosts, days = TLS_DAYS } = {}) {
     "-addext",
     `subjectAltName=${subjectAltNames(hosts)}`,
   ];
-}
-
-/**
- * The certificate's public key fingerprint, in the form Chromium takes.
- *
- * `--ignore-certificate-errors-spki-list` is how a browser is told to accept one
- * certificate without giving up verification of every other site. That is what the
- * browser inside the container needs: it drives the gateway's own pages (the panel
- * and the DevTools frontend, which opens a socket back to this gateway), and the
- * certificate is one nobody signed. Pinning the fingerprint allows exactly that
- * certificate and nothing else, where `--ignore-certificate-errors` would accept
- * any certificate for any site the agent visits.
- */
-export function certificateSpki(certificate) {
-  const publicKey = new X509Certificate(certificate).publicKey;
-  return createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("base64");
 }
 
 /** Whether the file exists, without throwing on the many ways it cannot. */
