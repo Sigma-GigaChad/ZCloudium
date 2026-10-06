@@ -1,0 +1,1449 @@
+From 3a1f96021d3a26400f2d062d5d80ff1e3ee445ba Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Wed, 7 Oct 2026 00:31:27 +0200
+Subject: [PATCH 1/2] zcloudium: full remote services bridge, web
+ connectRemote, cloud environments
+
+1. /ws/remote/:id exposes the complete remote channel set (mirrors
+   RemoteServiceAccess) instead of four services, and disposes the remote
+   connection when the browser socket closes; /api/dispose-remote/:id
+   releases an attached connection explicitly.
+2. web platform.connectRemote calls POST /api/connect-remote, attaches
+   the session over /ws/remote/<ticket>, registers it renderer-side and
+   returns {success, sessionId}; disposeRemoteSession releases the
+   server-side connection. allowRemoteWorkspace enabled for web.
+3. SshDockerBackend: the runtime runs inside a container on the SSH host
+   (docker exec over the operator's SSH session); selected through the
+   new optional SSHConnectOptions.dockerContainer.
+4. /api/cloud-environments provisions a disposable dev container
+   (default ubuntu:26.04) with a setup script and copies the host's gh
+   credentials in; DELETE removes it.
+---
+ packages/server/src/cloudEnvironments.ts      | 278 ++++++++++++++++++
+ packages/server/src/http.ts                   |  41 ++-
+ packages/server/src/remote/create-backend.ts  |  17 +-
+ .../server/src/remote/sshDockerBackend.ts     | 198 +++++++++++++
+ packages/server/src/remoteBridge.ts           | 136 +++++++++
+ packages/shared/src/remoteTarget.ts           |  15 +
+ packages/shared/src/validation.ts             |   1 +
+ packages/web/src/main.tsx                     |  96 +++++-
+ 8 files changed, 758 insertions(+), 24 deletions(-)
+ create mode 100644 packages/server/src/cloudEnvironments.ts
+ create mode 100644 packages/server/src/remote/sshDockerBackend.ts
+ create mode 100644 packages/server/src/remoteBridge.ts
+
+diff --git a/packages/server/src/cloudEnvironments.ts b/packages/server/src/cloudEnvironments.ts
+new file mode 100644
+index 0000000..a08a592
+--- /dev/null
++++ b/packages/server/src/cloudEnvironments.ts
+@@ -0,0 +1,278 @@
++import type { Hono } from "hono";
++import { formatZodError, sshConnectOptionsSchema } from "@zcode/shared";
++import { quotePosixShellArg } from "@zcode/server/remote/posixShell.js";
++import { SSHBackend } from "@zcode/server/remote/ssh-backend.js";
++
++/** The default base image a new cloud environment boots from. */
++export const DEFAULT_CLOUD_ENVIRONMENT_IMAGE = "ubuntu:26.04";
++
++const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
++
++interface ProvisionRequest {
++  ssh: {
++    host: string;
++    port?: number;
++    username: string;
++    password?: string;
++    privateKeyPath?: string;
++    privateKeyPassphrase?: string;
++  };
++  name?: unknown;
++  image?: unknown;
++  setupScript?: unknown;
++  installGhCredentials?: unknown;
++}
++
++/**
++ * Cloud environments: disposable dev containers on a machine the operator
++ * reaches over SSH.
++ *
++ * The endpoint provisions a container on the host (default Ubuntu 26.04), runs
++ * the caller's setup script inside it — where the agent later installs every
++ * dependency it needs — copies the host's GitHub CLI credentials in, and hands
++ * back the container name. The caller then connects with an SSH target whose
++ * `dockerContainer` is that name, so the runtime the agent talks to lives
++ * inside the container while the only transport is the operator's SSH session.
++ * Nothing here needs Docker credentials on the machine running this server.
++ */
++export function registerCloudEnvironmentRoutes(app: Hono): void {
++  app.post("/api/cloud-environments", async (c) => {
++    const rawBody = await c.req.json().catch(() => null);
++    if (!rawBody || typeof rawBody !== "object") {
++      return c.json({ error: "Invalid request body" }, 400);
++    }
++    const body = rawBody as ProvisionRequest;
++    const parsedSsh = sshConnectOptionsSchema.safeParse({ kind: "ssh", ...body.ssh });
++    if (!parsedSsh.success) {
++      return c.json({ error: `Invalid ssh target: ${formatZodError(parsedSsh.error)}` }, 400);
++    }
++    const ssh = parsedSsh.data;
++    if (ssh.dockerContainer) {
++      return c.json({ error: "ssh target must not carry dockerContainer" }, 400);
++    }
++
++    const name = asOptionalString(body.name);
++    if (name && !CONTAINER_NAME_PATTERN.test(name)) {
++      return c.json({ error: `Invalid environment name: ${name}` }, 400);
++    }
++    const image = asOptionalString(body.image) ?? DEFAULT_CLOUD_ENVIRONMENT_IMAGE;
++    const setupScript = asOptionalString(body.setupScript);
++    const installGhCredentials = body.installGhCredentials !== false;
++
++    const containerName = name ?? `zc-env-${Date.now().toString(36)}`;
++    const backend = new SSHBackend({
++      host: ssh.host,
++      port: ssh.port,
++      username: ssh.username,
++      password: ssh.password,
++      privateKeyPath: ssh.privateKeyPath,
++      privateKeyPassphrase: ssh.privateKeyPassphrase,
++    });
++
++    try {
++      const { ghCredentials } = await provisionEnvironment(backend, {
++        containerName,
++        image,
++        setupScript,
++        installGhCredentials,
++      });
++      return c.json({ container: containerName, image, ghCredentials });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      return c.json({ error: message }, 500);
++    } finally {
++      backend.dispose();
++    }
++  });
++
++  app.delete("/api/cloud-environments/:name", async (c) => {
++    const name = c.req.param("name");
++    if (!CONTAINER_NAME_PATTERN.test(name)) {
++      return c.json({ error: `Invalid environment name: ${name}` }, 400);
++    }
++    const rawBody = await c.req.json().catch(() => ({}));
++    const body = (rawBody ?? {}) as ProvisionRequest;
++    const parsedSsh = sshConnectOptionsSchema.safeParse({ kind: "ssh", ...body.ssh });
++    if (!parsedSsh.success) {
++      return c.json({ error: `Invalid ssh target: ${formatZodError(parsedSsh.error)}` }, 400);
++    }
++    const ssh = parsedSsh.data;
++    const backend = new SSHBackend({
++      host: ssh.host,
++      port: ssh.port,
++      username: ssh.username,
++      password: ssh.password,
++      privateKeyPath: ssh.privateKeyPath,
++      privateKeyPassphrase: ssh.privateKeyPassphrase,
++    });
++    try {
++      await runDocker(backend, ["rm", "-f", quotePosixShellArg(name)]);
++      return c.json({ ok: true });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      return c.json({ error: message }, 500);
++    } finally {
++      backend.dispose();
++    }
++  });
++}
++
++function asOptionalString(value: unknown): string | undefined {
++  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
++}
++
++interface ProvisionOptions {
++  containerName: string;
++  image: string;
++  setupScript?: string;
++  installGhCredentials: boolean;
++}
++
++async function provisionEnvironment(
++  backend: SSHBackend,
++  options: ProvisionOptions,
++): Promise<{ ghCredentials: boolean }> {
++  const container = quotePosixShellArg(options.containerName);
++
++  await runDocker(backend, ["version", "--format", "{{.Server.Version}}"]).catch((error) => {
++    throw new Error(`Docker is not available on the remote host: ${formatError(error)}`);
++  });
++
++  const existing = await runDocker(backend, [
++    "ps",
++    "-a",
++    "--format",
++    "{{.Names}}",
++  ]);
++  if (existing.split("\n").some((line) => line.trim() === options.containerName)) {
++    throw new Error(`A container named ${options.containerName} already exists on the host`);
++  }
++
++  await runDocker(backend, [
++    "run",
++    "-d",
++    "--restart",
++    "unless-stopped",
++    "--name",
++    container,
++    quotePosixShellArg(options.image),
++    "/bin/sh",
++    "-c",
++    "sleep infinity",
++  ]);
++
++  try {
++    if (options.setupScript) {
++      // The script installs whatever the environment needs; output is buffered
++      // and only reported when the script fails, so a clean run stays quiet.
++      await runDocker(backend, [
++        "exec",
++        container,
++        "/bin/sh",
++        "-lc",
++        quotePosixShellArg(options.setupScript),
++      ]);
++    }
++
++    const ghCredentials = options.installGhCredentials
++      ? await installGhCredentialsFromHost(backend, container)
++      : false;
++    return { ghCredentials };
++  } catch (error) {
++    // From here the container exists: a failure must not leave a
++    // half-provisioned environment behind.
++    const removed = await runDocker(backend, ["rm", "-f", container]).then(
++      () => true,
++      () => false,
++    );
++    const detail = formatError(error);
++    throw new Error(
++      removed
++        ? `Environment removed after a failed step:\n${detail}`
++        : `Provisioning failed and the environment could not be removed (docker rm -f ${options.containerName} on the host):\n${detail}`,
++    );
++  }
++}
++
++/**
++ * Copy the host's GitHub CLI credential material into the container, so the
++ * operator authenticates gh and git once per host instead of once per
++ * environment. Missing host credentials are not an error: the environment just
++ * starts without them.
++ */
++async function installGhCredentialsFromHost(
++  backend: SSHBackend,
++  container: string,
++): Promise<boolean> {
++  const hostsYml = await execSimple(
++    backend,
++    "cat ~/.config/gh/hosts.yml 2>/dev/null || true",
++  );
++  if (!hostsYml.trim()) {
++    return false;
++  }
++
++  await execStream(
++    backend,
++    `docker exec -i ${container} /bin/sh -lc 'mkdir -p ~/.config/gh && cat > ~/.config/gh/hosts.yml && chmod 600 ~/.config/gh/hosts.yml'`,
++    hostsYml,
++  );
++
++  // The credential helper routes git https pushes through gh; if git is not
++  // installed yet the setup script or a later install will pick the config up.
++  await execSimple(
++    backend,
++    `docker exec ${container} /bin/sh -lc 'command -v git >/dev/null 2>&1 && git config --global credential.helper "!gh auth git-credential" || true'`,
++  ).catch(() => {});
++  return true;
++}
++
++function formatError(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++/** docker CLI invocation over the SSH connection; argv stays an array, only the container name is shell-quoted. */
++async function runDocker(backend: SSHBackend, args: string[]): Promise<string> {
++  return execSimple(backend, `docker ${args.join(" ")}`);
++}
++
++async function execSimple(backend: SSHBackend, command: string): Promise<string> {
++  const stream = await backend.exec(command);
++  return await collect(stream);
++}
++
++async function execStream(
++  backend: SSHBackend,
++  command: string,
++  stdin: string,
++): Promise<void> {
++  const stream = await backend.exec(command);
++  stream.stdin.write(stdin);
++  stream.stdin.end();
++  await collect(stream);
++}
++
++async function collect(stream: {
++  stdout: NodeJS.ReadableStream;
++  stderr: NodeJS.ReadableStream;
++  onClose: { (listener: (code: number) => void): { dispose(): void } };
++}): Promise<string> {
++  return new Promise((resolve, reject) => {
++    let stdout = "";
++    let stderr = "";
++    stream.stdout.on("data", (chunk: Buffer) => {
++      stdout += chunk.toString();
++    });
++    stream.stderr.on("data", (chunk: Buffer) => {
++      stderr += chunk.toString();
++    });
++    const subscription = stream.onClose((code) => {
++      subscription.dispose();
++      if (code !== 0) {
++        reject(new Error(stderr.trim() || `command failed with exit code ${code}`));
++        return;
++      }
++      resolve(stdout);
++    });
++  });
++}
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index 8c38f91..13d2e39 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -19,10 +19,6 @@ import {
+   ServiceCollection,
+   IZCodeAgentService,
+   createZCodeAgentConnectionScope,
+-  IFileService,
+-  IGitService,
+-  ISystemService,
+-  ITerminalService,
+   IBotsService,
+   IProviderProvisioningTargetService,
+ } from "@zcode/services";
+@@ -39,6 +35,8 @@ import {
+   type ServerRemoteWorkspaceInfo,
+ } from "@zcode/shared";
+ import { connectRemote, createRemoteBackend, type RemoteConnection } from "./remote/index.js";
++import { remoteServiceCollection } from "./remoteBridge.js";
++import { registerCloudEnvironmentRoutes } from "./cloudEnvironments.js";
+ import { createHostCapabilityStore } from "./hostCapability.js";
+ 
+ function wrapWebSocket(ws: WebSocket): ISocket {
+@@ -127,6 +125,9 @@ function setupChannelServer(
+ /** 存储 web 模式下的远程连接，key 为随机 ID */
+ const remoteConnections = new Map<string, RemoteConnection>();
+ 
++/** ticket 消费后、WS 尚未断开的远程连接；dispose 端点按 id 找到它们 */
++const attachedRemoteConnections = new Map<string, { connection: RemoteConnection; ws: WebSocket }>();
++
+ function generateId(): string {
+   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+ }
+@@ -366,6 +367,22 @@ export function createHttpServer(
+     }
+   });
+ 
++  // 显式释放一条已 attach 的远程连接（web 端 disposeRemoteSession 调用）。
++  // 关闭 WS 会触发上面的 close 处理，这里主动 dispose 保证两次都幂等。
++  app.post("/api/dispose-remote/:id", (c) => {
++    const id = c.req.param("id");
++    const attached = attachedRemoteConnections.get(id);
++    if (!attached) {
++      return c.json({ ok: false }, 404);
++    }
++    attachedRemoteConnections.delete(id);
++    attached.ws.close();
++    attached.connection.dispose();
++    return c.json({ ok: true });
++  });
++
++  registerCloudEnvironmentRoutes(app);
++
+   const handleBotCallback = async (c: Context) => {
+     const provider = c.req.param("provider") as BotProvider;
+     if (!botProviders.includes(provider)) {
+@@ -432,14 +449,18 @@ export function createHttpServer(
+           // 一个连接只给一个 WS 客户端使用，取出后从 Map 移除
+           remoteConnections.delete(id);
+ 
+-          // 将远程 services 包装为 ServiceCollection，复用 exposeOnChannelServer 统一注册
+-          const remoteServices = new ServiceCollection()
+-            .register(IFileService, connection.services.fileService)
+-            .register(IGitService, connection.services.gitService)
+-            .register(ISystemService, connection.services.systemService)
+-            .register(ITerminalService, connection.services.terminalService);
++          // 桥接远端 host 暴露的全部 channels（见 remoteBridge.ts）：浏览器拿到的
++          // accessor 与桌面端一致，web 模式才能打开远程 workspace。
++          const remoteServices = remoteServiceCollection(connection);
+ 
+           setupChannelServer(ws.raw as WebSocket, remoteServices, "web-remote-replayable");
++          // ticket 消费后连接只由这条 WS 持有：浏览器断开（刷新/取消）即释放
++          // 远端连接，否则 SSH backend 与远端 server 进程会一直挂着。
++          attachedRemoteConnections.set(id, { connection, ws: ws.raw as WebSocket });
++          (ws.raw as WebSocket).on("close", () => {
++            attachedRemoteConnections.delete(id);
++            connection.dispose();
++          });
+         },
+       };
+     }),
+diff --git a/packages/server/src/remote/create-backend.ts b/packages/server/src/remote/create-backend.ts
+index d4bb8ad..46701db 100644
+--- a/packages/server/src/remote/create-backend.ts
++++ b/packages/server/src/remote/create-backend.ts
+@@ -6,14 +6,12 @@ import type { IRemoteBackend } from "./backend.js";
+ export async function createRemoteBackend(target: RemoteTarget): Promise<IRemoteBackend> {
+   switch (target.kind) {
+     case "ssh": {
+-      const { SSHBackend } = await import("./ssh-backend.js");
+       let privateKey: string | Buffer | undefined;
+       if (target.privateKeyPath) {
+         const keyPath = target.privateKeyPath.replace(/^~/, homedir());
+         privateKey = await readFile(keyPath);
+       }
+-
+-      return new SSHBackend({
++      const sshOptions = {
+         host: target.host,
+         port: target.port,
+         username: target.username,
+@@ -21,7 +19,18 @@ export async function createRemoteBackend(target: RemoteTarget): Promise<IRemote
+         privateKeyPath: target.privateKeyPath,
+         privateKeyPassphrase: target.privateKeyPassphrase,
+         privateKey,
+-      });
++      };
++
++      // dockerContainer: the runtime runs inside an already running container on
++      // the host — what the cloud environment flow provisions. The operator's SSH
++      // connection is the only transport; commands are prefixed with docker exec.
++      if (target.dockerContainer) {
++        const { SshDockerBackend } = await import("./sshDockerBackend.js");
++        return new SshDockerBackend({ ...sshOptions, container: target.dockerContainer });
++      }
++
++      const { SSHBackend } = await import("./ssh-backend.js");
++      return new SSHBackend(sshOptions);
+     }
+     case "wsl": {
+       const { WSLBackend } = await import("./wsl-backend.js");
+diff --git a/packages/server/src/remote/sshDockerBackend.ts b/packages/server/src/remote/sshDockerBackend.ts
+new file mode 100644
+index 0000000..c98cb49
+--- /dev/null
++++ b/packages/server/src/remote/sshDockerBackend.ts
+@@ -0,0 +1,198 @@
++import { createReadStream } from "node:fs";
++import { stat } from "node:fs/promises";
++import { Emitter } from "@zcode/rpc";
++import { normalizeRemoteArch, normalizeRemotePlatform } from "@zcode/server/remote/detectEnv.js";
++import { quotePosixShellArg } from "@zcode/server/remote/posixShell.js";
++import {
++  type RemoteDisconnectEvent,
++  type RemoteEnvironment,
++  type RemoteUploadOptions,
++  type StdioStream,
++  type IRemoteBackend,
++} from "./backend.js";
++import { SSHBackend, type SSHBackendOptions } from "./ssh-backend.js";
++
++export interface SshDockerBackendOptions extends SSHBackendOptions {
++  /** Name or id of an already running container on the SSH host. */
++  container: string;
++}
++
++/**
++ * Run the remote runtime inside a Docker container on an SSH host.
++ *
++ * This is what a "cloud environment" is: the agent works in a disposable
++ * container on the machine instead of on the machine itself. The transport is
++ * the operator's SSH connection; every command is prefixed with
++ * `docker exec -i <container>`, so the container needs no sshd, no port has to
++ * be published, and no Docker credentials ever reach the machine running this
++ * server — the operator's SSH right on the host is the only key involved.
++ */
++export class SshDockerBackend implements IRemoteBackend {
++  private readonly ssh: SSHBackend;
++  private readonly container: string;
++  private homeDirPromise: Promise<string> | null = null;
++  private readonly disconnectEmitter = new Emitter<RemoteDisconnectEvent>();
++  readonly onDidDisconnect = this.disconnectEmitter.event;
++
++  constructor(options: SshDockerBackendOptions) {
++    this.container = options.container;
++    const { container: _container, ...sshOptions } = options;
++    this.ssh = new SSHBackend(sshOptions);
++    this.ssh.onDidDisconnect?.((event) => this.disconnectEmitter.fire(event));
++  }
++
++  async detect(): Promise<RemoteEnvironment> {
++    const platform = normalizeRemotePlatform(await this.execSimple("uname -s"));
++    const arch = normalizeRemoteArch(await this.execSimple("uname -m"));
++    return { platform, arch };
++  }
++
++  async upload(localPath: string, remotePath: string, options?: RemoteUploadOptions): Promise<void> {
++    if (options?.signal?.aborted) {
++      const error = new Error("Remote upload canceled");
++      error.name = "AbortError";
++      throw error;
++    }
++    const resolved = await this.resolveLinuxPath(remotePath);
++    const parentDir = this.dirname(resolved);
++    await this.execSimple(`mkdir -p ${quotePosixShellArg(parentDir)}`);
++    await this.uploadViaExec(localPath, resolved, options ?? {});
++  }
++
++  async exec(command: string): Promise<StdioStream> {
++    return this.ssh.exec(this.wrapCommand(command));
++  }
++
++  async exists(remotePath: string): Promise<boolean> {
++    try {
++      const resolved = await this.resolveLinuxPath(remotePath);
++      const result = await this.execSimple(`test -f ${quotePosixShellArg(resolved)} && printf OK`);
++      return result.trim() === "OK";
++    } catch {
++      return false;
++    }
++  }
++
++  async readFile(remotePath: string): Promise<string> {
++    const resolved = await this.resolveLinuxPath(remotePath);
++    return this.execSimple(`cat ${quotePosixShellArg(resolved)}`);
++  }
++
++  dispose(): void {
++    this.ssh.dispose();
++  }
++
++  /** The command the deploy flow wants, redirected into the container. */
++  private wrapCommand(command: string): string {
++    return `docker exec -i ${quotePosixShellArg(this.container)} /bin/sh -lc ${quotePosixShellArg(command)}`;
++  }
++
++  private async resolveLinuxPath(remotePath: string): Promise<string> {
++    if (remotePath === "~" || remotePath.startsWith("~/")) {
++      const homeDir = await this.resolveHomeDir();
++      return remotePath === "~" ? homeDir : `${homeDir.replace(/\/$/, "")}/${remotePath.slice(2)}`;
++    }
++    return remotePath;
++  }
++
++  private resolveHomeDir(): Promise<string> {
++    this.homeDirPromise ??= this.execSimple("printf %s ~").then((value) => value.trim());
++    return this.homeDirPromise;
++  }
++
++  private dirname(remotePath: string): string {
++    const normalized = remotePath.replace(/\/+/g, "/");
++    const lastSlash = normalized.lastIndexOf("/");
++    if (lastSlash <= 0) {
++      return "/";
++    }
++    return normalized.slice(0, lastSlash);
++  }
++
++  private execSimple(command: string): Promise<string> {
++    return new Promise((resolve, reject) => {
++      void this.exec(command).then(async (stream) => {
++        let stdout = "";
++        let stderr = "";
++        stream.stdout.on("data", (chunk: Buffer) => {
++          stdout += chunk.toString();
++        });
++        stream.stderr.on("data", (chunk: Buffer) => {
++          stderr += chunk.toString();
++        });
++        const code = await new Promise<number>((resolveClose) => {
++          const subscription = stream.onClose((value) => {
++            subscription.dispose();
++            resolveClose(value);
++          });
++        });
++        if (code !== 0) {
++          reject(new Error(stderr.trim() || `command failed with exit code ${code}`));
++          return;
++        }
++        resolve(stdout);
++      }, reject);
++    });
++  }
++
++  /** Stream a local file into the container through stdin, like DockerBackend does. */
++  private async uploadViaExec(
++    localPath: string,
++    remotePath: string,
++    options: RemoteUploadOptions,
++  ): Promise<void> {
++    const totalBytes = await stat(localPath).then((value) => value.size);
++    const stream = await this.exec(`cat > ${quotePosixShellArg(remotePath)}`);
++    await new Promise<void>((resolve, reject) => {
++      const readStream = createReadStream(localPath);
++      const stdin = stream.stdin;
++      let stderrText = "";
++      let settled = false;
++      const onStderr = (chunk: Buffer) => {
++        stderrText = `${stderrText}${chunk.toString()}`.slice(-2048);
++      };
++      stream.stderr.on("data", onStderr);
++      const finishError = (error: Error) => {
++        if (settled) return;
++        settled = true;
++        options.signal?.removeEventListener("abort", abort);
++        stream.stderr.removeListener("data", onStderr);
++        readStream.destroy();
++        (stdin as unknown as { destroy?: (error?: Error) => void }).destroy?.(error);
++        reject(error);
++      };
++      const abort = () => {
++        const error = new Error("Remote upload canceled");
++        error.name = "AbortError";
++        finishError(error);
++      };
++      options.signal?.addEventListener("abort", abort, { once: true });
++      readStream.on("data", (chunk: Buffer) => {
++        options.onProgress?.({ uploadedBytes: readStream.bytesRead, totalBytes });
++      });
++      readStream.on("error", finishError);
++      stdin.on("error", finishError);
++      const subscription = stream.onClose((code) => {
++        subscription.dispose();
++        if (settled) return;
++        settled = true;
++        options.signal?.removeEventListener("abort", abort);
++        stream.stderr.removeListener("data", onStderr);
++        if (code !== 0) {
++          const stderrSummary = stderrText.trim();
++          reject(
++            new Error(
++              stderrSummary
++                ? `upload failed with exit code ${code}: ${stderrSummary}`
++                : `upload failed with exit code ${code}`,
++            ),
++          );
++          return;
++        }
++        options.onProgress?.({ uploadedBytes: totalBytes, totalBytes });
++        resolve();
++      });
++      readStream.pipe(stdin);
++    });
++  }
++}
+diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
+new file mode 100644
+index 0000000..c3fee86
+--- /dev/null
++++ b/packages/server/src/remoteBridge.ts
+@@ -0,0 +1,136 @@
++import type { CancellationToken, ChannelClient, IChannel, IServerChannel } from "@zcode/rpc";
++import {
++  ServiceCollection,
++  IBotsService,
++  IBroadcastService,
++  IClientConfigService,
++  IClientScenesService,
++  ICodingPlanSubscriptionService,
++  ICommandsService,
++  IConversationShareService,
++  ICredentialService,
++  ICuaPermissionService,
++  IFeedbackService,
++  IFileService,
++  IFileWatcherService,
++  IGitCheckpointService,
++  IGitService,
++  IHooksService,
++  IMcpSyncService,
++  IMediaPreviewService,
++  IMemoryService,
++  IModelSelectionService,
++  IOAuthService,
++  IOffPeakTaskService,
++  IOnboardingRecordService,
++  IPluginManagementService,
++  IPluginsService,
++  IPluginSyncService,
++  IPromptAttachmentTransferService,
++  IProviderSettingsService,
++  ISkillsService,
++  ISkillSyncService,
++  ISettingService,
++  ISettingsSyncService,
++  ISubagentsService,
++  ISystemService,
++  ITerminalService,
++  IUsageStatsService,
++  IWindowControllerService,
++  IZCodeAgentService,
++  IZCodeSessionService,
++  IZCodeTaskService,
++  type ServiceDescriptor,
++} from "@zcode/services";
++import type { RemoteConnection } from "./remote/index.js";
++
++/**
++ * Bridge the full remote service set onto a local WebSocket.
++ *
++ * `/ws/remote/:id` used to expose only four services, which is why web mode
++ * could not open a remote workspace: the renderer needs the same accessor the
++ * desktop one has. This mirrors the channel list of `RemoteServiceAccess`
++ * (packages/client/src/remoteServiceAccess.ts) one for one, forwarding each
++ * channel verbatim to the remote host instead of re-wrapping proxied service
++ * objects.
++ *
++ * `IProviderProvisioningTargetService` is deliberately absent, like on the
++ * desktop renderer boundary: provisioning carries cross-Environment
++ * credentials and is a trusted-host-only capability (see the override in
++ * setupChannelServer).
++ */
++export function remoteServiceCollection(connection: RemoteConnection): ServiceCollection {
++  const descriptors: ServiceDescriptor<unknown>[] = [
++    IFileService,
++    IMediaPreviewService,
++    IGitService,
++    IGitCheckpointService,
++    ISystemService,
++    ITerminalService,
++    ISettingService,
++    IOnboardingRecordService,
++    ICredentialService,
++    IBroadcastService,
++    IZCodeTaskService,
++    IWindowControllerService,
++    IZCodeAgentService,
++    IZCodeSessionService,
++    ICuaPermissionService,
++    IConversationShareService,
++    IBotsService,
++    IFileWatcherService,
++    IOAuthService,
++    IProviderSettingsService,
++    IModelSelectionService,
++    IUsageStatsService,
++    ICodingPlanSubscriptionService,
++    IClientConfigService,
++    IClientScenesService,
++    IOffPeakTaskService,
++    ISkillsService,
++    ISkillSyncService,
++    IMcpSyncService,
++    IPluginSyncService,
++    IPluginsService,
++    IPluginManagementService,
++    ISubagentsService,
++    ICommandsService,
++    IHooksService,
++    IMemoryService,
++    ISettingsSyncService,
++    IFeedbackService,
++    IPromptAttachmentTransferService,
++  ];
++
++  const collection = new ServiceCollection();
++  for (const descriptor of descriptors) {
++    collection.register(descriptor, bridgeRemoteChannel(connection.client, descriptor.channelName));
++  }
++  return collection;
++}
++
++/**
++ * A channel on the local server that is a transparent pipe to the same channel
++ * on the remote host: commands and event subscriptions go through unchanged, so
++ * whatever the remote serves, the browser gets, and a channel the remote does
++ * not serve fails there with its own "unknown channel" error.
++ */
++function bridgeRemoteChannel(
++  client: ChannelClient,
++  channelName: string,
++): IServerChannel<string> {
++  const channel = client.getChannel<IChannel>(channelName);
++  return {
++    call<T>(
++      _ctx: string,
++      command: string,
++      arg?: unknown,
++      cancellationToken?: CancellationToken,
++    ): Promise<T> {
++      return channel.call<T>(command, arg, cancellationToken);
++    },
++    listen<T>(_ctx: string, event: string, arg?: unknown) {
++      return channel.listen<T>(event, arg);
++    },
++  };
++}
+diff --git a/packages/shared/src/remoteTarget.ts b/packages/shared/src/remoteTarget.ts
+index 090289c..e833a65 100644
+--- a/packages/shared/src/remoteTarget.ts
++++ b/packages/shared/src/remoteTarget.ts
+@@ -1,6 +1,13 @@
+ import type { RemoteAssetInstallMode } from "./remoteAssetInstallMode.js";
+ import type { RemoteResourcePackageSelection } from "./remoteResourcePackages.js";
+ 
++export interface CloudEnvironmentOptions {
++  /** Base image; the server defaults it to Ubuntu 26.04. */
++  image?: string;
++  /** Shell script run inside the environment right after creation. */
++  setupScript?: string;
++}
++
+ export interface SSHConnectOptions {
+   kind: "ssh";
+   host: string;
+@@ -10,6 +17,14 @@ export interface SSHConnectOptions {
+   password?: string;
+   privateKeyPath?: string;
+   privateKeyPassphrase?: string;
++  /** Run the runtime inside this (already running) Docker container on the host. */
++  dockerContainer?: string;
++  /**
++   * Web-only orchestration hint: the client provisions the environment first,
++   * then connects with `dockerContainer` set to the provisioned container. The
++   * server never receives this field.
++   */
++  cloudEnvironment?: CloudEnvironmentOptions;
+   assetInstallMode?: RemoteAssetInstallMode;
+   resourcePackages?: RemoteResourcePackageSelection;
+ }
+diff --git a/packages/shared/src/validation.ts b/packages/shared/src/validation.ts
+index 85b5a64..e3af0d3 100644
+--- a/packages/shared/src/validation.ts
++++ b/packages/shared/src/validation.ts
+@@ -67,6 +67,7 @@ export const sshConnectOptionsSchema = z.object({
+   password: z.string().optional(),
+   privateKeyPath: z.string().optional(),
+   privateKeyPassphrase: z.string().optional(),
++  dockerContainer: nonEmptyStringSchema.optional(),
+   assetInstallMode: z.enum(REMOTE_ASSET_INSTALL_MODES).optional(),
+   resourcePackages: z
+     .object({
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 052eab8..3af3875 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -6,6 +6,7 @@ import {
+   ZCodeIntlProvider,
+   generateMobileDeviceFingerprint,
+   playTaskNotificationSound,
++  registerRemoteWorkspaceSession,
+   setStreamClientId,
+   type Theme,
+ } from "@zcode/ui";
+@@ -17,6 +18,7 @@ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOA
+ import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
+ import { resolveWebCommunityUrl, resolveWebHelpConfig } from "./communityUrl.js";
+ import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
++import { stripRemoteTargetSecrets } from "@zcode/shared";
+ import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
+ 
+ function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
+@@ -115,17 +117,59 @@ function createWebPlatform(): IPlatformService {
+     onBotRemoteWorkspaceReconnected: () => () => {},
+     // Web 端无多窗口管理
+     activateOrSetWorkspace: () => Promise.resolve({ activated: false }),
+-    // TODO(web-remote-workspace): 普通 Web 模式先只保证 server 本地工作区可用。
+-    // 远程 WebSocket 只暴露部分 service，与 Root/RemoteServiceAccess 需要的完整
+-    // accessor 不匹配，直接打开 ?remote=<id> 会在项目向导或首屏卡住。
+-    connectRemote(options: RemoteTarget) {
+-      return Promise.resolve({
+-        success: false,
+-        error: `Remote connect is not supported in Web mode yet: ${options.kind}`,
+-      });
++    // Web 模式的远程连接：POST /api/connect-remote 在 server 内建立远端连接并返回
++    // 一次性 ticket，随后把 accessor 挂到 /ws/remote/<ticket> 上；session 直接在
++    // renderer 侧注册，无需 Desktop 的 MessagePort 通道。凭据只在请求体内走一趟，
++    // store 只保留脱敏后的 target。
++    async connectRemote(options: RemoteTarget) {
++      try {
++        let target = options;
++        if (options.kind === "ssh" && options.cloudEnvironment) {
++          const { cloudEnvironment, ...ssh } = options;
++          const provisioned = await provisionCloudEnvironment(ssh, cloudEnvironment);
++          if (!provisioned.success) {
++            return provisioned;
++          }
++          target = { ...ssh, dockerContainer: provisioned.container };
++        }
++        const response = await fetch("/api/connect-remote", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify(target),
++        });
++        const payload = (await response.json().catch(() => ({}))) as { id?: string; error?: string };
++        if (!response.ok || !payload.id) {
++          return {
++            success: false,
++            error: payload.error ?? `Remote connect failed (${response.status})`,
++          };
++        }
++        const sessionId = payload.id;
++        const services = await connectViaWebSocket(
++          `${resolveDefaultWsOrigin()}/ws/remote/${sessionId}`,
++          { onClose: () => {} },
++        );
++        registerRemoteWorkspaceSession({
++          sessionId,
++          target: stripRemoteTargetSecrets(options),
++          services,
++        });
++        return { success: true, sessionId };
++      } catch (error) {
++        return {
++          success: false,
++          error: error instanceof Error ? error.message : String(error),
++        };
++      }
+     },
+     cancelPendingRemoteConnection: (_requestId?: string) => Promise.resolve(),
+-    disposeRemoteSession: () => Promise.resolve(),
++    // 释放服务端连接（/api/dispose-remote 会关掉对应 WS 并 dispose 远端连接）。
++    // 失败不阻塞 UI：页面关闭时 server 也会随 WS 断开而释放。
++    async disposeRemoteSession(sessionId: string) {
++      await fetch(`/api/dispose-remote/${encodeURIComponent(sessionId)}`, {
++        method: "POST",
++      }).catch(() => undefined);
++    },
+     isDockerAvailable: () => Promise.resolve(false),
+     listWSLDistros: () => Promise.resolve([]),
+     listDockerContainers: () => Promise.resolve([]),
+@@ -267,6 +311,38 @@ function resolveDefaultWsOrigin(): string {
+   return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+ }
+ 
++type CloudEnvironmentProvisionResult =
++  | { success: true; container: string }
++  | { success: false; error: string };
++
++/**
++ * Provision a cloud environment on the target host (disposable container +
++ * setup script + gh/git credentials), then connect into it. The connect step
++ * carries `dockerContainer`, so the runtime runs inside the container while
++ * the only transport stays the operator's SSH session.
++ */
++async function provisionCloudEnvironment(
++  ssh: Omit<Extract<RemoteTarget, { kind: "ssh" }>, "dockerContainer" | "cloudEnvironment">,
++  cloud: NonNullable<Extract<RemoteTarget, { kind: "ssh" }>["cloudEnvironment"]>,
++): Promise<CloudEnvironmentProvisionResult> {
++  const response = await fetch("/api/cloud-environments", {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify({ ssh, image: cloud.image, setupScript: cloud.setupScript }),
++  });
++  const payload = (await response.json().catch(() => ({}))) as {
++    container?: string;
++    error?: string;
++  };
++  if (!response.ok || !payload.container) {
++    return {
++      success: false,
++      error: payload.error ?? `Environment provisioning failed (${response.status})`,
++    };
++  }
++  return { success: true, container: payload.container };
++}
++
+ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+   const params = new URLSearchParams(window.location.search);
+   const remoteId = params.get("remote");
+@@ -371,7 +447,7 @@ async function bootstrapWebApp() {
+             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
+             preferDirectoryBrowser
+             supportsEmbeddedBrowser={false}
+-            allowRemoteWorkspace={false}
++            allowRemoteWorkspace
+           />
+         </ZCodeIntlProvider>
+       </AppErrorBoundary>,
+-- 
+2.56.0
+
+
+From cbf6ffc9eacc613de3b25531aed961d40aa90975 Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Wed, 7 Oct 2026 00:39:15 +0200
+Subject: [PATCH 2/2] zcloudium: the remote connection wizard offers a cloud
+ environment
+
+The Docker card becomes 'Cloud Environment': it collects the same SSH
+host and credential fields and adds a base image (default Ubuntu 26.04)
+and an optional setup script. The wizard keeps Docker's spot, test id
+and step plumbing; the built target is an SSH one carrying
+cloudEnvironment, which the web platform provisions before connecting.
+---
+ packages/shared/src/test-ids.ts               |  2 +
+ .../ui/src/RemoteConnectionDialogContent.tsx  | 70 ++++++++++++++++---
+ packages/ui/src/SSHDialog.tsx                 | 12 +++-
+ .../ui/src/hooks/useRemoteConnectionForm.ts   | 23 ++++--
+ packages/ui/src/i18n/locales/en-US.ts         |  7 ++
+ packages/ui/src/i18n/locales/zh-CN.ts         |  7 ++
+ packages/ui/src/lib/remoteConnectionWizard.ts | 64 +++++++++++------
+ 7 files changed, 147 insertions(+), 38 deletions(-)
+
+diff --git a/packages/shared/src/test-ids.ts b/packages/shared/src/test-ids.ts
+index 5b4dba3..873881c 100644
+--- a/packages/shared/src/test-ids.ts
++++ b/packages/shared/src/test-ids.ts
+@@ -157,6 +157,8 @@ export const TID_REMOTE_KIND_SSH = "remote-kind-ssh";
+ export const TID_REMOTE_KIND_WSL = "remote-kind-wsl";
+ /** 远程连接方式切换到 Docker */
+ export const TID_REMOTE_KIND_DOCKER = "remote-kind-docker";
++/** 远程连接方式切换到 Cloud Environment（可弃容器） */
++export const TID_REMOTE_KIND_CLOUD = "remote-kind-cloud";
+ /** SSH 主机地址输入框 */
+ export const TID_SSH_HOST_INPUT = "ssh-host-input";
+ /** SSH 端口号输入框 */
+diff --git a/packages/ui/src/RemoteConnectionDialogContent.tsx b/packages/ui/src/RemoteConnectionDialogContent.tsx
+index 6a1b22f..7250fc7 100644
+--- a/packages/ui/src/RemoteConnectionDialogContent.tsx
++++ b/packages/ui/src/RemoteConnectionDialogContent.tsx
+@@ -8,7 +8,7 @@ import type {
+   SSHConfigAliasOption,
+   WSLDistro,
+ } from "@zcode/shared";
+-import { TID_REMOTE_KIND_DOCKER, TID_REMOTE_KIND_SSH, TID_REMOTE_KIND_WSL } from "@zcode/shared";
++import { TID_REMOTE_KIND_CLOUD, TID_REMOTE_KIND_DOCKER, TID_REMOTE_KIND_SSH, TID_REMOTE_KIND_WSL } from "@zcode/shared";
+ import type {
+   IMcpSyncService,
+   IPluginSyncService,
+@@ -19,6 +19,7 @@ import type {
+ import {
+   AlertTriangleIcon,
+   ChevronRightIcon,
++  CloudIcon,
+   LoaderIcon,
+   MonitorCogIcon,
+   ServerIcon,
+@@ -26,8 +27,9 @@ import {
+ } from "lucide-react";
+ import { DirectoryBrowser } from "@/DirectoryBrowser.js";
+ import { RemoteConnectionFields } from "@/RemoteConnectionFields.js";
+-import type { SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
++import type { RemoteKind, SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
+ import { Button } from "@/components/ui/button.js";
++import { Input } from "@/components/ui/input.js";
+ import { cn } from "@/components/lib/utils.js";
+ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+ import {
+@@ -37,7 +39,7 @@ import {
+ } from "@/settings/RemoteSyncActions.js";
+ export { RemoteConnectionConnectingStep } from "@/remote-connection/RemoteConnectionConnectingStep.js";
+ 
+-function getKindIcon(kind: RemoteTarget["kind"]) {
++function getKindIcon(kind: RemoteKind) {
+   switch (kind) {
+     case "ssh":
+       return ServerIcon;
+@@ -45,6 +47,8 @@ function getKindIcon(kind: RemoteTarget["kind"]) {
+       return MonitorCogIcon;
+     case "wsl":
+       return TerminalIcon;
++    case "cloud":
++      return CloudIcon;
+   }
+ }
+ 
+@@ -55,9 +59,9 @@ export function RemoteConnectionKindStep({
+   onCancel,
+   onNext,
+ }: {
+-  kind: RemoteTarget["kind"];
+-  availableKinds: RemoteTarget["kind"][];
+-  onKindChange: (value: RemoteTarget["kind"]) => void;
++  kind: RemoteKind;
++  availableKinds: RemoteKind[];
++  onKindChange: (value: RemoteKind) => void;
+   onCancel: () => void;
+   onNext: () => void;
+ }) {
+@@ -80,7 +84,9 @@ export function RemoteConnectionKindStep({
+                   ? TID_REMOTE_KIND_SSH
+                   : value === "wsl"
+                     ? TID_REMOTE_KIND_WSL
+-                    : TID_REMOTE_KIND_DOCKER
++                    : value === "cloud"
++                      ? TID_REMOTE_KIND_CLOUD
++                      : TID_REMOTE_KIND_DOCKER
+               }
+               className={cn(
+                 "flex min-h-32 flex-col items-start gap-4 rounded-2xl border p-4 text-start transition-colors",
+@@ -159,6 +165,8 @@ export function RemoteConnectionSettingsStep({
+   remoteWorkspaceSessions = [],
+   validationMessage,
+   loading,
++  cloudImage = "",
++  cloudSetupScript = "",
+   onBack,
+   onHostChange,
+   onPortChange,
+@@ -175,9 +183,11 @@ export function RemoteConnectionSettingsStep({
+   onDockerContainersRefresh,
+   onApplySshConfigAlias,
+   onClearSelectedSshConfigAlias,
++  onCloudImageChange,
++  onCloudSetupScriptChange,
+   onConnect,
+ }: {
+-  kind: RemoteTarget["kind"];
++  kind: RemoteKind;
+   host: string;
+   port: string;
+   username: string;
+@@ -202,6 +212,8 @@ export function RemoteConnectionSettingsStep({
+   remoteWorkspaceSessions?: RemoteWorkspaceSessionEntry[];
+   validationMessage: string;
+   loading: boolean;
++  cloudImage?: string;
++  cloudSetupScript?: string;
+   onBack: () => void;
+   onHostChange: (value: string) => void;
+   onPortChange: (value: string) => void;
+@@ -218,6 +230,8 @@ export function RemoteConnectionSettingsStep({
+   onDockerContainersRefresh?: () => void;
+   onApplySshConfigAlias: (value: SSHConfigAliasOption) => void;
+   onClearSelectedSshConfigAlias: () => void;
++  onCloudImageChange?: (value: string) => void;
++  onCloudSetupScriptChange?: (value: string) => void;
+   onConnect: () => void;
+ }) {
+   const { intl } = useZCodeIntl();
+@@ -237,8 +251,9 @@ export function RemoteConnectionSettingsStep({
+           </div>
+         ) : null}
+ 
++        {/* cloud 复用 SSH 的主机/凭据字段；容器与脚本参数在下方追加。 */}
+         <RemoteConnectionFields
+-          kind={kind}
++          kind={kind === "cloud" ? "ssh" : kind}
+           host={host}
+           port={port}
+           username={username}
+@@ -276,6 +291,43 @@ export function RemoteConnectionSettingsStep({
+           setManualDockerContainer={onManualDockerContainerChange}
+           refreshDockerContainers={onDockerContainersRefresh}
+         />
++
++        {kind === "cloud" ? (
++          <div className="space-y-3 rounded-2xl border border-border bg-card p-4">
++            <div className="grid gap-3 md:grid-cols-2">
++              <div>
++                <label className="mb-1 block text-ui-base text-foreground-subtle">
++                  {intl.formatMessage({ id: "remote.cloud.image" })}
++                </label>
++                <Input
++                  className="h-9 text-ui-base"
++                  value={cloudImage}
++                  onChange={(event) => onCloudImageChange?.(event.target.value)}
++                  placeholder="ubuntu:26.04"
++                  autoCapitalize="none"
++                  spellCheck={false}
++                  data-testid="cloud-image-input"
++                />
++              </div>
++            </div>
++            <div>
++              <label className="mb-1 block text-ui-base text-foreground-subtle">
++                {intl.formatMessage({ id: "remote.cloud.setupScript" })}
++              </label>
++              <textarea
++                className="min-h-24 w-full rounded-lg border border-input-border bg-input px-3 py-2 font-mono text-ui-sm text-foreground outline-none focus-visible:border-primary"
++                value={cloudSetupScript}
++                onChange={(event) => onCloudSetupScriptChange?.(event.target.value)}
++                placeholder={intl.formatMessage({ id: "remote.cloud.setupScriptPlaceholder" })}
++                spellCheck={false}
++                data-testid="cloud-setup-script-input"
++              />
++              <p className="mt-1 text-ui-sm leading-4 text-foreground-subtle">
++                {intl.formatMessage({ id: "remote.cloud.setupScriptDescription" })}
++              </p>
++            </div>
++          </div>
++        ) : null}
+       </div>
+ 
+       <div className="flex items-center justify-end gap-3">
+diff --git a/packages/ui/src/SSHDialog.tsx b/packages/ui/src/SSHDialog.tsx
+index f252336..e618fc0 100644
+--- a/packages/ui/src/SSHDialog.tsx
++++ b/packages/ui/src/SSHDialog.tsx
+@@ -111,6 +111,8 @@ export function RemoteConnectionDialog({
+     wslUser,
+     dockerContainer,
+     manualDockerContainer,
++    cloudImage,
++    cloudSetupScript,
+     sshConfigAliases,
+     sshConfigAliasesLoading,
+     sshConfigAliasesError,
+@@ -132,6 +134,8 @@ export function RemoteConnectionDialog({
+     setWslUser,
+     setDockerContainer,
+     setManualDockerContainer,
++    setCloudImage,
++    setCloudSetupScript,
+     refreshDockerContainers,
+     applySshConfigAlias,
+     clearSelectedSshConfigAlias,
+@@ -318,6 +322,8 @@ export function RemoteConnectionDialog({
+       wslUser,
+       dockerContainer,
+       manualDockerContainer,
++      cloudImage,
++      cloudSetupScript,
+     });
+     if (!nextTarget) {
+       // 必填项缺失属于表单校验，不应该和真实连接失败共用 destructive 错误样式。
+@@ -527,6 +533,8 @@ export function RemoteConnectionDialog({
+                     remoteWorkspaceSessions={remoteWorkspaceSessions}
+                     validationMessage={validationMessage}
+                     loading={loading}
++                    cloudImage={cloudImage}
++                    cloudSetupScript={cloudSetupScript}
+                     onBack={() => {
+                       resetFeedback();
+                       setCurrentStep("kind");
+@@ -546,6 +554,8 @@ export function RemoteConnectionDialog({
+                     onDockerContainersRefresh={refreshDockerContainers}
+                     onApplySshConfigAlias={applySshConfigAlias}
+                     onClearSelectedSshConfigAlias={clearSelectedSshConfigAlias}
++                    onCloudImageChange={setCloudImage}
++                    onCloudSetupScriptChange={setCloudSetupScript}
+                     onConnect={() => {
+                       void handleConnect();
+                     }}
+@@ -554,7 +564,7 @@ export function RemoteConnectionDialog({
+ 
+                 {currentStep === "connecting" ? (
+                   <RemoteConnectionConnectingStep
+-                    kind={kind}
++                    kind={kind === "cloud" ? "ssh" : kind}
+                     logs={connectionLogs}
+                     errorMessage={error}
+                     loading={loading}
+diff --git a/packages/ui/src/hooks/useRemoteConnectionForm.ts b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+index 865316a..4860572 100644
+--- a/packages/ui/src/hooks/useRemoteConnectionForm.ts
++++ b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+@@ -13,20 +13,25 @@ import {
+   resolveDockerContainerSelectionAfterRefresh,
+ } from "@/lib/remoteConnectionDockerOptions.js";
+ 
+-type RemoteKind = RemoteTarget["kind"];
++/**
++ * The wizard's selectable methods. "cloud" is a UI-level method that builds an
++ * SSH target: the environment (a disposable container on the host) is
++ * provisioned first, then the runtime connects into it through
++ * `dockerContainer`.
++ */
++export type RemoteKind = RemoteTarget["kind"] | "cloud";
+ export type SSHAuthMethod = "password" | "privateKey";
+ 
+ function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
+   const kinds: RemoteKind[] = ["ssh"];
+   // 远程连接入口里 WSL 和 SSH 同属主机类连接。
+-  // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
++  // Windows 下先放 WSL 再放 Cloud，避免 WSL 被隔开后在选择页显得离 SSH 很远。
+   if (options.isWindowsDesktop) {
+     kinds.push("wsl");
+   }
+-  // Docker入口之前完全依赖预探测结果决定是否展示。
+-  // 当探测能力暂时不可用、或用户还没切到 Docker 时，入口会直接消失，
+-  // 用户甚至不知道这里支持 Docker 连接。改为始终展示入口，切换后再懒加载探测结果。
+-  kinds.push("docker");
++  // Cloud environment 取代了原来的 Docker 本地容器入口：容器在 SSH 主机上按需
++  // 创建（可弃、带 setup script、注入 gh 凭据），而不是连接宿主机上的既有容器。
++  kinds.push("cloud");
+   return kinds;
+ }
+ 
+@@ -57,6 +62,8 @@ export function useRemoteConnectionForm({
+   const [wslUser, setWslUser] = useState("");
+   const [dockerContainer, setDockerContainer] = useState("");
+   const [manualDockerContainer, setManualDockerContainer] = useState("");
++  const [cloudImage, setCloudImage] = useState("");
++  const [cloudSetupScript, setCloudSetupScript] = useState("");
+   const [sshConfigAliases, setSshConfigAliases] = useState<SSHConfigAliasOption[]>([]);
+   const [sshConfigAliasesLoading, setSshConfigAliasesLoading] = useState(false);
+   const [sshConfigAliasesLoaded, setSshConfigAliasesLoaded] = useState(false);
+@@ -338,6 +345,8 @@ export function useRemoteConnectionForm({
+     wslUser,
+     dockerContainer,
+     manualDockerContainer,
++    cloudImage,
++    cloudSetupScript,
+     sshConfigAliases,
+     sshConfigAliasesLoading,
+     sshConfigAliasesError,
+@@ -359,6 +368,8 @@ export function useRemoteConnectionForm({
+     setWslUser,
+     setDockerContainer,
+     setManualDockerContainer,
++    setCloudImage,
++    setCloudSetupScript,
+     // Docker 容器列表是运行态数据，之前只在进入 Docker 页时拉一次。
+     // 下拉每次打开都通过这个回调按需刷新，避免用户看到已过期的容器列表。
+     refreshDockerContainers: () => refreshDockerContainers({ clearContainersOnError: false }),
+diff --git a/packages/ui/src/i18n/locales/en-US.ts b/packages/ui/src/i18n/locales/en-US.ts
+index 3843d0d..13bfa9b 100644
+--- a/packages/ui/src/i18n/locales/en-US.ts
++++ b/packages/ui/src/i18n/locales/en-US.ts
+@@ -1783,9 +1783,16 @@ const enUS: Record<string, string> = {
+   "remote.kind.ssh": "SSH",
+   "remote.kind.wsl": "WSL",
+   "remote.kind.docker": "Docker",
++  "remote.kind.cloud": "Cloud Environment",
+   "remote.kind.ssh.wizardDescription": "Remote host",
+   "remote.kind.wsl.wizardDescription": "Windows Subsystem for Linux",
+   "remote.kind.docker.wizardDescription": "Local container",
++  "remote.kind.cloud.wizardDescription": "Disposable container on an SSH host",
++  "remote.cloud.image": "Base image (optional)",
++  "remote.cloud.setupScript": "Setup script (optional)",
++  "remote.cloud.setupScriptPlaceholder": "apt-get update && apt-get install -y git build-essential",
++  "remote.cloud.setupScriptDescription":
++    "Runs once inside the environment right after creation. The container is kept afterwards, so everything the script installs persists between sessions.",
+   "remote.connect": "Connect",
+   "remote.connecting": "Connecting...",
+   "remote.minimize": "Minimize remote connection window",
+diff --git a/packages/ui/src/i18n/locales/zh-CN.ts b/packages/ui/src/i18n/locales/zh-CN.ts
+index 5bb9764..84a95cf 100644
+--- a/packages/ui/src/i18n/locales/zh-CN.ts
++++ b/packages/ui/src/i18n/locales/zh-CN.ts
+@@ -1657,9 +1657,16 @@ const zhCN: Record<string, string> = {
+   "remote.kind.ssh": "SSH",
+   "remote.kind.wsl": "WSL",
+   "remote.kind.docker": "Docker",
++  "remote.kind.cloud": "云环境",
+   "remote.kind.ssh.wizardDescription": "远程主机",
+   "remote.kind.wsl.wizardDescription": "Windows Linux 子系统",
+   "remote.kind.docker.wizardDescription": "本地容器",
++  "remote.kind.cloud.wizardDescription": "SSH 主机上的可弃容器",
++  "remote.cloud.image": "基础镜像（可选）",
++  "remote.cloud.setupScript": "初始化脚本（可选）",
++  "remote.cloud.setupScriptPlaceholder": "apt-get update && apt-get install -y git build-essential",
++  "remote.cloud.setupScriptDescription":
++    "创建时在环境内执行一次。容器随后保留，脚本安装的一切在会话之间持久化。",
+   "remote.connect": "连接",
+   "remote.connecting": "正在连接...",
+   "remote.minimize": "收起远程连接窗口",
+diff --git a/packages/ui/src/lib/remoteConnectionWizard.ts b/packages/ui/src/lib/remoteConnectionWizard.ts
+index d1d54e2..5ff7613 100644
+--- a/packages/ui/src/lib/remoteConnectionWizard.ts
++++ b/packages/ui/src/lib/remoteConnectionWizard.ts
+@@ -1,6 +1,6 @@
+ import type { RemoteAssetInstallMode, RemoteTarget } from "@zcode/shared";
+ import { isValidWslUser, normalizeRemoteResourcePackageSelection } from "@zcode/shared";
+-import type { SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
++import type { RemoteKind, SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
+ import type { RemoteWizardStep } from "@/RemoteConnectionWizardChrome.js";
+ 
+ type WizardIntlLike = {
+@@ -8,7 +8,7 @@ type WizardIntlLike = {
+ };
+ 
+ interface RemoteConnectionFormSnapshot {
+-  kind: RemoteTarget["kind"];
++  kind: RemoteKind;
+   host: string;
+   port: string;
+   username: string;
+@@ -22,12 +22,14 @@ interface RemoteConnectionFormSnapshot {
+   wslUser?: string;
+   dockerContainer: string;
+   manualDockerContainer?: string;
++  cloudImage?: string;
++  cloudSetupScript?: string;
+ }
+ 
+ export function getRemoteWizardStepCopy(
+   intl: WizardIntlLike,
+   step: RemoteWizardStep,
+-  kind: RemoteTarget["kind"],
++  kind: RemoteKind,
+ ) {
+   switch (step) {
+     case "kind":
+@@ -68,7 +70,10 @@ export function buildRemoteTarget(
+   snapshot: RemoteConnectionFormSnapshot,
+ ): { target?: RemoteTarget; errorMessage?: string } {
+   switch (snapshot.kind) {
+-    case "ssh":
++    // cloud 与 ssh 共用同一组主机/凭据校验；cloud 只是在生成的 SSH 目标上多带
++    // 一个 cloudEnvironment 提示，由 Web 端先按需创建容器再以 dockerContainer 连接。
++    case "cloud":
++    case "ssh": {
+       if (!snapshot.host || !snapshot.username) {
+         return {
+           errorMessage: intl.formatMessage({ id: "ssh.validation.required" }),
+@@ -89,25 +94,40 @@ export function buildRemoteTarget(
+ 
+       const sshConfigAlias = snapshot.selectedSshConfigAlias?.trim();
+ 
+-      return {
+-        target: {
+-          kind: "ssh",
+-          host: snapshot.host,
+-          port: snapshot.port ? Number(snapshot.port) : undefined,
+-          username: snapshot.username,
+-          ...(sshConfigAlias ? { sshConfigAlias } : {}),
+-          assetInstallMode: snapshot.assetInstallMode,
+-          ...(snapshot.sshAuthMethod === "password" && snapshot.password
+-            ? { password: snapshot.password }
+-            : {}),
+-          ...(snapshot.sshAuthMethod === "privateKey" && snapshot.privateKeyPath
+-            ? { privateKeyPath: snapshot.privateKeyPath }
+-            : {}),
+-          ...(snapshot.sshAuthMethod === "privateKey" && snapshot.privateKeyPassphrase
+-            ? { privateKeyPassphrase: snapshot.privateKeyPassphrase }
+-            : {}),
+-        },
++      const sshTarget: RemoteTarget = {
++        kind: "ssh",
++        host: snapshot.host,
++        port: snapshot.port ? Number(snapshot.port) : undefined,
++        username: snapshot.username,
++        ...(sshConfigAlias ? { sshConfigAlias } : {}),
++        assetInstallMode: snapshot.assetInstallMode,
++        ...(snapshot.sshAuthMethod === "password" && snapshot.password
++          ? { password: snapshot.password }
++          : {}),
++        ...(snapshot.sshAuthMethod === "privateKey" && snapshot.privateKeyPath
++          ? { privateKeyPath: snapshot.privateKeyPath }
++          : {}),
++        ...(snapshot.sshAuthMethod === "privateKey" && snapshot.privateKeyPassphrase
++          ? { privateKeyPassphrase: snapshot.privateKeyPassphrase }
++          : {}),
+       };
++
++      if (snapshot.kind === "cloud") {
++        const image = snapshot.cloudImage?.trim();
++        const setupScript = snapshot.cloudSetupScript?.trim();
++        return {
++          target: {
++            ...sshTarget,
++            cloudEnvironment: {
++              ...(image ? { image } : {}),
++              ...(setupScript ? { setupScript } : {}),
++            },
++          },
++        };
++      }
++
++      return { target: sshTarget };
++    }
+     case "docker":
+       // Docker 运行中列表可能因为探测失败或刷新延迟不完整。
+       // 手动输入必须独立于下拉选择，提交时优先使用手动输入，空值再回落到下拉选择。
+-- 
+2.56.0
+
