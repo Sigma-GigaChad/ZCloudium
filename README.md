@@ -287,13 +287,6 @@ sets to `/host/home/<user>`. Without it the image default `/workspace` wins, and
 the agent works in a throwaway path inside the container instead of your home on
 the machine.
 
-The unsafe profile (`compose.unsafe.yml`) carried the same block, and the defect
-it hid was worse there: `/workspace` is not mounted on that profile at all, so the
-agent worked in the container's own filesystem, outside `/host`, and lost the work
-with the container. That file now sets `ZCODE_SERVER_WORKSPACE` to the same
-`/host/home/<user>`, and `./check-unsafe.sh` fails when the runtime does not report
-it.
-
 ## TLS, terminated here or in front
 
 **The gateway serves https by default**, with a certificate it generates on first
@@ -379,48 +372,32 @@ left commented out.
 The authentication gateway is on by default in this profile, which is where it
 matters most: with a root agent, an open port would mean owning the machine.
 
-## The machine itself, no container boundary (unsafe)
+## Deployment doctrine: a sandbox here, development elsewhere
 
-`compose.unsafe.yml` goes one step further than full access: the container is
-`privileged`, shares the machine's process namespace (`pid: "host"`), and holds
-the machine's Docker socket. Concretely, the agent can:
+A previous profile, `compose.unsafe.yml`, removed the container boundary on
+purpose: `privileged`, the machine's process namespace (`pid: "host"`) and the
+Docker socket mounted, so the agent could `nsenter` into the machine, install
+packages with its package manager and drive its containers. It is **removed**:
+everything it offered beyond full access was the definition of a machine
+compromised by design, and `check-unsafe.sh` went with it. What it was used for
+is now spelled out as a doctrine instead of a launch flag.
 
-- read and write every path of the machine, as full access;
-- run commands as the machine itself, inside its namespaces:
-  `nsenter -t 1 -m -u -i -n -p -- <command>`;
-- install packages with the machine's own package manager, apt, pacman or
-  whatever it runs, from inside the conversation:
-  `nsenter -t 1 -m -u -i -n -p -- apt-get install -y <pkg>`;
-- see and signal the machine's processes, and control the machine's containers
-  through the mounted Docker socket.
+**The container is a sandbox, and that is all it is.** It serves the web
+application behind the gateway, and the work it produces lives in Docker
+volumes, not in the container: `/data` for the state that must survive (the
+gateway accounts, the runtime configuration), and the workspace directory for
+the work itself. Replacing the container never costs a line of work; the image
+is disposable by construction, and no profile needs to punch through it.
 
-There is nothing to elevate to: the agent already is root on the machine, so
-sudo and privilege requests are no-ops. Tell it once in a conversation that
-these paths exist (or add them to your `AGENTS.md` in the operator home), and it
-will use them directly.
-
-```bash
-./check-unsafe.sh                        # verifies all of it (throwaway container)
-cp compose.unsafe.yml compose.local.yml  # adapt the port and the home paths
-docker compose -f compose.local.yml up -d
-```
-
-The authentication gateway stays in front of the port on this profile too. It
-decides **who** reaches the agent; it does not limit **what** the authenticated
-agent can do, which is the machine, period.
-
-Two things to know:
-
-- **Snapshot the machine before the first run, and before every unsupervised
-  run.** On this profile a wrong command is a wrong command on your machine, and
-  `apt` or `pacman` installs are real installs.
-- **On a multi distribution WSL setup**, `pid: "host"` and the `/:/host` mount
-  resolve against the environment of the Docker daemon, which may be a different
-  distribution from the one your shell runs in (found while testing: the daemon
-  side ran Arch based CachyOS with pacman while `/host` carried Debian with
-  apt; both were usable, each through its own path). On the intended target, a
-  single distribution VM, the two are the same machine and this caveat does not
-  exist.
+**Everything heavier happens on a dedicated machine, reached over SSH.**
+System packages, machine level services, repositories with their own
+toolchains, long running development jobs: those run on a dedicated
+development machine, and the agent works on it through ZCode's Remote SSH
+feature instead of through a wider container. The machine owns its own
+credentials and its own hardening; the container only needs to reach it, which
+is one outbound SSH connection and no new published port. The full access
+profile stays for the case where the agent must genuinely act on the very
+machine that hosts it, with the consequences documented above.
 
 ### Finding your existing ~/.zcode again
 
@@ -540,7 +517,7 @@ Tested by actually running things, not only written. The measurements below date
 from the run that made them: where one names a version, that is the version it
 was measured on, while `zcode.version` is what a build carries today.
 
-- **test suite**: 100 tests, 100 pass, 0 fail (`node --test --test-force-exit`,
+- **test suite**: 101 tests, 101 pass, 0 fail (`node --test --test-force-exit`,
   which prints the count and exits on its own). The new features carry their own
   tests: the recovery sheet arithmetic, the single-use rule end to end, the
   password change and the key rotation it forces, the failure budget surviving a
@@ -572,19 +549,6 @@ was measured on, while `zcode.version` is what a build carries today.
   `workspaces[].path` as the mounted operator home (measured on a throwaway home
   in the test), not the image default `/workspace`: the workspace comes from
   `ZCODE_SERVER_WORKSPACE`
-- **unsafe workspace, and the check that keeps it**: `./check-unsafe.sh` starts
-  the throwaway container with the image's own entrypoint (no `--entrypoint bash`,
-  no `command:` block, the home and the workspace in the environment) and reads
-  the workspace back from the running runtime, at
-  `http://127.0.0.1:3131/api/server-info`: it answers
-  `workspaces[0].path == /host/tmp/zcloudium-unsafe-home`, the mounted home. The
-  same container started with the pre-fix settings (the `command:` block with
-  `--workspace=/host/home/delta`, no `ZCODE_SERVER_WORKSPACE`) answered
-  `/workspace`, logged `ignoring the extra command line arguments (...)`, and that
-  path is not a mount inside the container (`mount` shows none): the agent's work
-  landed in the container's own filesystem. Removing the variable from the script
-  makes probe 1 fail with `reports '/workspace' instead of
-  /host/tmp/zcloudium-unsafe-home` and the script exits `1`
 - **leftover `command:` block**: a container started with the old argument list
   appended logs `ignoring the extra command line arguments (...)` and still runs
   with the loopback arguments built from the environment

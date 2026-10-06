@@ -81,7 +81,7 @@ assert_compose_profile() {
   fi
 
   if [ "$workspace_must_match_home" = "true" ]; then
-    echo -n "  6. ZCODE_SERVER_WORKSPACE matches HOME (required on unsafe/full-access): "
+    echo -n "  6. ZCODE_SERVER_WORKSPACE matches HOME (required on full access): "
     if [ -n "$workspace_val" ] && [ "$workspace_val" = "$home_val" ]; then
       echo "OK (all three point at '$home_val')"
     else

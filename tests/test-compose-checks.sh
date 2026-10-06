@@ -12,12 +12,12 @@ cd "$SCRIPT_DIR/.."
 source lib/check-compose-coherence.sh
 
 echo "=========================================="
-echo "TEST 1: compose.unsafe.yml - remove ZCODE_SERVER_WORKSPACE"
+echo "TEST 1: compose.full-access.yml - remove ZCODE_SERVER_WORKSPACE"
 echo "=========================================="
-cp compose.unsafe.yml compose.unsafe.yml.test
-sed -i '/ZCODE_SERVER_WORKSPACE:/d' compose.unsafe.yml.test
+cp compose.full-access.yml compose.full-access.yml.test
+sed -i '/ZCODE_SERVER_WORKSPACE:/d' compose.full-access.yml.test
 echo "Running check on broken file..."
-OUTPUT=$(assert_compose_profile compose.unsafe.yml.test 2>&1 || true)
+OUTPUT=$(assert_compose_profile compose.full-access.yml.test 2>&1 || true)
 echo "$OUTPUT"
 if echo "$OUTPUT" | grep -q "ZCODE_SERVER_WORKSPACE present: FAIL"; then
   echo "✓ Check correctly detected missing ZCODE_SERVER_WORKSPACE"
@@ -26,7 +26,7 @@ else
   echo "✗ Check did not detect the issue"
   RESULT1="FAIL"
 fi
-rm -f compose.unsafe.yml.test
+rm -f compose.full-access.yml.test
 
 echo
 echo "=========================================="
@@ -67,13 +67,13 @@ rm -f compose.yml.test
 
 echo
 echo "=========================================="
-echo "TEST 4: compose.unsafe.yml - mismatched workspace path"
+echo "TEST 4: compose.full-access.yml - mismatched workspace path"
 echo "=========================================="
-cp compose.unsafe.yml compose.unsafe.yml.test
+cp compose.full-access.yml compose.full-access.yml.test
 # Change ZCODE_SERVER_WORKSPACE to a different path
-sed -i 's|ZCODE_SERVER_WORKSPACE: /host/home/delta|ZCODE_SERVER_WORKSPACE: /host/home/other|' compose.unsafe.yml.test
+sed -i 's|ZCODE_SERVER_WORKSPACE: /host/home/delta|ZCODE_SERVER_WORKSPACE: /host/home/other|' compose.full-access.yml.test
 echo "Running check on broken file..."
-OUTPUT=$(assert_compose_profile compose.unsafe.yml.test 2>&1 || true)
+OUTPUT=$(assert_compose_profile compose.full-access.yml.test 2>&1 || true)
 echo "$OUTPUT"
 if echo "$OUTPUT" | grep -q "ZCODE_SERVER_WORKSPACE matches HOME.*FAIL"; then
   echo "✓ Check correctly detected mismatched workspace path"
@@ -82,7 +82,7 @@ else
   echo "✗ Check did not detect the issue"
   RESULT4="FAIL"
 fi
-rm -f compose.unsafe.yml.test
+rm -f compose.full-access.yml.test
 
 echo
 echo "=========================================="
@@ -107,10 +107,10 @@ echo
 echo "=========================================="
 echo "SUMMARY"
 echo "=========================================="
-echo "Test 1 (unsafe - missing ZCODE_SERVER_WORKSPACE): $RESULT1"
+echo "Test 1 (full-access - missing ZCODE_SERVER_WORKSPACE): $RESULT1"
 echo "Test 2 (full-access - leftover command: block): $RESULT2"
 echo "Test 3 (restricted - missing ZCODE_SERVER_WORKSPACE): $RESULT3"
-echo "Test 4 (unsafe - mismatched workspace path): $RESULT4"
+echo "Test 4 (full-access - mismatched workspace path): $RESULT4"
 echo "Test 5 (restricted - mismatched HOME/ZCODE_DATA_BASE_DIR): $RESULT5"
 
 if [ "$RESULT1" = "PASS" ] && [ "$RESULT2" = "PASS" ] && [ "$RESULT3" = "PASS" ] && [ "$RESULT4" = "PASS" ] && [ "$RESULT5" = "PASS" ]; then

@@ -6,11 +6,11 @@
 #
 #   ./check-restricted.sh
 #
-# Unlike check-unsafe.sh and check-full-access.sh, this script does not start a
+# Unlike check-full-access.sh, this script does not start a
 # container: the restricted profile runs as an unprivileged user with a
 # read-only rootfs and named volumes, so the runtime probes would require a
 # full setup wizard run. The static assertion is enough to catch the drift the
-# other two checks catch: a missing ZCODE_SERVER_WORKSPACE, or a leftover
+# check-full-access.sh catches: a missing ZCODE_SERVER_WORKSPACE, or a leftover
 # command: block that the entrypoint would ignore.
 
 set -euo pipefail
