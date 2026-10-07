@@ -393,11 +393,15 @@ is disposable by construction, and no profile needs to punch through it.
 System packages, machine level services, repositories with their own
 toolchains, long running development jobs: those run on a dedicated
 development machine, and the agent works on it through ZCode's Remote SSH
-feature instead of through a wider container. The machine owns its own
-credentials and its own hardening; the container only needs to reach it, which
-is one outbound SSH connection and no new published port. The full access
-profile stays for the case where the agent must genuinely act on the very
-machine that hosts it, with the consequences documented above.
+feature instead of through a wider container — from the desktop app, and from
+the web interface in this image, where the wizard also offers **Cloud
+Environment**: a disposable container on that machine, provisioned with a
+setup script, in which the agent installs whatever the project needs
+(see "Web mode: remote workspaces and cloud environments"). The machine owns
+its own credentials and its own hardening; the container only needs to reach
+it, which is one outbound SSH connection and no new published port. The full
+access profile stays for the case where the agent must genuinely act on the
+very machine that hosts it, with the consequences documented above.
 
 ### Finding your existing ~/.zcode again
 
@@ -639,29 +643,45 @@ compiles the sources yourself. Read its header first: the build is validated,
 but the image it produces is not the product (see below), and the original
 vendor's tag series lags the fork the precompiled runtime comes from.
 
-## Dockerfile.from-source (build validated, not wired to the gateway)
+## The from-source build carries the remote workspace features
 
-Compiles the runtime from the git sources instead of using the published
-tarball. Validated on the ZCodium fork's `v3.14.7` (2026-10-06): the build
-completes with the vendor's own release sequence (`pnpm install
---frozen-lockfile`, `pnpm typecheck`, `pnpm build:zcode` — the `typecheck`
-step is what emits `packages/shared/dist`, which the SEA collector requires),
-and the runtime it produces starts and answers `/api/server-info`.
+The precompiled image runs the published tarball exactly as the fork ships it.
+The features that need runtime changes — opening Remote SSH sessions from the
+web client, and creating Cloud Environments — live in a small, reviewed patch
+series that `Dockerfile.from-source` applies to the pinned ZCodium revision
+before compiling it (`./build.sh --from-source`). The image it produces carries
+the same gateway, entrypoint and hardening as the precompiled one; only the
+runtime differs, and the build proves the series reached the artefacts (it
+greps one server route and one web string after extraction).
 
-What it costs and what it does not buy, measured:
+What the series adds, and where it is documented: `patches/README.md` lists
+every file and the upstream policy — new files for new capabilities, small
+marked hunks in the few edited ones, upstream behaviour without it. The pinned
+revision is labelled with its exact commit (`org.opencontainers.image.revision`),
+and `build.sh` refuses a from-source build whose `patches/` is empty: an image
+compiled without the series would silently miss every feature this path exists
+for.
 
-- about 5 minutes of cold build on a capable machine, against about 8 seconds
-  for the precompiled path;
-- the tarball it builds does not reproduce the official one bit for bit
-  (different sha256: tarballs carry mtimes);
-- upstream `zai-org/ZCode` stops at `v3.14.3`: building only from the original
-  vendor means staying several releases behind, and building current versions
-  means building the fork's git anyway;
-- the image it produces has no gateway, no TLS and no entrypoint: it is not the
-  product, and wiring it would have to pass the e2e suite before shipping.
+Costs, measured: about 5 minutes of cold build against about 8 seconds for the
+precompiled path; the tarball it builds does not reproduce the official one bit
+for bit (tarballs carry mtimes), which is why the image version is the source
+revision, not a hash of the output. Upstream `zai-org/ZCode` stops at `v3.14.3`:
+building current versions means building this fork's git anyway.
 
-## Limits of web mode
+## Web mode: remote workspaces and cloud environments
 
-Web mode does not allow connecting to a remote project from the interface
-(`connectRemote` answers *not supported in Web mode yet*): the workspace is the
-server directory mounted on `/workspace`.
+The stock web client refuses remote connections (*not supported in Web mode
+yet*), because the server exposes only four services over the remote
+WebSocket. In this image the web client connects Remote SSH targets like the
+desktop one, and the wizard's method list offers **Cloud Environment** instead
+of Docker: the wizard collects the SSH host and credentials plus an optional
+base image (default `ubuntu:26.04`) and an optional setup script, the server
+provisions a disposable container on that host, copies the host's GitHub CLI
+credentials into it (authenticate `gh` and `git` once on the machine, every
+environment inherits them), and the runtime connects into the container through
+the operator's SSH session — no sshd in the container, no published port, no
+Docker credentials on the machine running this image.
+
+Environments persist on the host (the setup script runs once, dependencies
+survive between sessions) and are removed with `docker rm -f <name>` on that
+machine, or by an operator who wants the space back.
