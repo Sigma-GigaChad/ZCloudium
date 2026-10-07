@@ -183,7 +183,8 @@ export async function pollDeviceToken(deviceCode, fetchImpl = fetch) {
     return { status: "pending" };
   }
   if (payload.error === "slow_down") {
-    return { status: "pending", intervalSeconds: 10 };
+    // The caller adds five to the interval it just used (RFC 8628 §3.5).
+    return { status: "pending", slowDown: true };
   }
   if (payload.error === "expired_token") {
     return { status: "expired" };

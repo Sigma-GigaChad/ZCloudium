@@ -864,7 +864,7 @@ export async function createGateway({
           seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(requested.error)}`);
           return;
         }
-        deviceFlows.set(session.user, { ...requested, lastPollAtMs: 0, intervalSeconds: requested.intervalSeconds });
+        deviceFlows.set(session.user, { ...requested, lastPollAtMs: now(), intervalSeconds: requested.intervalSeconds });
         seeOther(res, `${AUTH_PREFIX}/github/device`);
         return;
       }
@@ -906,8 +906,9 @@ export async function createGateway({
         }
         const verdict = await pollDeviceToken(flow.deviceCode, githubApiFetch);
         if (verdict.status === "pending") {
-          if (typeof verdict.intervalSeconds === "number") {
-            flow.intervalSeconds = Math.max(flow.intervalSeconds, verdict.intervalSeconds);
+          if (verdict.slowDown) {
+            // RFC 8628 §3.5: the interval just used, plus five seconds.
+            flow.intervalSeconds = flow.intervalSeconds + 5;
           }
           seeOther(res, `${AUTH_PREFIX}/github/device`);
           return;

@@ -10,6 +10,7 @@ import { join } from "node:path";
 // would keep the old value and the timing tests below would then measure a
 // number the product no longer uses.
 import { BLOCK_MS, createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
+import { GH_CLIENT_ID, GH_SCOPES } from "../gateway/lib/github.mjs";
 import { totp } from "../gateway/lib/totp.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -1010,11 +1011,15 @@ test("GitHub device flow: the owner signs in like gh auth login, the token lands
       // interval), then reports pending while the code is not typed yet.
       const heldBack = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
       assert.equal(heldBack.status, 303, "the first poll respects the interval GitHub named");
+      // A bounce and a pending poll both redirect to the waiting page; only
+      // the hit counter makes the hold-back claim falsifiable.
+      assert.equal(tokenEndpointHits, 0, "the first check must not poll: the code was issued moments ago");
       advance(6_000);
 
       const pending = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
       assert.equal(pending.status, 303);
       assert.equal(pending.headers.get("location"), "/_auth/github/device", "pending sends the browser back to the waiting page");
+      assert.equal(tokenEndpointHits, 1, "once the interval has passed, the check polls");
 
       // Step 3: the user has typed the code; the next check completes the
       // sign-in and writes the same hosts.yml the token form writes. The
@@ -1093,10 +1098,23 @@ test("GitHub device flow: expired codes clean up, cancel clears the flow, non-ow
  * the /user lookup names the login. `authorized` is reset per test.
  */
 let authorized = false;
+let tokenEndpointHits = 0;
 function deviceFlowStub() {
   authorized = false;
-  return async (url) => {
+  tokenEndpointHits = 0;
+  return async (url, init = {}) => {
+    const headers = init.headers ?? {};
+    // The device endpoints ask for application/json; the /user lookup for the
+    // versioned application/vnd.github+json. Both are JSON asks; anything
+    // else would make GitHub answer form-encoded.
+    if (!/application\/(vnd\.github\+)?json/.test(String(headers.accept ?? ""))) {
+      return new Response("expect JSON accept", { status: 400 });
+    }
+    const body = new URLSearchParams(init.body ?? "");
     if (String(url).endsWith("/login/device/code")) {
+      if (body.get("client_id") !== GH_CLIENT_ID || body.get("scope") !== GH_SCOPES) {
+        return new Response("wrong device-code request", { status: 400 });
+      }
       return new Response(JSON.stringify({
         device_code: "device-flow-device-code",
         user_code: "WXYZ-1234",
@@ -1106,6 +1124,10 @@ function deviceFlowStub() {
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (String(url).endsWith("/login/oauth/access_token")) {
+      if (body.get("client_id") !== GH_CLIENT_ID || body.get("device_code") !== "device-flow-device-code" || body.get("grant_type") !== "urn:ietf:params:oauth:grant-type:device_code") {
+        return new Response("wrong token request", { status: 400 });
+      }
+      tokenEndpointHits += 1;
       if (!authorized) {
         return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 200, headers: { "content-type": "application/json" } });
       }
