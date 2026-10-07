@@ -108,3 +108,92 @@ export async function validateGitHubToken(token, fetchImpl = fetch) {
   }
   return { ok: true, login };
 }
+
+/**
+ * The device flow, exactly as `gh auth login` runs it.
+ *
+ * The client id is GitHub CLI's public OAuth application (it is not a secret:
+ * device flow clients carry none, and this one ships in gh's open source). The
+ * authorization page the user sees therefore says "GitHub CLI", the requested
+ * scopes are gh's, and the token this flow returns is an ordinary gh token —
+ * it lands in the same hosts.yml, and environments inherit it like any other.
+ * No custom OAuth application to register, no client secret to keep.
+ */
+
+export const GH_CLIENT_ID = "178c6fc778ccc68e1d6a";
+export const GH_SCOPES = "repo,read:org,gist,workflow";
+const GH_DEVICE_CODE_URL = "https://github.com/login/device/code";
+const GH_TOKEN_URL = "https://github.com/login/oauth/access_token";
+
+/**
+ * Step one: ask GitHub for a device code pair. Returns what the page shows
+ * (the short code and the address to type it at) plus what only the server
+ * keeps (the device code and the polling cadence).
+ */
+export async function requestDeviceCode(fetchImpl = fetch) {
+  const response = await fetchImpl(GH_DEVICE_CODE_URL, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded", "user-agent": "z-cloudium-gateway" },
+    body: new URLSearchParams({ client_id: GH_CLIENT_ID, scope: GH_SCOPES }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    return { ok: false, error: `GitHub answered ${response.status} for a device code.` };
+  }
+  const payload = await response.json().catch(() => null);
+  if (!payload?.device_code || !payload?.user_code || !payload?.verification_uri) {
+    return { ok: false, error: "GitHub answered a device code this gateway cannot read." };
+  }
+  return {
+    ok: true,
+    deviceCode: payload.device_code,
+    userCode: payload.user_code,
+    verificationUri: payload.verification_uri,
+    intervalSeconds: Number(payload.interval) > 0 ? Number(payload.interval) : 5,
+    expiresAtMs: Date.now() + (Number(payload.expires_in) > 0 ? Number(payload.expires_in) : 900) * 1000,
+  };
+}
+
+/**
+ * Step two, run once per poll: ask GitHub whether the user typed the code yet.
+ * GitHub answers 200 for every case here — the error field is the protocol:
+ * `authorization_pending` is the normal waiting state, `slow_down` asks for a
+ * longer interval, `expired_token` ends the flow, and a success carries the
+ * token with the granted scopes.
+ */
+export async function pollDeviceToken(deviceCode, fetchImpl = fetch) {
+  const response = await fetchImpl(GH_TOKEN_URL, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded", "user-agent": "z-cloudium-gateway" },
+    body: new URLSearchParams({
+      client_id: GH_CLIENT_ID,
+      device_code: deviceCode,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    return { status: "error", error: `GitHub answered ${response.status} while waiting for the authorization.` };
+  }
+  const payload = await response.json().catch(() => null);
+  if (!payload) {
+    return { status: "error", error: "GitHub answered something this gateway cannot read." };
+  }
+  if (payload.error === "authorization_pending") {
+    return { status: "pending" };
+  }
+  if (payload.error === "slow_down") {
+    // The caller adds five to the interval it just used (RFC 8628 §3.5).
+    return { status: "pending", slowDown: true };
+  }
+  if (payload.error === "expired_token") {
+    return { status: "expired" };
+  }
+  if (payload.error) {
+    return { status: "error", error: `GitHub refused the flow: ${payload.error}.` };
+  }
+  if (typeof payload.access_token !== "string" || !payload.access_token) {
+    return { status: "error", error: "GitHub answered without a token." };
+  }
+  return { status: "authorized", token: payload.access_token, scopes: String(payload.scope ?? "") };
+}

@@ -134,9 +134,12 @@ workspace:
   (dependencies survive between sessions) until you remove it.
 
 GitHub credentials are enrolled **once, in this container**: the owner's menu
-has a *GitHub credentials* page, the token is validated against
-`api.github.com` and stored on the `/data` volume. Fine-grained tokens work
-and limit the blast radius.
+has a *GitHub credentials* page whose main button runs the same device
+sign-in as `gh auth login` — GitHub shows a short code, you type it at
+`github.com/login/device`, the token lands on the `/data` volume. It is
+GitHub CLI's own application and scopes; there is nothing to register.
+Paste-a-token stays for fine-grained PATs, which the device flow cannot
+create.
 
 ## Deployment profiles
 

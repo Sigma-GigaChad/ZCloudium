@@ -394,19 +394,53 @@ export function githubPage({ login, hasToken, saved, error } = {}) {
 ${errorBlock(error)}
 ${savedBlock}
 ${status}
-<form method="post" action="/_auth/github" autocomplete="off">
-  <div class="field">
-    <label for="token">Personal access token</label>
-    <input id="token" name="token" type="password" autocomplete="new-password" required>
-  </div>
-  <button class="primary" type="submit">Validate and store</button>
+<form method="post" action="/_auth/github/device" autocomplete="off">
+  <button class="primary" type="submit">Sign in with GitHub (browser)</button>
 </form>
+<p class="hint">The same sign-in <code>gh auth login</code> performs: GitHub shows a short code, you type it in the browser, done. Requests the <code>repo</code>, <code>read:org</code>, <code>gist</code> and <code>workflow</code> scopes, under GitHub CLI's own application.</p>
+<details>
+  <summary>Or paste a personal access token instead</summary>
+  <form method="post" action="/_auth/github" autocomplete="off">
+    <div class="field">
+      <label for="token">Personal access token</label>
+      <input id="token" name="token" type="password" autocomplete="new-password" required>
+    </div>
+    <button type="submit">Validate and store</button>
+  </form>
+  <p class="hint">A fine-grained token cannot be created through the device flow, so this path stays for it. The token is validated against api.github.com before being written.</p>
+</details>
 ${hasToken ? `
 <form method="post" action="/_auth/github">
   <input type="hidden" name="remove" value="1">
   <button type="submit">Remove the stored credentials</button>
 </form>` : ""}
-<p class="hint">Create the token on GitHub (Settings → Developer settings → Personal access tokens) with the <code>repo</code> scope — or a fine-grained token limited to the repositories that matter. The token is validated against api.github.com before being written to <code>~/.config/gh/hosts.yml</code> on the data volume, mode 0600, where the gateway can read it and nothing else can.</p>`,
+<p class="hint">Whatever the path, the credentials land in <code>~/.config/gh/hosts.yml</code> on the data volume, mode 0600, where the gateway can read them and nothing else can.</p>`,
+  });
+}
+
+/**
+ * The device-flow waiting page. The gateway's pages carry no JavaScript (the
+ * CSP allows exactly one script by hash), so the waiting loop is the same
+ * mechanism as the 502 page: a meta refresh that lands on the check route,
+ * which polls GitHub once per cycle and redirects back here until the user
+ * has typed the code.
+ */
+export function githubDevicePage({ userCode, verificationUri, expiresInSeconds }) {
+  const minutes = Math.max(1, Math.round(expiresInSeconds / 60));
+  return layout({
+    title: "GitHub sign-in",
+    body: `
+<h1>GitHub sign-in</h1>
+<p class="lead">On github.com, enter this code. That is the whole flow — it is the device sign-in <code>gh auth login</code> runs.</p>
+<code class="secret" data-testid="device-user-code">${escapeHtml(userCode)}</code>
+<p class="step">1. Open <a href="${escapeHtml(verificationUri)}" rel="noopener">${escapeHtml(verificationUri)}</a> (github.com/login/device)</p>
+<p class="step">2. Type the code above</p>
+<p class="step">3. Authorize <strong>GitHub CLI</strong> — this gateway runs its sign-in, under its application</p>
+<p class="hint">Waiting for you to finish — this page checks every few seconds and moves on by itself. The code expires in about ${minutes} minutes.</p>
+<form method="post" action="/_auth/github/device/cancel">
+  <button type="submit">Cancel</button>
+</form>
+<meta http-equiv="refresh" content="5; url=/_auth/github/device/check">`,
   });
 }
 
