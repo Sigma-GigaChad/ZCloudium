@@ -1495,7 +1495,7 @@ index 052eab8..f48c7f5 100644
 2.56.0
 
 
-From 1085543beeb81d98601977faa03a90c1101a71e3 Mon Sep 17 00:00:00 2001
+From 0fd2bb804cbb6b56b6079104125258a46f012c61 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Wed, 7 Oct 2026 11:46:09 +0200
 Subject: [PATCH 2/2] zcloudium: GitHub credentials follow the app, not the
@@ -1508,13 +1508,13 @@ it. A hosts.yml on the SSH host stays the fallback, and missing
 credentials on both are still not an error. The wizard's setup-script
 hint mentions the owner-menu enrolment.
 ---
- packages/server/src/cloudEnvironments.ts | 24 ++++++++++++++++++++----
+ packages/server/src/cloudEnvironments.ts | 28 +++++++++++++++++++-----
  packages/ui/src/i18n/locales/en-US.ts    |  2 +-
  packages/ui/src/i18n/locales/zh-CN.ts    |  2 +-
- 3 files changed, 22 insertions(+), 6 deletions(-)
+ 3 files changed, 25 insertions(+), 7 deletions(-)
 
 diff --git a/packages/server/src/cloudEnvironments.ts b/packages/server/src/cloudEnvironments.ts
-index a08a592..33df109 100644
+index a08a592..67fce0e 100644
 --- a/packages/server/src/cloudEnvironments.ts
 +++ b/packages/server/src/cloudEnvironments.ts
 @@ -1,3 +1,6 @@
@@ -1524,10 +1524,11 @@ index a08a592..33df109 100644
  import type { Hono } from "hono";
  import { formatZodError, sshConnectOptionsSchema } from "@zcode/shared";
  import { quotePosixShellArg } from "@zcode/server/remote/posixShell.js";
-@@ -200,14 +203,27 @@ async function provisionEnvironment(
+@@ -200,14 +203,29 @@ async function provisionEnvironment(
   * environment. Missing host credentials are not an error: the environment just
   * starts without them.
   */
+-async function installGhCredentialsFromHost(
 +/**
 + * Propagate GitHub credentials into the environment.
 + *
@@ -1540,7 +1541,9 @@ index a08a592..33df109 100644
 + * credentials on both are not an error: the environment just starts without
 + * GitHub access.
 + */
- async function installGhCredentialsFromHost(
++/** Exported for the build-time validation: the credential preference order is
++ * exactly the cross-component contract a typecheck cannot see. */
++export async function installGhCredentialsFromHost(
    backend: SSHBackend,
    container: string,
  ): Promise<boolean> {

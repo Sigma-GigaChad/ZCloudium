@@ -664,7 +664,7 @@ The precompiled image runs the published tarball exactly as the fork ships it.
 The features that need runtime changes — opening Remote SSH sessions from the
 web client, and creating Cloud Environments — live in a small, reviewed patch
 series that `Dockerfile.from-source` applies to the pinned ZCodium revision
-before compiling it (`./build.sh --from-source`). The image it produces carries
+before compiling it (`./build.sh`). The image it produces carries
 the same gateway, entrypoint and hardening as the precompiled one; only the
 runtime differs, and the build proves the series reached the artefacts (it
 greps one server route and one web string after extraction).

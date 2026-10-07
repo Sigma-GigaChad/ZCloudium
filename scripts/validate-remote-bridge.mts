@@ -84,4 +84,91 @@ if (eventPayload !== "remote-event-payload") {
 }
 
 console.log("ROUND-TRIP OK: the toService registration survives exposeOnChannelServer");
+
+// ---------------------------------------------------------------------------
+// The credential preference contract: installGhCredentialsFromHost must read
+// the container's own $HOME/.config/gh/hosts.yml first (what the gateway's
+// /_auth/github page writes), fall back to the SSH host's file, and treat
+// "neither" as a clean no-op. os.homedir() follows $HOME, so the test points
+// it at a temp directory instead of the real home.
+// ---------------------------------------------------------------------------
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { installGhCredentialsFromHost } from "./src/cloudEnvironments.js";
+
+function fakeBackend(remoteFile: string) {
+  const commands: string[] = [];
+  return {
+    commands,
+    exec: (command: string) => {
+      commands.push(command);
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stdin = new PassThrough();
+      stdin.resume();
+      const onClose = (listener: (code: number) => void) => {
+        const subscription = { dispose: () => {} };
+        setImmediate(() => {
+          // The remote cat reads the host's file; everything else succeeds.
+          if (command.includes("cat ~/.config/gh/hosts.yml")) {
+            stdout.end(remoteFile);
+            stderr.end();
+            listener(0);
+          } else if (command.includes("command -v git")) {
+            // Git absent in the environment: the helper install is optional.
+            stderr.end("/bin/sh: git: not found");
+            listener(1);
+          } else {
+            stdout.end();
+            stderr.end();
+            listener(0);
+          }
+        });
+        return subscription;
+      };
+      return Promise.resolve({ stdin, stdout, stderr, onClose });
+    },
+    dispose: () => {},
+  } as never;
+}
+
+const originalHome = process.env.HOME;
+try {
+  const home = await mkdtemp(join(tmpdir(), "zc-gh-home-"));
+  process.env.HOME = home;
+
+  // 1. Local file present: it wins, and the host's file is never read.
+  await mkdir(join(home, ".config", "gh"), { recursive: true });
+  await writeFile(join(home, ".config", "gh", "hosts.yml"), "github.com:\n    user: local\n");
+  const local = fakeBackend("host-copy");
+  const propagated = await installGhCredentialsFromHost(local, "ctr");
+  if (!propagated || !local.commands.some((c) => c.includes("cat > ~/.config/gh/hosts.yml")) || local.commands.some((c) => c.includes("cat ~/.config/gh/hosts.yml"))) {
+    console.error("FAIL: local hosts.yml not preferred (commands:", local.commands, ")");
+    process.exit(1);
+  }
+
+  // 2. Local file absent: the host's file is read and propagated.
+  await rm(join(home, ".config", "gh"), { recursive: true, force: true });
+  const remote = fakeBackend("host-copy");
+  const propagatedRemote = await installGhCredentialsFromHost(remote, "ctr");
+  if (!propagatedRemote || !remote.commands.some((c) => c.includes("cat ~/.config/gh/hosts.yml")) || !remote.commands.some((c) => c.includes("cat > ~/.config/gh/hosts.yml"))) {
+    console.error("FAIL: remote hosts.yml fallback broken (commands:", remote.commands, ")");
+    process.exit(1);
+  }
+
+  // 3. Neither: a clean no-op, false, no write attempted.
+  const none = fakeBackend("");
+  const propagatedNone = await installGhCredentialsFromHost(none, "ctr");
+  if (propagatedNone !== false || none.commands.some((c) => c.includes("cat > ~/.config/gh/hosts.yml"))) {
+    console.error("FAIL: missing credentials must be a clean no-op (commands:", none.commands, ")");
+    process.exit(1);
+  }
+
+  await rm(home, { recursive: true, force: true });
+  console.log("CREDENTIAL PREFERENCE OK: local hosts.yml wins, host fallback works, absence is a no-op");
+} finally {
+  process.env.HOME = originalHome;
+}
 process.exit(0);
