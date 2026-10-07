@@ -12,12 +12,14 @@
  */
 
 import { spawn } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { constants } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGateway } from "./lib/server.mjs";
 import { DEFAULT_SESSION_TTL_MS } from "./lib/session.mjs";
 import { certificateHosts, loadOrCreateCertificate } from "./lib/tls.mjs";
+import { assessVolumes, parseMountInfo, readMountInfo } from "./lib/volumes.mjs";
 
 /** Where the runtime tarball is extracted in the image. */
 export const RUNTIME_ENTRY = "/opt/zcodium/bin/zcode.mjs";
@@ -133,6 +135,7 @@ export function parseEnv(env = process.env) {
     trustProxy: parseTrustProxy(env.ZCLOUDIUM_TRUST_PROXY),
     tls: parseTls(env.ZCLOUDIUM_TLS),
     tlsHosts: parseTlsHosts(env.ZCLOUDIUM_TLS_HOSTS),
+    volumeCheck: !isOff(env.ZCLOUDIUM_VOLUME_CHECK),
     workspace: envValue(env, "ZCODE_SERVER_WORKSPACE", DEFAULT_WORKSPACE),
     dataDir: envValue(env, "ZCODE_DATA_BASE_DIR", DEFAULT_DATA_DIR),
     sessionTtlHours,
@@ -202,10 +205,55 @@ export async function start({
   spawnRuntime = (file, args, options) => spawn(file, args, options),
   createGatewayFn = createGateway,
   loadOrCreateCertificateFn = loadOrCreateCertificate,
+  /**
+   * The kernel's view of this container's mounts, and a way to ask whether a
+   * directory already holds anything. Injectable so the tests can exercise
+   * every shape of deployment without mounting anything.
+   */
+  mountInfoText = readMountInfo(),
+  dirState = (dir) => (readdirSync(dir).length > 0 ? "content" : "empty"),
   onExit = (code) => process.exit(code),
 } = {}) {
   const config = parseEnv(env);
   const args = runtimeArgs(config);
+
+  // The persistence pre-check runs before anything else, because every other
+  // failure mode is recoverable and this one is not: an agent that works for
+  // an hour on a throwaway filesystem has done work that no retry brings back.
+  // The image declares VOLUME /data, so Docker always mounts something there —
+  // the trap this catches is the anonymous volume it silently creates when the
+  // operator forgot the -v.
+  if (config.volumeCheck) {
+    if (mountInfoText === null) {
+      logger(
+        "[start] the volume check cannot read the mount table (/proc/self/mountinfo): skipping. " +
+          "Persistence is not verified for this run.",
+      );
+    } else {
+      const assessment = assessVolumes({
+        dataDir: config.dataDir,
+        workspace: config.workspace,
+        mounts: parseMountInfo(mountInfoText),
+        dirState,
+      });
+      for (const warning of assessment.warnings) {
+        logger(`[start] warning: ${warning}`);
+      }
+      if (!assessment.ok) {
+        throw new Error(
+          "refusing to start: the directories that hold your work are not persisted.\n" +
+            assessment.errors.map((error) => `  - ${error}`).join("\n") +
+            "\nMount the volumes (compose.yml does this as shipped), or set ZCLOUDIUM_VOLUME_CHECK=off " +
+            "if this container is genuinely throwaway.",
+        );
+      }
+    }
+  } else {
+    logger(
+      "[start] volume check off (ZCLOUDIUM_VOLUME_CHECK=off): nothing verifies that " +
+        `${config.dataDir} or ${config.workspace} survive this container`,
+    );
+  }
 
   // The addresses and the workspace come from the environment. A leftover
   // command line is appended to this script and does nothing, so say so instead

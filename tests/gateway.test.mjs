@@ -491,7 +491,7 @@ test("the block lifts exactly after the configured duration, and not before", ()
   }));
 
 test("the gateway applies the block duration the documentation advertises", () => {
-  // README.md and SECURITY.md both quote five minutes for one block. This pins the
+  // ENVIRONMENT.md and SECURITY.md both quote five minutes for one block. This pins the
   // constant itself, so changing the duration without changing what is advertised
   // fails here, and the timing test above keeps measuring the real value.
   assert.equal(BLOCK_MS, ADVERTISED_BLOCK_MS, "the advertised block duration and the applied one must agree");
