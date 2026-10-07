@@ -52,7 +52,10 @@ if [ "$FROM_SOURCE" = 1 ]; then
     echo "patches/ carries no .patch file; --from-source would build a feature-less image." >&2
     exit 1
   fi
-  ZCODE_COMMIT="$(git ls-remote "$FROM_SOURCE_REPO" "refs/tags/${VERSION_TAG}" | awk '{print $1}')"
+  # Annotated tags list a tag object sha first: resolve the peeled ref, and
+  # fall back to the plain one for lightweight tags.
+  ZCODE_COMMIT="$(git ls-remote "$FROM_SOURCE_REPO" "refs/tags/${VERSION_TAG}^{}" | awk '{print $1}')"
+  ZCODE_COMMIT="${ZCODE_COMMIT:-$(git ls-remote "$FROM_SOURCE_REPO" "refs/tags/${VERSION_TAG}" | awk '{print $1}')}"
   if [ -z "$ZCODE_COMMIT" ]; then
     echo "Tag ${VERSION_TAG} not found on ${FROM_SOURCE_REPO}." >&2
     exit 1

@@ -8,3 +8,5 @@
 !gateway/**
 !patches
 !patches/**
+!scripts
+!scripts/validate-remote-bridge.mts

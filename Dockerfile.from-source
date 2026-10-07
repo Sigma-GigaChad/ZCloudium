@@ -58,6 +58,11 @@ RUN if [ -z "$(ls -A /patches/*.patch 2>/dev/null)" ]; then \
       exit 1; \
     fi
 
+# The bridge contract (a toService proxy must survive exposeOnChannelServer and
+# carry calls AND events) is exactly the failure class a typecheck cannot see:
+# it is exercised over two in-memory channel hops before anything else runs.
+COPY scripts/validate-remote-bridge.mts /src/packages/server/validate-remote-bridge.mts
+
 # Fetch a single revision: accepts a tag, a branch or a SHA. `--branch` does not
 # handle SHAs, hence the fetch plus FETCH_HEAD.
 RUN git init -q . \
@@ -77,7 +82,8 @@ RUN git apply --check /patches/*.patch \
 # project references: it is what emits packages/shared/dist/index.js, which has no
 # build script of its own and which the SEA asset collector requires.
 RUN pnpm install --frozen-lockfile \
- && pnpm prepare:desktop-runtime || true
+ && pnpm prepare:desktop-runtime || true \
+ && pnpm exec tsx packages/server/validate-remote-bridge.mts
 
 RUN pnpm typecheck
 

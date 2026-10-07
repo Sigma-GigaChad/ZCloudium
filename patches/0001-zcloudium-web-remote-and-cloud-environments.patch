@@ -1,17 +1,26 @@
-From 3a1f96021d3a26400f2d062d5d80ff1e3ee445ba Mon Sep 17 00:00:00 2001
+From 4d62749a8a986b92ff18e3ce68d7af5b9e9b69ac Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
-Date: Wed, 7 Oct 2026 00:31:27 +0200
-Subject: [PATCH 1/2] zcloudium: full remote services bridge, web
- connectRemote, cloud environments
+Date: Wed, 7 Oct 2026 01:29:55 +0200
+Subject: [PATCH] zcloudium: full remote services bridge, web connectRemote,
+ cloud environments
 
-1. /ws/remote/:id exposes the complete remote channel set (mirrors
-   RemoteServiceAccess) instead of four services, and disposes the remote
-   connection when the browser socket closes; /api/dispose-remote/:id
-   releases an attached connection explicitly.
+1. /ws/remote/:id exposes the complete remote channel set: the same
+   ProxyChannel.toService service proxies RemoteServiceAccess builds,
+   registered one per descriptor so exposeOnChannelServer wraps them
+   exactly like local services. Four services were exposed before,
+   which is why web mode could not open a remote workspace. The remote
+   connection is disposed when the browser socket closes;
+   POST /api/dispose-remote/:id releases an attached connection; ticket
+   ids come from randomUUID now that they guard a full remote-control
+   capability.
 2. web platform.connectRemote calls POST /api/connect-remote, attaches
-   the session over /ws/remote/<ticket>, registers it renderer-side and
-   returns {success, sessionId}; disposeRemoteSession releases the
-   server-side connection. allowRemoteWorkspace enabled for web.
+   the session over /ws/remote/<ticket>, registers it renderer-side
+   with the resolved target (dockerContainer set, cloudEnvironment
+   gone), so history reconnects reuse the same container; a failed
+   connect after provisioning removes the environment. disposeRemoteSession
+   releases the server-side connection. allowRemoteWorkspace enabled
+   for web; supportsCloudEnvironments marks the platforms whose
+   connectRemote handles cloudEnvironment targets.
 3. SshDockerBackend: the runtime runs inside a container on the SSH host
    (docker exec over the operator's SSH session); selected through the
    new optional SSHConnectOptions.dockerContainer.
@@ -20,14 +29,22 @@ Subject: [PATCH 1/2] zcloudium: full remote services bridge, web
    credentials in; DELETE removes it.
 ---
  packages/server/src/cloudEnvironments.ts      | 278 ++++++++++++++++++
- packages/server/src/http.ts                   |  41 ++-
+ packages/server/src/http.ts                   |  45 ++-
  packages/server/src/remote/create-backend.ts  |  17 +-
  .../server/src/remote/sshDockerBackend.ts     | 198 +++++++++++++
- packages/server/src/remoteBridge.ts           | 136 +++++++++
+ packages/server/src/remoteBridge.ts           | 122 ++++++++
+ packages/shared/src/platform.ts               |   6 +
  packages/shared/src/remoteTarget.ts           |  15 +
- packages/shared/src/validation.ts             |   1 +
- packages/web/src/main.tsx                     |  96 +++++-
- 8 files changed, 758 insertions(+), 24 deletions(-)
+ packages/shared/src/test-ids.ts               |   2 +
+ packages/shared/src/validation.ts             |   7 +
+ .../ui/src/RemoteConnectionDialogContent.tsx  |  70 ++++-
+ packages/ui/src/SSHDialog.tsx                 |  12 +-
+ .../ui/src/hooks/useRemoteConnectionForm.ts   |  36 ++-
+ packages/ui/src/i18n/locales/en-US.ts         |   7 +
+ packages/ui/src/i18n/locales/zh-CN.ts         |   7 +
+ packages/ui/src/lib/remoteConnectionWizard.ts |  64 ++--
+ packages/web/src/main.tsx                     | 111 ++++++-
+ 16 files changed, 931 insertions(+), 66 deletions(-)
  create mode 100644 packages/server/src/cloudEnvironments.ts
  create mode 100644 packages/server/src/remote/sshDockerBackend.ts
  create mode 100644 packages/server/src/remoteBridge.ts
@@ -317,7 +334,7 @@ index 0000000..a08a592
 +  });
 +}
 diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
-index 8c38f91..13d2e39 100644
+index 8c38f91..038cb3f 100644
 --- a/packages/server/src/http.ts
 +++ b/packages/server/src/http.ts
 @@ -19,10 +19,6 @@ import {
@@ -340,17 +357,22 @@ index 8c38f91..13d2e39 100644
  import { createHostCapabilityStore } from "./hostCapability.js";
  
  function wrapWebSocket(ws: WebSocket): ISocket {
-@@ -127,6 +125,9 @@ function setupChannelServer(
+@@ -127,8 +125,13 @@ function setupChannelServer(
  /** 存储 web 模式下的远程连接，key 为随机 ID */
  const remoteConnections = new Map<string, RemoteConnection>();
  
 +/** ticket 消费后、WS 尚未断开的远程连接；dispose 端点按 id 找到它们 */
 +const attachedRemoteConnections = new Map<string, { connection: RemoteConnection; ws: WebSocket }>();
 +
++// zcloudium: randomUUID instead of Math.random — the id guards a full remote
++// control capability, so it should be unguessable, not merely unique.
  function generateId(): string {
-   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
++  return randomUUID();
  }
-@@ -366,6 +367,22 @@ export function createHttpServer(
+ 
+ interface HttpServerOptions {
+@@ -366,6 +369,22 @@ export function createHttpServer(
      }
    });
  
@@ -373,7 +395,7 @@ index 8c38f91..13d2e39 100644
    const handleBotCallback = async (c: Context) => {
      const provider = c.req.param("provider") as BotProvider;
      if (!botProviders.includes(provider)) {
-@@ -432,14 +449,18 @@ export function createHttpServer(
+@@ -432,14 +451,18 @@ export function createHttpServer(
            // 一个连接只给一个 WS 客户端使用，取出后从 Map 移除
            remoteConnections.delete(id);
  
@@ -644,11 +666,11 @@ index 0000000..c98cb49
 +}
 diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
 new file mode 100644
-index 0000000..c3fee86
+index 0000000..1aff54c
 --- /dev/null
 +++ b/packages/server/src/remoteBridge.ts
-@@ -0,0 +1,136 @@
-+import type { CancellationToken, ChannelClient, IChannel, IServerChannel } from "@zcode/rpc";
+@@ -0,0 +1,122 @@
++import { ProxyChannel, type IChannel } from "@zcode/rpc";
 +import {
 +  ServiceCollection,
 +  IBotsService,
@@ -700,9 +722,10 @@ index 0000000..c3fee86
 + * `/ws/remote/:id` used to expose only four services, which is why web mode
 + * could not open a remote workspace: the renderer needs the same accessor the
 + * desktop one has. This mirrors the channel list of `RemoteServiceAccess`
-+ * (packages/client/src/remoteServiceAccess.ts) one for one, forwarding each
-+ * channel verbatim to the remote host instead of re-wrapping proxied service
-+ * objects.
++ * (packages/client/src/remoteServiceAccess.ts) one for one, registering
++ * service-shaped proxies over the connection's channel client — the same
++ * objects upstream's accessor builds, so `exposeOnChannelServer` can wrap them
++ * exactly like it wraps local services.
 + *
 + * `IProviderProvisioningTargetService` is deliberately absent, like on the
 + * desktop renderer boundary: provisioning carries cross-Environment
@@ -754,36 +777,38 @@ index 0000000..c3fee86
 +
 +  const collection = new ServiceCollection();
 +  for (const descriptor of descriptors) {
-+    collection.register(descriptor, bridgeRemoteChannel(connection.client, descriptor.channelName));
++    // Register service-shaped proxies, the same shape exposeOnChannelServer
++    // expects (it wraps every value in ProxyChannel.fromService, which
++    // dispatches by method name on the object): a raw {call, listen} channel
++    // adapter would die on the first RPC with "Method not found". toService
++    // proxies round-trip through fromService: method access becomes a call,
++    // on* access a buffered listen.
++    collection.register(
++      descriptor,
++      ProxyChannel.toService<Record<string, unknown>>(
++        connection.client.getChannel<IChannel>(descriptor.channelName),
++      ),
++    );
 +  }
 +  return collection;
 +}
+diff --git a/packages/shared/src/platform.ts b/packages/shared/src/platform.ts
+index 503608f..ea20b85 100644
+--- a/packages/shared/src/platform.ts
++++ b/packages/shared/src/platform.ts
+@@ -584,6 +584,12 @@ export interface IPlatformService {
+     },
+   ): Promise<{ success: boolean; error?: string; sessionId?: string }>;
+ 
++  // zcloudium: set by the web platform only — connectRemote handles
++  // cloudEnvironment targets there. The wizard hides the Cloud Environment
++  // card on platforms that leave it unset (desktop connects SSH directly and
++  // would silently ignore the provisioning request).
++  supportsCloudEnvironments?: boolean;
 +
-+/**
-+ * A channel on the local server that is a transparent pipe to the same channel
-+ * on the remote host: commands and event subscriptions go through unchanged, so
-+ * whatever the remote serves, the browser gets, and a channel the remote does
-+ * not serve fails there with its own "unknown channel" error.
-+ */
-+function bridgeRemoteChannel(
-+  client: ChannelClient,
-+  channelName: string,
-+): IServerChannel<string> {
-+  const channel = client.getChannel<IChannel>(channelName);
-+  return {
-+    call<T>(
-+      _ctx: string,
-+      command: string,
-+      arg?: unknown,
-+      cancellationToken?: CancellationToken,
-+    ): Promise<T> {
-+      return channel.call<T>(command, arg, cancellationToken);
-+    },
-+    listen<T>(_ctx: string, event: string, arg?: unknown) {
-+      return channel.listen<T>(event, arg);
-+    },
-+  };
-+}
+   /** 取消当前窗口尚未建立完成的远程连接（可选：Web 平台可忽略） */
+   cancelPendingRemoteConnection?(requestId?: string): Promise<void>;
+ 
 diff --git a/packages/shared/src/remoteTarget.ts b/packages/shared/src/remoteTarget.ts
 index 090289c..e833a65 100644
 --- a/packages/shared/src/remoteTarget.ts
@@ -817,180 +842,6 @@ index 090289c..e833a65 100644
    assetInstallMode?: RemoteAssetInstallMode;
    resourcePackages?: RemoteResourcePackageSelection;
  }
-diff --git a/packages/shared/src/validation.ts b/packages/shared/src/validation.ts
-index 85b5a64..e3af0d3 100644
---- a/packages/shared/src/validation.ts
-+++ b/packages/shared/src/validation.ts
-@@ -67,6 +67,7 @@ export const sshConnectOptionsSchema = z.object({
-   password: z.string().optional(),
-   privateKeyPath: z.string().optional(),
-   privateKeyPassphrase: z.string().optional(),
-+  dockerContainer: nonEmptyStringSchema.optional(),
-   assetInstallMode: z.enum(REMOTE_ASSET_INSTALL_MODES).optional(),
-   resourcePackages: z
-     .object({
-diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
-index 052eab8..3af3875 100644
---- a/packages/web/src/main.tsx
-+++ b/packages/web/src/main.tsx
-@@ -6,6 +6,7 @@ import {
-   ZCodeIntlProvider,
-   generateMobileDeviceFingerprint,
-   playTaskNotificationSound,
-+  registerRemoteWorkspaceSession,
-   setStreamClientId,
-   type Theme,
- } from "@zcode/ui";
-@@ -17,6 +18,7 @@ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOA
- import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
- import { resolveWebCommunityUrl, resolveWebHelpConfig } from "./communityUrl.js";
- import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
-+import { stripRemoteTargetSecrets } from "@zcode/shared";
- import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
- 
- function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
-@@ -115,17 +117,59 @@ function createWebPlatform(): IPlatformService {
-     onBotRemoteWorkspaceReconnected: () => () => {},
-     // Web 端无多窗口管理
-     activateOrSetWorkspace: () => Promise.resolve({ activated: false }),
--    // TODO(web-remote-workspace): 普通 Web 模式先只保证 server 本地工作区可用。
--    // 远程 WebSocket 只暴露部分 service，与 Root/RemoteServiceAccess 需要的完整
--    // accessor 不匹配，直接打开 ?remote=<id> 会在项目向导或首屏卡住。
--    connectRemote(options: RemoteTarget) {
--      return Promise.resolve({
--        success: false,
--        error: `Remote connect is not supported in Web mode yet: ${options.kind}`,
--      });
-+    // Web 模式的远程连接：POST /api/connect-remote 在 server 内建立远端连接并返回
-+    // 一次性 ticket，随后把 accessor 挂到 /ws/remote/<ticket> 上；session 直接在
-+    // renderer 侧注册，无需 Desktop 的 MessagePort 通道。凭据只在请求体内走一趟，
-+    // store 只保留脱敏后的 target。
-+    async connectRemote(options: RemoteTarget) {
-+      try {
-+        let target = options;
-+        if (options.kind === "ssh" && options.cloudEnvironment) {
-+          const { cloudEnvironment, ...ssh } = options;
-+          const provisioned = await provisionCloudEnvironment(ssh, cloudEnvironment);
-+          if (!provisioned.success) {
-+            return provisioned;
-+          }
-+          target = { ...ssh, dockerContainer: provisioned.container };
-+        }
-+        const response = await fetch("/api/connect-remote", {
-+          method: "POST",
-+          headers: { "content-type": "application/json" },
-+          body: JSON.stringify(target),
-+        });
-+        const payload = (await response.json().catch(() => ({}))) as { id?: string; error?: string };
-+        if (!response.ok || !payload.id) {
-+          return {
-+            success: false,
-+            error: payload.error ?? `Remote connect failed (${response.status})`,
-+          };
-+        }
-+        const sessionId = payload.id;
-+        const services = await connectViaWebSocket(
-+          `${resolveDefaultWsOrigin()}/ws/remote/${sessionId}`,
-+          { onClose: () => {} },
-+        );
-+        registerRemoteWorkspaceSession({
-+          sessionId,
-+          target: stripRemoteTargetSecrets(options),
-+          services,
-+        });
-+        return { success: true, sessionId };
-+      } catch (error) {
-+        return {
-+          success: false,
-+          error: error instanceof Error ? error.message : String(error),
-+        };
-+      }
-     },
-     cancelPendingRemoteConnection: (_requestId?: string) => Promise.resolve(),
--    disposeRemoteSession: () => Promise.resolve(),
-+    // 释放服务端连接（/api/dispose-remote 会关掉对应 WS 并 dispose 远端连接）。
-+    // 失败不阻塞 UI：页面关闭时 server 也会随 WS 断开而释放。
-+    async disposeRemoteSession(sessionId: string) {
-+      await fetch(`/api/dispose-remote/${encodeURIComponent(sessionId)}`, {
-+        method: "POST",
-+      }).catch(() => undefined);
-+    },
-     isDockerAvailable: () => Promise.resolve(false),
-     listWSLDistros: () => Promise.resolve([]),
-     listDockerContainers: () => Promise.resolve([]),
-@@ -267,6 +311,38 @@ function resolveDefaultWsOrigin(): string {
-   return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
- }
- 
-+type CloudEnvironmentProvisionResult =
-+  | { success: true; container: string }
-+  | { success: false; error: string };
-+
-+/**
-+ * Provision a cloud environment on the target host (disposable container +
-+ * setup script + gh/git credentials), then connect into it. The connect step
-+ * carries `dockerContainer`, so the runtime runs inside the container while
-+ * the only transport stays the operator's SSH session.
-+ */
-+async function provisionCloudEnvironment(
-+  ssh: Omit<Extract<RemoteTarget, { kind: "ssh" }>, "dockerContainer" | "cloudEnvironment">,
-+  cloud: NonNullable<Extract<RemoteTarget, { kind: "ssh" }>["cloudEnvironment"]>,
-+): Promise<CloudEnvironmentProvisionResult> {
-+  const response = await fetch("/api/cloud-environments", {
-+    method: "POST",
-+    headers: { "content-type": "application/json" },
-+    body: JSON.stringify({ ssh, image: cloud.image, setupScript: cloud.setupScript }),
-+  });
-+  const payload = (await response.json().catch(() => ({}))) as {
-+    container?: string;
-+    error?: string;
-+  };
-+  if (!response.ok || !payload.container) {
-+    return {
-+      success: false,
-+      error: payload.error ?? `Environment provisioning failed (${response.status})`,
-+    };
-+  }
-+  return { success: true, container: payload.container };
-+}
-+
- async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
-   const params = new URLSearchParams(window.location.search);
-   const remoteId = params.get("remote");
-@@ -371,7 +447,7 @@ async function bootstrapWebApp() {
-             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
-             preferDirectoryBrowser
-             supportsEmbeddedBrowser={false}
--            allowRemoteWorkspace={false}
-+            allowRemoteWorkspace
-           />
-         </ZCodeIntlProvider>
-       </AppErrorBoundary>,
--- 
-2.56.0
-
-
-From cbf6ffc9eacc613de3b25531aed961d40aa90975 Mon Sep 17 00:00:00 2001
-From: ZCloudium <zcloudium@local>
-Date: Wed, 7 Oct 2026 00:39:15 +0200
-Subject: [PATCH 2/2] zcloudium: the remote connection wizard offers a cloud
- environment
-
-The Docker card becomes 'Cloud Environment': it collects the same SSH
-host and credential fields and adds a base image (default Ubuntu 26.04)
-and an optional setup script. The wizard keeps Docker's spot, test id
-and step plumbing; the built target is an SSH one carrying
-cloudEnvironment, which the web platform provisions before connecting.
----
- packages/shared/src/test-ids.ts               |  2 +
- .../ui/src/RemoteConnectionDialogContent.tsx  | 70 ++++++++++++++++---
- packages/ui/src/SSHDialog.tsx                 | 12 +++-
- .../ui/src/hooks/useRemoteConnectionForm.ts   | 23 ++++--
- packages/ui/src/i18n/locales/en-US.ts         |  7 ++
- packages/ui/src/i18n/locales/zh-CN.ts         |  7 ++
- packages/ui/src/lib/remoteConnectionWizard.ts | 64 +++++++++++------
- 7 files changed, 147 insertions(+), 38 deletions(-)
-
 diff --git a/packages/shared/src/test-ids.ts b/packages/shared/src/test-ids.ts
 index 5b4dba3..873881c 100644
 --- a/packages/shared/src/test-ids.ts
@@ -1004,6 +855,24 @@ index 5b4dba3..873881c 100644
  /** SSH 主机地址输入框 */
  export const TID_SSH_HOST_INPUT = "ssh-host-input";
  /** SSH 端口号输入框 */
+diff --git a/packages/shared/src/validation.ts b/packages/shared/src/validation.ts
+index 85b5a64..f76e833 100644
+--- a/packages/shared/src/validation.ts
++++ b/packages/shared/src/validation.ts
+@@ -67,6 +67,13 @@ export const sshConnectOptionsSchema = z.object({
+   password: z.string().optional(),
+   privateKeyPath: z.string().optional(),
+   privateKeyPassphrase: z.string().optional(),
++  // zcloudium: container name or id only. Anything else (a docker flag like
++  // --user=0:0) is refused at the door even though quoting would keep it safe.
++  dockerContainer: z
++    .string()
++    .trim()
++    .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/)
++    .optional(),
+   assetInstallMode: z.enum(REMOTE_ASSET_INSTALL_MODES).optional(),
+   resourcePackages: z
+     .object({
 diff --git a/packages/ui/src/RemoteConnectionDialogContent.tsx b/packages/ui/src/RemoteConnectionDialogContent.tsx
 index 6a1b22f..7250fc7 100644
 --- a/packages/ui/src/RemoteConnectionDialogContent.tsx
@@ -1232,10 +1101,10 @@ index f252336..e618fc0 100644
                      errorMessage={error}
                      loading={loading}
 diff --git a/packages/ui/src/hooks/useRemoteConnectionForm.ts b/packages/ui/src/hooks/useRemoteConnectionForm.ts
-index 865316a..4860572 100644
+index 865316a..812d8b1 100644
 --- a/packages/ui/src/hooks/useRemoteConnectionForm.ts
 +++ b/packages/ui/src/hooks/useRemoteConnectionForm.ts
-@@ -13,20 +13,25 @@ import {
+@@ -13,20 +13,32 @@ import {
    resolveDockerContainerSelectionAfterRefresh,
  } from "@/lib/remoteConnectionDockerOptions.js";
  
@@ -1249,7 +1118,11 @@ index 865316a..4860572 100644
 +export type RemoteKind = RemoteTarget["kind"] | "cloud";
  export type SSHAuthMethod = "password" | "privateKey";
  
- function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
+-function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
++function buildAvailableKinds(options: {
++  isWindowsDesktop: boolean;
++  supportsCloudEnvironments: boolean;
++}): RemoteKind[] {
    const kinds: RemoteKind[] = ["ssh"];
    // 远程连接入口里 WSL 和 SSH 同属主机类连接。
 -  // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
@@ -1263,11 +1136,15 @@ index 865316a..4860572 100644
 -  kinds.push("docker");
 +  // Cloud environment 取代了原来的 Docker 本地容器入口：容器在 SSH 主机上按需
 +  // 创建（可弃、带 setup script、注入 gh 凭据），而不是连接宿主机上的既有容器。
-+  kinds.push("cloud");
++  // 平台没有声明该能力（desktop 直接连 SSH，不会处理 cloudEnvironment）就不展示，
++  // 避免“看起来创建了环境、实际连到了主机本身”的静默偏差。
++  if (options.supportsCloudEnvironments) {
++    kinds.push("cloud");
++  }
    return kinds;
  }
  
-@@ -57,6 +62,8 @@ export function useRemoteConnectionForm({
+@@ -57,6 +69,8 @@ export function useRemoteConnectionForm({
    const [wslUser, setWslUser] = useState("");
    const [dockerContainer, setDockerContainer] = useState("");
    const [manualDockerContainer, setManualDockerContainer] = useState("");
@@ -1276,7 +1153,18 @@ index 865316a..4860572 100644
    const [sshConfigAliases, setSshConfigAliases] = useState<SSHConfigAliasOption[]>([]);
    const [sshConfigAliasesLoading, setSshConfigAliasesLoading] = useState(false);
    const [sshConfigAliasesLoaded, setSshConfigAliasesLoaded] = useState(false);
-@@ -338,6 +345,8 @@ export function useRemoteConnectionForm({
+@@ -75,8 +89,8 @@ export function useRemoteConnectionForm({
+   const dockerOptionsActiveLoadIdRef = useRef(0);
+   const dockerOptionsInFlightLoadIdRef = useRef<number | null>(null);
+   const availableKinds = useMemo(
+-    () => buildAvailableKinds({ isWindowsDesktop }),
+-    [isWindowsDesktop],
++    () => buildAvailableKinds({ isWindowsDesktop, supportsCloudEnvironments: Boolean(platform.supportsCloudEnvironments) }),
++    [isWindowsDesktop, platform],
+   );
+ 
+   useEffect(() => {
+@@ -338,6 +352,8 @@ export function useRemoteConnectionForm({
      wslUser,
      dockerContainer,
      manualDockerContainer,
@@ -1285,7 +1173,7 @@ index 865316a..4860572 100644
      sshConfigAliases,
      sshConfigAliasesLoading,
      sshConfigAliasesError,
-@@ -359,6 +368,8 @@ export function useRemoteConnectionForm({
+@@ -359,6 +375,8 @@ export function useRemoteConnectionForm({
      setWslUser,
      setDockerContainer,
      setManualDockerContainer,
@@ -1444,6 +1332,165 @@ index d1d54e2..5ff7613 100644
      case "docker":
        // Docker 运行中列表可能因为探测失败或刷新延迟不完整。
        // 手动输入必须独立于下拉选择，提交时优先使用手动输入，空值再回落到下拉选择。
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 052eab8..f48c7f5 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -6,6 +6,7 @@ import {
+   ZCodeIntlProvider,
+   generateMobileDeviceFingerprint,
+   playTaskNotificationSound,
++  registerRemoteWorkspaceSession,
+   setStreamClientId,
+   type Theme,
+ } from "@zcode/ui";
+@@ -17,6 +18,7 @@ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOA
+ import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
+ import { resolveWebCommunityUrl, resolveWebHelpConfig } from "./communityUrl.js";
+ import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
++import { stripRemoteTargetSecrets } from "@zcode/shared";
+ import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
+ 
+ function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
+@@ -101,6 +103,7 @@ function renderWebAuthCallbackPage(): void {
+ 
+ function createWebPlatform(): IPlatformService {
+   return {
++    supportsCloudEnvironments: true,
+     canSelectFilePath: false,
+     // Web 端无法打开系统目录选择框
+     selectDirectory: () => Promise.resolve(null),
+@@ -115,17 +118,73 @@ function createWebPlatform(): IPlatformService {
+     onBotRemoteWorkspaceReconnected: () => () => {},
+     // Web 端无多窗口管理
+     activateOrSetWorkspace: () => Promise.resolve({ activated: false }),
+-    // TODO(web-remote-workspace): 普通 Web 模式先只保证 server 本地工作区可用。
+-    // 远程 WebSocket 只暴露部分 service，与 Root/RemoteServiceAccess 需要的完整
+-    // accessor 不匹配，直接打开 ?remote=<id> 会在项目向导或首屏卡住。
+-    connectRemote(options: RemoteTarget) {
+-      return Promise.resolve({
+-        success: false,
+-        error: `Remote connect is not supported in Web mode yet: ${options.kind}`,
+-      });
++    // Web 模式的远程连接：POST /api/connect-remote 在 server 内建立远端连接并返回
++    // 一次性 ticket，随后把 accessor 挂到 /ws/remote/<ticket> 上；session 直接在
++    // renderer 侧注册，无需 Desktop 的 MessagePort 通道。凭据只在请求体内走一趟，
++    // store 只保留脱敏后的 target。
++    async connectRemote(options: RemoteTarget) {
++      try {
++        let target = options;
++        let provisionedName: string | null = null;
++        if (options.kind === "ssh" && options.cloudEnvironment) {
++          const { cloudEnvironment, ...ssh } = options;
++          const provisioned = await provisionCloudEnvironment(ssh, cloudEnvironment);
++          if (!provisioned.success) {
++            return provisioned;
++          }
++          provisionedName = provisioned.container;
++          target = { ...ssh, dockerContainer: provisioned.container };
++        }
++        const response = await fetch("/api/connect-remote", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify(target),
++        });
++        const payload = (await response.json().catch(() => ({}))) as { id?: string; error?: string };
++        if (!response.ok || !payload.id) {
++          // Provisioned but not connected: the environment would sit orphaned
++          // on the host. Best-effort removal keeps a failed wizard harmless.
++          if (provisionedName && target.kind === "ssh") {
++            await fetch(`/api/cloud-environments/${encodeURIComponent(provisionedName)}`, {
++              method: "DELETE",
++              headers: { "content-type": "application/json" },
++              body: JSON.stringify({ ssh: target }),
++            }).catch(() => undefined);
++          }
++          return {
++            success: false,
++            error: payload.error ?? `Remote connect failed (${response.status})`,
++          };
++        }
++        const sessionId = payload.id;
++        const services = await connectViaWebSocket(
++          `${resolveDefaultWsOrigin()}/ws/remote/${sessionId}`,
++          { onClose: () => {} },
++        );
++        // The resolved target (dockerContainer set, cloudEnvironment gone) is
++        // what history reconnects replay: they reuse the same container
++        // instead of provisioning a new one.
++        registerRemoteWorkspaceSession({
++          sessionId,
++          target: stripRemoteTargetSecrets(target),
++          services,
++        });
++        return { success: true, sessionId };
++      } catch (error) {
++        return {
++          success: false,
++          error: error instanceof Error ? error.message : String(error),
++        };
++      }
+     },
+     cancelPendingRemoteConnection: (_requestId?: string) => Promise.resolve(),
+-    disposeRemoteSession: () => Promise.resolve(),
++    // 释放服务端连接（/api/dispose-remote 会关掉对应 WS 并 dispose 远端连接）。
++    // 失败不阻塞 UI：页面关闭时 server 也会随 WS 断开而释放。
++    async disposeRemoteSession(sessionId: string) {
++      await fetch(`/api/dispose-remote/${encodeURIComponent(sessionId)}`, {
++        method: "POST",
++      }).catch(() => undefined);
++    },
+     isDockerAvailable: () => Promise.resolve(false),
+     listWSLDistros: () => Promise.resolve([]),
+     listDockerContainers: () => Promise.resolve([]),
+@@ -267,6 +326,38 @@ function resolveDefaultWsOrigin(): string {
+   return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+ }
+ 
++type CloudEnvironmentProvisionResult =
++  | { success: true; container: string }
++  | { success: false; error: string };
++
++/**
++ * Provision a cloud environment on the target host (disposable container +
++ * setup script + gh/git credentials), then connect into it. The connect step
++ * carries `dockerContainer`, so the runtime runs inside the container while
++ * the only transport stays the operator's SSH session.
++ */
++async function provisionCloudEnvironment(
++  ssh: Omit<Extract<RemoteTarget, { kind: "ssh" }>, "dockerContainer" | "cloudEnvironment">,
++  cloud: NonNullable<Extract<RemoteTarget, { kind: "ssh" }>["cloudEnvironment"]>,
++): Promise<CloudEnvironmentProvisionResult> {
++  const response = await fetch("/api/cloud-environments", {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify({ ssh, image: cloud.image, setupScript: cloud.setupScript }),
++  });
++  const payload = (await response.json().catch(() => ({}))) as {
++    container?: string;
++    error?: string;
++  };
++  if (!response.ok || !payload.container) {
++    return {
++      success: false,
++      error: payload.error ?? `Environment provisioning failed (${response.status})`,
++    };
++  }
++  return { success: true, container: payload.container };
++}
++
+ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+   const params = new URLSearchParams(window.location.search);
+   const remoteId = params.get("remote");
+@@ -371,7 +462,7 @@ async function bootstrapWebApp() {
+             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
+             preferDirectoryBrowser
+             supportsEmbeddedBrowser={false}
+-            allowRemoteWorkspace={false}
++            allowRemoteWorkspace
+           />
+         </ZCodeIntlProvider>
+       </AppErrorBoundary>,
 -- 
 2.56.0
 

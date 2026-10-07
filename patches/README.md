@@ -5,15 +5,23 @@ revision before the build. Everything the product adds to the runtime lives
 here, and nothing else is allowed to drift from upstream: an upstream bump
 means refreshing this file, not hunting deltas.
 
+The build also runs `scripts/validate-remote-bridge.mts`: an in-memory,
+two-hop round trip (browser channel client → local channel server →
+`toService` proxy → remote channel client → remote channel server) proving
+that a call and an event subscription survive `exposeOnChannelServer`. That is
+the failure class a typecheck cannot see — the bridge once broke exactly there
+and every other check stayed green.
+
 ## What it contains
 
 | Area | Files | Purpose |
 | --- | --- | --- |
-| Remote services bridge | `packages/server/src/remoteBridge.ts` (new), `packages/server/src/http.ts` | `/ws/remote/:id` exposes the full remote channel set (mirrors `RemoteServiceAccess`) instead of four services, and disposes the remote connection when the browser socket closes; `POST /api/dispose-remote/:id` releases an attached connection |
-| Web remote connect | `packages/web/src/main.tsx` | `platform.connectRemote` calls `POST /api/connect-remote`, attaches the session over `/ws/remote/<ticket>`, registers it renderer-side; `allowRemoteWorkspace` enabled for web |
+| Remote services bridge | `packages/server/src/remoteBridge.ts` (new), `packages/server/src/http.ts` | `/ws/remote/:id` exposes the full remote channel set (registers the same `ProxyChannel.toService` service proxies `RemoteServiceAccess` builds, so `exposeOnChannelServer` wraps them exactly like local services) instead of four services, and disposes the remote connection when the browser socket closes; `POST /api/dispose-remote/:id` releases an attached connection; ticket ids use `randomUUID` |
+| Web remote connect | `packages/web/src/main.tsx` | `platform.connectRemote` calls `POST /api/connect-remote`, attaches the session over `/ws/remote/<ticket>`, registers it renderer-side with the resolved target (a history reconnect reuses the same container); a failed connect after provisioning removes the environment; `allowRemoteWorkspace` and `supportsCloudEnvironments` on for web |
 | Cloud environments | `packages/server/src/cloudEnvironments.ts` (new) | `POST /api/cloud-environments` provisions a disposable dev container on an SSH host (default `ubuntu:26.04`), runs the setup script, copies the host's gh credentials in; `DELETE` removes it |
-| Container transport | `packages/server/src/remote/sshDockerBackend.ts` (new), `packages/server/src/remote/create-backend.ts`, `packages/shared/src/remoteTarget.ts`, `packages/shared/src/validation.ts` | the runtime runs inside a container on the SSH host (`docker exec` over the operator's SSH session), selected with the optional `dockerContainer` field |
-| Wizard | `packages/ui/src/hooks/useRemoteConnectionForm.ts`, `packages/ui/src/lib/remoteConnectionWizard.ts`, `packages/ui/src/RemoteConnectionDialogContent.tsx`, `packages/ui/src/SSHDialog.tsx`, `packages/ui/src/i18n/locales/en-US.ts`, `packages/ui/src/i18n/locales/zh-CN.ts`, `packages/shared/src/test-ids.ts` | the Docker card becomes **Cloud Environment**: same SSH host and credential fields, plus a base image and an optional setup script |
+| Container transport | `packages/server/src/remote/sshDockerBackend.ts` (new), `packages/server/src/remote/create-backend.ts`, `packages/shared/src/remoteTarget.ts`, `packages/shared/src/validation.ts` | the runtime runs inside a container on the SSH host (`docker exec` over the operator's SSH session), selected with the optional `dockerContainer` field (validated as a name or id, never a flag) |
+| Platform contract | `packages/shared/src/platform.ts` | optional `supportsCloudEnvironments`: the wizard hides the Cloud Environment card on platforms that do not declare it (desktop would silently ignore provisioning) |
+| Wizard | `packages/ui/src/hooks/useRemoteConnectionForm.ts`, `packages/ui/src/lib/remoteConnectionWizard.ts`, `packages/ui/src/RemoteConnectionDialogContent.tsx`, `packages/ui/src/SSHDialog.tsx`, `packages/ui/src/i18n/locales/en-US.ts`, `packages/ui/src/i18n/locales/zh-CN.ts`, `packages/shared/src/test-ids.ts` | the Docker card becomes **Cloud Environment** on capable platforms: same SSH host and credential fields, plus a base image and an optional setup script |
 
 ## Upstream policy
 
