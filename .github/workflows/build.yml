@@ -105,13 +105,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The volume on /data is required: the gateway writes its session key and
-      # its accounts there, and the container root filesystem is read-only.
+      # The volumes are required: the volume pre-check refuses to start a
+      # container whose /data or /workspace is not persisted, and the gateway
+      # writes its session key and its accounts on /data. The container root
+      # filesystem is read-only.
       - name: Start the published image
         run: |
           docker run -d --name smoke \
             -p 127.0.0.1:3030:3030 \
             -v smoke-data:/data \
+            -v smoke-ws:/workspace \
             --read-only --tmpfs /tmp:size=512m \
             --security-opt no-new-privileges:true \
             --cap-drop ALL \
@@ -129,6 +132,22 @@ jobs:
           echo "The gateway never answered." >&2
           docker logs smoke >&2
           exit 1
+
+      # The pre-check is itself part of the product: a container launched
+      # without volumes must refuse to start, with the fix in the message.
+      - name: Check that the volume pre-check refuses an unmounted container
+        run: |
+          set -o pipefail
+          if docker run --rm --name smoke-novol \
+            --read-only --tmpfs /tmp:size=512m \
+            "${{ env.IMAGE }}:${{ needs.build.outputs.version }}" 2>&1 | tee smoke-novol.log; then
+            echo "A container without volumes started: the pre-check did not run." >&2
+            exit 1
+          fi
+          grep -q "refusing to start" smoke-novol.log
+          grep -q "throwaway anonymous volume" smoke-novol.log
+          echo "The pre-check refused the unmounted container, with the fix in the message."
+          rm -f smoke-novol.log
 
       - name: Check that the interface sits behind the gateway
         run: |
@@ -161,5 +180,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f smoke || true
-          docker volume rm smoke-data || true
+          docker rm -f smoke smoke-novol || true
+          docker volume rm smoke-data smoke-ws || true

@@ -40,6 +40,7 @@ test("the defaults match the image: /workspace, /data, loopback runtime, gateway
     tls: true,
     tlsHosts: [],
     trustProxy: false,
+    volumeCheck: true,
     workspace: DEFAULT_WORKSPACE,
     dataDir: DEFAULT_DATA_DIR,
     sessionTtlHours: DEFAULT_SESSION_TTL_HOURS,
@@ -254,6 +255,17 @@ async function runStart(
     gateway = null,
     argv = ["node", "/opt/cloudium/gateway/start.mjs"],
     certificate = async () => ({ cert: "fake certificate", key: "fake key" }),
+    /**
+     * A mount table where /data and /workspace are named volumes: what a
+     * correctly launched container sees. Individual tests override it to
+     * exercise the persistence pre-check (anonymous volume, bare filesystem).
+     */
+    mountInfoText = [
+      "808 802 0:792 / / rw,relatime - overlay overlay rw",
+      "820 808 0:94 /var/lib/docker/volumes/zc-data/_data /data rw,relatime - ext4 /dev/sda1 rw",
+      "821 808 0:95 /var/lib/docker/volumes/zc-ws/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
+    ].join("\n"),
+    dirState = undefined,
   } = {},
 ) {
   const child = fakeChild();
@@ -268,6 +280,8 @@ async function runStart(
     argv,
     logger: (line) => logs.push(line),
     signals,
+    mountInfoText,
+    ...(dirState ? { dirState } : {}),
     spawnRuntime: (file, args, options) => {
       spawns.push({ file, args, options });
       return child;
@@ -437,4 +451,80 @@ test("extra command line arguments are reported and ignored", async () => {
 
   const quiet = await runStart({ HOME: "/data" });
   assert.equal(quiet.logs.some((line) => /command line/i.test(line)), false, "nothing to report without extra arguments");
+});
+
+test("the persistence pre-check refuses to start on a throwaway anonymous volume", async () => {
+  const anonymous = [
+    "808 802 0:792 / / rw,relatime - overlay overlay rw",
+    "820 808 0:94 /var/lib/docker/volumes/9f2c1e88d1c64d0c9b61d0c5c8f0e7a2b3d4c5e6f7a8b9c0d1e2f3a4b5c6d7e8/_data /data rw,relatime - ext4 /dev/sda1 rw",
+    "821 808 0:95 /var/lib/docker/volumes/zc-ws/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
+  ].join("\n");
+
+  await assert.rejects(
+    () =>
+      runStart(
+        { HOME: "/data" },
+        { mountInfoText: anonymous, dirState: () => "empty" },
+      ),
+    (error) => {
+      assert.match(error.message, /refusing to start/);
+      assert.match(error.message, /throwaway anonymous volume/);
+      assert.match(error.message, /-v z-cloudium-data:\/data/);
+      assert.match(error.message, /ZCLOUDIUM_VOLUME_CHECK=off/);
+      return true;
+    },
+  );
+});
+
+test("an anonymous volume that already carries state only warns, and ZCLOUDIUM_VOLUME_CHECK=off skips the check", async () => {
+  const anonymous = [
+    "808 802 0:792 / / rw,relatime - overlay overlay rw",
+    "820 808 0:94 /var/lib/docker/volumes/9f2c1e88d1c64d0c9b61d0c5c8f0e7a2b3d4c5e6f7a8b9c0d1e2f3a4b5c6d7e8/_data /data rw,relatime - ext4 /dev/sda1 rw",
+    "821 808 0:95 /var/lib/docker/volumes/zc-ws/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
+  ].join("\n");
+
+  // A `docker start` of the same container reuses its anonymous volume: the
+  // data is alive for as long as the volume is, so this starts, loudly.
+  const warned = await runStart(
+    { HOME: "/data" },
+    { mountInfoText: anonymous, dirState: () => "content" },
+  );
+  assert.ok(
+    warned.logs.some((line) => /warning: .*anonymous volume Docker created/.test(line)),
+    `the reuse warning must reach the log, got: ${JSON.stringify(warned.logs)}`,
+  );
+  assert.equal(warned.spawns.length, 1, "the runtime still starts");
+
+  // The documented escape hatch: a deliberately throwaway container.
+  const off = await runStart({ HOME: "/data", ZCLOUDIUM_VOLUME_CHECK: "off" }, { mountInfoText: anonymous });
+  assert.equal(off.spawns.length, 1);
+  assert.ok(
+    off.logs.some((line) => /volume check off/.test(line)),
+    "turning the check off is stated, not silent",
+  );
+});
+
+test("a workspace on the bare container filesystem is refused with the mount to add", async () => {
+  const dataOnly = [
+    "808 802 0:792 / / rw,relatime - overlay overlay rw",
+    "820 808 0:94 /var/lib/docker/volumes/zc-data/_data /data rw,relatime - ext4 /dev/sda1 rw",
+  ].join("\n");
+
+  await assert.rejects(
+    () => runStart({ HOME: "/data" }, { mountInfoText: dataOnly }),
+    (error) => {
+      assert.match(error.message, /\/workspace lives on the container filesystem/);
+      assert.match(error.message, /-v z-cloudium-workspace:\/workspace/);
+      return true;
+    },
+  );
+});
+
+test("an unreadable mount table skips the check instead of guessing", async () => {
+  const started = await runStart({ HOME: "/data" }, { mountInfoText: null });
+  assert.equal(started.spawns.length, 1, "fail-open: the container still starts");
+  assert.ok(
+    started.logs.some((line) => /volume check cannot read the mount table/.test(line)),
+    `the skip must be stated, got: ${JSON.stringify(started.logs)}`,
+  );
 });
