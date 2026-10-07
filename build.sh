@@ -52,7 +52,7 @@ if [ "$FROM_SOURCE" = 1 ]; then
   # refused by the Dockerfile, and one without the pinned revision would not be
   # reproducible. Resolve the exact commit for the image's revision label.
   if [ -z "$(ls patches/*.patch 2>/dev/null)" ]; then
-    echo "patches/ carries no .patch file; --from-source would build a feature-less image." >&2
+    echo "patches/ carries no .patch file; the from-source build would be a feature-less image." >&2
     exit 1
   fi
   # Annotated tags list a tag object sha first: resolve the peeled ref, and
@@ -74,6 +74,13 @@ if [ "$FROM_SOURCE" = 1 ]; then
     --tag "$IMAGE:latest" \
     .
 else
+  # The tarball path must not ship under the product tags: it carries no patch
+  # series, so a push here would replace the product with a feature-less
+  # image. Local builds under the version tag are what the checks need.
+  if [ "$PUSH" = 1 ]; then
+    echo "Refusing to push a --precompiled build: it is the check path, not the product." >&2
+    exit 1
+  fi
   echo "    runtime : $RUNTIME_URL"
   echo "    sha256  : $EXPECTED_SHA"
   docker build \
@@ -81,7 +88,6 @@ else
     --build-arg "TARBALL_URL=$RUNTIME_URL" \
     --build-arg "TARBALL_SHA256=$EXPECTED_SHA" \
     --tag "$IMAGE:$VERSION" \
-    --tag "$IMAGE:latest" \
     .
 fi
 
