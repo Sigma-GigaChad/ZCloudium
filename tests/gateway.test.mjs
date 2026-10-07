@@ -913,3 +913,75 @@ test("a dead upstream answers with an html page that reloads itself", async () =
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test("GitHub credentials: the owner stores a token once, the file is gh's own, non-owners are refused", () =>
+  withGateway(
+    async ({ base, dataDir, now, advance }) => {
+      const { session } = await completeSetup(base, now);
+
+      // Behind the same door as every gateway page.
+      const anonymous = await fetch(`${base}/_auth/github`, { redirect: "manual" });
+      assert.equal(anonymous.status, 302);
+      assert.match(anonymous.headers.get("location") ?? "", /_auth\/login/);
+
+      // The credentials every account's environments inherit are the owner's
+      // decision, so a signed-in non-owner is refused like on /_auth/users.
+      const created = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+      const setupCookie = cookieFrom(created, "zc_setup");
+      const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+      const secret = (await enroll.text()).match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+      // The account exists only once its enrolment is confirmed.
+      const confirmed = await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+      assert.equal(confirmed.status, 303);
+      advance(30_000);
+      const login = await post(base, "/_auth/login", { username: "colleague", password: "a-fine-long-passphrase" });
+      const verified = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, cookieFrom(login, "zc_login"));
+      const colleagueSession = cookieFrom(verified, "zc_sess");
+      const refused = await fetch(`${base}/_auth/github`, { headers: { cookie: colleagueSession } });
+      assert.equal(refused.status, 403);
+
+      // The owner starts from an empty status.
+      const empty = await fetch(`${base}/_auth/github`, { headers: { cookie: session } });
+      assert.equal(empty.status, 200);
+      assert.match(await empty.text(), /No GitHub credentials stored/);
+
+      // A token GitHub refuses is not stored.
+      const bad = await post(base, "/_auth/github", { token: "ghp_invalid_token_value" }, session);
+      assert.equal(bad.status, 303);
+      assert.match(bad.headers.get("location") ?? "", /error=/);
+      await assert.rejects(() => readFile(join(dataDir, ".config", "gh", "hosts.yml")));
+
+      // A token GitHub accepts is written where gh reads it, mode 0600.
+      const good = await post(base, "/_auth/github", { token: "ghp_good_token_value_1234567890" }, session);
+      assert.equal(good.status, 303);
+      assert.match(good.headers.get("location") ?? "", /saved=octocat/);
+      const path = join(dataDir, ".config", "gh", "hosts.yml");
+      const stored = await readFile(path, "utf8");
+      assert.match(stored, /^github\.com:$/m);
+      assert.match(stored, /oauth_token: ghp_good_token_value_1234567890/m);
+      assert.match(stored, /user: octocat/m);
+      const { stat } = await import("node:fs/promises");
+      assert.equal((await stat(path)).mode & 0o777, 0o600, "the token file is owner-only");
+      const page = await fetch(`${base}/_auth/github`, { headers: { cookie: session } });
+      assert.match(await page.text(), /Authenticated as <strong>octocat<\/strong>/);
+
+      // Removal empties the status again.
+      const removed = await post(base, "/_auth/github", { remove: "1" }, session);
+      assert.equal(removed.status, 303);
+      await assert.rejects(() => readFile(path));
+      const after = await fetch(`${base}/_auth/github`, { headers: { cookie: session } });
+      assert.match(await after.text(), /No GitHub credentials stored/);
+    },
+    {
+      // The GitHub API stub: only tokens this test controls validate, so the
+      // suite never touches the network and 401s are reproducible.
+      githubApiFetch: async (_url, init) => {
+        const token = String(init?.headers?.authorization ?? "").replace("Bearer ", "");
+        const status = token.startsWith("ghp_good") ? 200 : 401;
+        return new Response(JSON.stringify({ login: "octocat" }), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    },
+  ));

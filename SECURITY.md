@@ -193,6 +193,12 @@ What it does not do:
   `/data/auth/failures.json`. Anyone who can read the volume can run the
   instance, add an account, or wipe the failure budget: the volume is the trust
   boundary, and the budget being on disk is what makes a restart not reset it;
+- the owner's GitHub credentials live on the same volume, in
+  `/data/.config/gh/hosts.yml` (mode 0600, written only after
+  `api.github.com` accepted the token, owner-only page). That is a real
+  GitHub token, so the volume boundary now carries GitHub write access to
+  whatever the token scopes; treat the token like the accounts file, and
+  prefer a fine-grained one scoped to the repositories the agent must reach;
 - the failure counter is persisted with every change, so restarting no longer
   clears it; a block still ends after five minutes and the budget still starts
   again after it, as before.

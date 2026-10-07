@@ -32,6 +32,12 @@ import {
   verifySession,
 } from "./session.mjs";
 import {
+  readGitHubCredentials,
+  removeGitHubCredentials,
+  validateGitHubToken,
+  writeGitHubCredentials,
+} from "./github.mjs";
+import {
   findUser,
   hasUsers,
   ownerOf,
@@ -244,6 +250,8 @@ export async function createGateway({
   tls = null,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
+  // Injectable so the GitHub token validation never touches the network in tests.
+  githubApiFetch = fetch,
 } = {}) {
   if (!dataDir) {
     throw new Error("createGateway requires a dataDir");
@@ -752,6 +760,59 @@ export async function createGateway({
         seeOther(res, `${AUTH_PREFIX}/setup/totp`, [
           pendingCookie(PENDING_SETUP_COOKIE, pending, PENDING_TTL_SECONDS),
         ]);
+        return;
+      }
+    }
+
+    // GitHub credentials: authenticate once, in the container, and every cloud
+    // environment this container provisions inherits them. The file the page
+    // writes is the same hosts.yml gh reads, at the runtime's $HOME, so the
+    // provisioning path and the page share one source of truth.
+    if (pathname === `${AUTH_PREFIX}/github`) {
+      const session = sessionOf(req);
+      if (!session) {
+        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(`${AUTH_PREFIX}/github`)}`);
+        return;
+      }
+      const fresh = await readUsers(dataDir);
+      const owner = ownerOf(fresh);
+      const isOwner = owner !== null && owner.name === session.user;
+      if (!isOwner) {
+        html(res, 403, pages.messagePage({
+          title: "Not allowed",
+          heading: "Owner only",
+          message: "Only the owner manages the credentials that environments inherit.",
+        }));
+        return;
+      }
+
+      if (req.method === "GET") {
+        const credentials = await readGitHubCredentials(dataDir);
+        html(res, 200, pages.githubPage({
+          hasToken: credentials.present,
+          login: credentials.login,
+          saved: url.searchParams.get("saved"),
+          error: url.searchParams.get("error"),
+        }));
+        return;
+      }
+
+      if (req.method === "POST") {
+        const form = await readForm(req, maxBodyBytes);
+        if (form.remove === "1") {
+          await removeGitHubCredentials(dataDir);
+          seeOther(res, `${AUTH_PREFIX}/github`);
+          return;
+        }
+        const token = String(form.token ?? "").trim();
+        const verdict = await validateGitHubToken(token, githubApiFetch);
+        if (!verdict.ok) {
+          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(verdict.error)}`);
+          return;
+        }
+        await writeGitHubCredentials(dataDir, { login: verdict.login, token });
+        logger(`[auth] GitHub credentials stored for ${verdict.login}`);
+        seeOther(res, `${AUTH_PREFIX}/github?saved=${encodeURIComponent(verdict.login)}`);
         return;
       }
     }

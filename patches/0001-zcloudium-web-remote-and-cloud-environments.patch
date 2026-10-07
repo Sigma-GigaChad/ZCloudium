@@ -1,8 +1,8 @@
 From 4d62749a8a986b92ff18e3ce68d7af5b9e9b69ac Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Wed, 7 Oct 2026 01:29:55 +0200
-Subject: [PATCH] zcloudium: full remote services bridge, web connectRemote,
- cloud environments
+Subject: [PATCH 1/2] zcloudium: full remote services bridge, web
+ connectRemote, cloud environments
 
 1. /ws/remote/:id exposes the complete remote channel set: the same
    ProxyChannel.toService service proxies RemoteServiceAccess builds,
@@ -1491,6 +1491,97 @@ index 052eab8..f48c7f5 100644
            />
          </ZCodeIntlProvider>
        </AppErrorBoundary>,
+-- 
+2.56.0
+
+
+From 1085543beeb81d98601977faa03a90c1101a71e3 Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Wed, 7 Oct 2026 11:46:09 +0200
+Subject: [PATCH 2/2] zcloudium: GitHub credentials follow the app, not the
+ target machines
+
+installGhCredentialsFromHost now prefers the hosts.yml the gateway's
+/_auth/github page writes at the runtime's $HOME: the operator
+authenticates once, in the container, and every environment inherits
+it. A hosts.yml on the SSH host stays the fallback, and missing
+credentials on both are still not an error. The wizard's setup-script
+hint mentions the owner-menu enrolment.
+---
+ packages/server/src/cloudEnvironments.ts | 24 ++++++++++++++++++++----
+ packages/ui/src/i18n/locales/en-US.ts    |  2 +-
+ packages/ui/src/i18n/locales/zh-CN.ts    |  2 +-
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/packages/server/src/cloudEnvironments.ts b/packages/server/src/cloudEnvironments.ts
+index a08a592..33df109 100644
+--- a/packages/server/src/cloudEnvironments.ts
++++ b/packages/server/src/cloudEnvironments.ts
+@@ -1,3 +1,6 @@
++import { readFile } from "node:fs/promises";
++import { homedir } from "node:os";
++import { join } from "node:path";
+ import type { Hono } from "hono";
+ import { formatZodError, sshConnectOptionsSchema } from "@zcode/shared";
+ import { quotePosixShellArg } from "@zcode/server/remote/posixShell.js";
+@@ -200,14 +203,27 @@ async function provisionEnvironment(
+  * environment. Missing host credentials are not an error: the environment just
+  * starts without them.
+  */
++/**
++ * Propagate GitHub credentials into the environment.
++ *
++ * The operator authenticates once, in the container that runs this server,
++ * through the gateway's /_auth/github page: that writes a standard hosts.yml at
++ * $HOME/.config/gh/hosts.yml, which is what this function prefers — the
++ * credentials follow the web app, not the target machines, and nothing has to
++ * be enrolled on the SSH host itself. A hosts.yml on the SSH host (an operator
++ * who authenticated there the classic way) is the fallback. Missing
++ * credentials on both are not an error: the environment just starts without
++ * GitHub access.
++ */
+ async function installGhCredentialsFromHost(
+   backend: SSHBackend,
+   container: string,
+ ): Promise<boolean> {
+-  const hostsYml = await execSimple(
+-    backend,
+-    "cat ~/.config/gh/hosts.yml 2>/dev/null || true",
+-  );
++  const localHostsYml = await readFile(join(homedir(), ".config", "gh", "hosts.yml"), "utf8")
++    .catch(() => "");
++  const hostsYml = localHostsYml.trim()
++    ? localHostsYml
++    : await execSimple(backend, "cat ~/.config/gh/hosts.yml 2>/dev/null || true");
+   if (!hostsYml.trim()) {
+     return false;
+   }
+diff --git a/packages/ui/src/i18n/locales/en-US.ts b/packages/ui/src/i18n/locales/en-US.ts
+index 13bfa9b..49bb616 100644
+--- a/packages/ui/src/i18n/locales/en-US.ts
++++ b/packages/ui/src/i18n/locales/en-US.ts
+@@ -1792,7 +1792,7 @@ const enUS: Record<string, string> = {
+   "remote.cloud.setupScript": "Setup script (optional)",
+   "remote.cloud.setupScriptPlaceholder": "apt-get update && apt-get install -y git build-essential",
+   "remote.cloud.setupScriptDescription":
+-    "Runs once inside the environment right after creation. The container is kept afterwards, so everything the script installs persists between sessions.",
++    "Runs once inside the environment right after creation. The container is kept afterwards, so everything the script installs persists between sessions. GitHub credentials follow the app: authenticate once under \"GitHub credentials\" (owner menu) and every environment inherits them.",
+   "remote.connect": "Connect",
+   "remote.connecting": "Connecting...",
+   "remote.minimize": "Minimize remote connection window",
+diff --git a/packages/ui/src/i18n/locales/zh-CN.ts b/packages/ui/src/i18n/locales/zh-CN.ts
+index 84a95cf..2b7107c 100644
+--- a/packages/ui/src/i18n/locales/zh-CN.ts
++++ b/packages/ui/src/i18n/locales/zh-CN.ts
+@@ -1666,7 +1666,7 @@ const zhCN: Record<string, string> = {
+   "remote.cloud.setupScript": "初始化脚本（可选）",
+   "remote.cloud.setupScriptPlaceholder": "apt-get update && apt-get install -y git build-essential",
+   "remote.cloud.setupScriptDescription":
+-    "创建时在环境内执行一次。容器随后保留，脚本安装的一切在会话之间持久化。",
++    "创建时在环境内执行一次。容器随后保留，脚本安装的一切在会话之间持久化。GitHub 凭据随应用走：在\"GitHub credentials\"（owner 菜单）认证一次，所有环境自动继承。",
+   "remote.connect": "连接",
+   "remote.connecting": "正在连接...",
+   "remote.minimize": "收起远程连接窗口",
 -- 
 2.56.0
 
