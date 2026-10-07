@@ -513,9 +513,18 @@ test("a workspace on the bare container filesystem is refused with the mount to 
   await assert.rejects(
     () => runStart({ HOME: "/data" }, { mountInfoText: dataOnly }),
     (error) => {
-      assert.match(error.message, /\/workspace is not a mount/);
+      assert.match(error.message, /\/workspace lives on the container filesystem/);
       assert.match(error.message, /-v z-cloudium-workspace:\/workspace/);
       return true;
     },
+  );
+});
+
+test("an unreadable mount table skips the check instead of guessing", async () => {
+  const started = await runStart({ HOME: "/data" }, { mountInfoText: null });
+  assert.equal(started.spawns.length, 1, "fail-open: the container still starts");
+  assert.ok(
+    started.logs.some((line) => /volume check cannot read the mount table/.test(line)),
+    `the skip must be stated, got: ${JSON.stringify(started.logs)}`,
   );
 });

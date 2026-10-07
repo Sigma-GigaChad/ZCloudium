@@ -165,8 +165,11 @@ when either path would not survive the container:
   `-v z-cloudium-data:/data`;
 - the **bare container filesystem** or **tmpfs** under either path.
 
-An anonymous volume that already carries content (a restarted `docker run`
-container reusing its volume) starts with a loud warning — nothing is lost
+Volume mounts are recognized on every runtime (rootful and rootless Docker,
+Podman, custom data-roots): they all end in `/_data`, and anonymous volumes
+are a 64-hex hash on all of them. An anonymous volume that already carries
+content (a restarted `docker run` container reusing its volume) starts with a
+loud warning — nothing is lost
 while that unnamed volume lives, but the warning tells you how to migrate to a
 named one. Paths under a bind mount pass (the full access profile puts both
 directories under `/host`).

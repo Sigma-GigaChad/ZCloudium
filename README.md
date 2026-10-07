@@ -115,6 +115,7 @@ read, not an accident.
 | Telemetry | forced off | none of ours to give, none of the runtime's either |
 | Port binding | `127.0.0.1` in the shipped compose files | the gateway is the front door; it should not face a network by accident |
 | Container | unprivileged, read-only rootfs, `cap_drop: ALL` | a compromise does not persist and has no privileges to use |
+| Host | x86-64 Linux | the runtime ships linux-x64 `node-pty` binaries; there is no arm64 build yet |
 
 ## Work from the browser: SSH hosts and Cloud Environments
 
@@ -170,8 +171,9 @@ volume itself).
   and the smoke job starts the published image before letting it ship.
 - Freeze a version with `image: ghcr.io/sigma-gigachad/z-cloudium:3.14.7`
   (tags: `latest`, `<version>`, `sha-<commit>`).
-- `./check-upstream.sh` watches for new releases and opens an issue; `--bump`
-  applies one. Bumping includes refreshing the patch series — recipe in
+- `./check-upstream.sh` compares the pin against the latest release (exit 0 or
+  1); CI runs it weekly and opens an issue on a new release; `--bump` applies
+  one. Bumping includes refreshing the patch series — recipe in
   [patches/README.md](patches/README.md).
 - Build it yourself with `./build.sh` (product, from source) — nothing but
   Docker is needed; `--precompiled` exists for checks and refuses `--push`.

@@ -18,8 +18,6 @@
 
 import { readFileSync } from "node:fs";
 
-const DOCKER_VOLUMES = "/var/lib/docker/volumes/";
-
 /**
  * The mount table of this container, or null where it cannot be read (a
  * non-Linux development machine, a hardened kernel without procfs): the check
@@ -60,19 +58,28 @@ export function parseMountInfo(text) {
     .filter((mount) => mount !== null);
 }
 
-/** Anonymous volumes are the ones Docker names with a 64-hex hash. */
+/**
+ * Every container runtime ends its volume mounts with `/_data` — Docker
+ * (rootful at /var/lib/docker/volumes, rootless under ~/.local/share/docker),
+ * Podman, any custom data-root — and the segment before it names the volume.
+ * Anonymous volumes are a 64-hex hash on every one of those runtimes; named
+ * ones are not. A bind mount of a host directory that happens to end in
+ * /_data classifies as a named volume, which is the safe direction: it never
+ * gets refused, only mis-described.
+ */
 export function classifyMount(mount) {
-  if (!mount.root.startsWith(DOCKER_VOLUMES)) {
-    if (mount.mountPoint === "/" && mount.root === "/") {
-      return "rootfs";
-    }
-    if (mount.type === "tmpfs") {
-      return "tmpfs";
-    }
-    return "bind";
+  if (mount.root.endsWith("/_data")) {
+    const before = mount.root.slice(0, -"/_data".length);
+    const name = before.slice(before.lastIndexOf("/") + 1);
+    return /^[0-9a-f]{64}$/.test(name) ? "anonymous-volume" : "named-volume";
   }
-  const name = mount.root.slice(DOCKER_VOLUMES.length, mount.root.lastIndexOf("/_data"));
-  return /^[0-9a-f]{64}$/.test(name) ? "anonymous-volume" : "named-volume";
+  if (mount.mountPoint === "/" && mount.root === "/") {
+    return "rootfs";
+  }
+  if (mount.type === "tmpfs") {
+    return "tmpfs";
+  }
+  return "bind";
 }
 
 /**
@@ -100,40 +107,46 @@ export function coveringMount(mounts, path) {
  * The assessment itself. `dirState` answers whether a directory already holds
  * anything ("content") or is empty ("empty") — only asked for anonymous
  * volumes, where an existing container restart reuses its volume while a fresh
- * `docker run` creates a new empty one.
+ * `docker run` creates a new empty one. Both protected paths get the same
+ * policy: the workspace losing the agent's work is as unacceptable as the data
+ * directory losing it.
  */
 export function assessVolumes({ dataDir, workspace, mounts, dirState = () => "empty" }) {
   const errors = [];
   const warnings = [];
 
-  const dataMount = coveringMount(mounts, dataDir);
-  if (!dataMount) {
-    errors.push(`${dataDir} is not a mount at all: it lives on the container filesystem, and everything written there dies with the container.`);
-  } else {
-    const kind = classifyMount(dataMount);
+  const assess = (path, volumeHint) => {
+    const mount = coveringMount(mounts, path);
+    if (!mount) {
+      errors.push(
+        `${path} is not a mount at all: it lives on the container filesystem, and everything written there dies with the container.`,
+      );
+      return;
+    }
+    const kind = classifyMount(mount);
     if (kind === "rootfs") {
-      errors.push(`${dataDir} lives on the container filesystem (no volume is mounted there): accounts, settings and work die with the container. Mount a volume: -v z-cloudium-data:${dataDir}`);
+      errors.push(
+        `${path} lives on the container filesystem (no volume is mounted there): everything written there dies with the container. Mount a volume: -v ${volumeHint}:${path}`,
+      );
     } else if (kind === "tmpfs") {
-      errors.push(`${dataDir} is on tmpfs: everything written there is gone at the next restart. Mount a real volume instead: -v z-cloudium-data:${dataDir}`);
+      errors.push(
+        `${path} is on tmpfs: everything written there is gone at the next restart. Mount a real volume instead: -v ${volumeHint}:${path}`,
+      );
     } else if (kind === "anonymous-volume") {
-      if (dirState(dataDir) === "content") {
+      if (dirState(path) === "content") {
         warnings.push(
-          `${dataDir} is an anonymous volume Docker created because no -v was given. This container reuses it, so nothing is lost while it lives — but the volume is unnamed and unmanaged: a docker rm followed by a docker run silently starts over. Create a named volume: docker volume create z-cloudium-data, then -v z-cloudium-data:${dataDir}`,
+          `${path} is an anonymous volume Docker created because no -v was given. This container reuses it, so nothing is lost while it lives — but the volume is unnamed and unmanaged: a docker rm followed by a docker run silently starts over. Create a named volume: docker volume create ${volumeHint}, then -v ${volumeHint}:${path}`,
         );
       } else {
         errors.push(
-          `${dataDir} is a throwaway anonymous volume (no -v was given for it): a fresh docker run created it empty, and everything written there dies with the container — the setup wizard would run again from zero. Mount a volume: -v z-cloudium-data:${dataDir}`,
+          `${path} is a throwaway anonymous volume (no -v was given for it): a fresh docker run created it empty, and everything written there dies with the container — the setup wizard would run again from zero. Mount a volume: -v ${volumeHint}:${path}`,
         );
       }
     }
-  }
+  };
 
-  const workspaceMount = coveringMount(mounts, workspace);
-  if (!workspaceMount || classifyMount(workspaceMount) === "rootfs") {
-    errors.push(
-      `${workspace} is not a mount: the agent's work dies with the container. Mount one: -v z-cloudium-workspace:${workspace} (or a host directory).`,
-    );
-  }
+  assess(dataDir, "z-cloudium-data");
+  assess(workspace, "z-cloudium-workspace");
 
   return { ok: errors.length === 0, errors, warnings };
 }

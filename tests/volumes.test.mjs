@@ -81,11 +81,47 @@ test("data or workspace on the bare container filesystem is refused", () => {
   const bare = assessVolumes({ dataDir: "/state", workspace: "/work", mounts: MOUNTS });
   assert.equal(bare.ok, false);
   assert.match(bare.errors[0], /\/state lives on the container filesystem/);
-  assert.match(bare.errors[1], /\/work is not a mount/);
+  assert.match(bare.errors[1], /\/work lives on the container filesystem/);
 });
 
 test("tmpfs as the data directory is refused: it evaporates at restart", () => {
   const ramdisk = assessVolumes({ dataDir: "/tmp", workspace: "/workspace", mounts: MOUNTS });
   assert.equal(ramdisk.ok, false);
   assert.match(ramdisk.errors[0], /tmpfs/);
+});
+
+test("the workspace gets the same policy as the data directory", () => {
+  // tmpfs under the workspace is refused, exactly like under /data.
+  const ramdisk = assessVolumes({ dataDir: "/data", workspace: "/tmp", mounts: MOUNTS, dirState: () => "content" });
+  assert.equal(ramdisk.ok, false);
+  assert.match(ramdisk.errors[0], /\/tmp is on tmpfs/);
+
+  // A fresh anonymous volume under the workspace is refused too.
+  const anonymousWs = parseMountInfo(
+    [
+      "808 802 0:792 / / rw,relatime - overlay overlay rw",
+      "820 808 0:94 /var/lib/docker/volumes/zc-data/_data /data rw,relatime - ext4 /dev/sda1 rw",
+      "821 808 0:95 /var/lib/docker/volumes/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
+    ].join("\n"),
+  );
+  const fresh = assessVolumes({ dataDir: "/data", workspace: "/workspace", mounts: anonymousWs });
+  assert.equal(fresh.ok, false);
+  assert.match(fresh.errors[0], /\/workspace is a throwaway anonymous volume/);
+});
+
+test("anonymous volumes are recognized on every runtime, not only rootful Docker", () => {
+  const rootless = parseMountInfo(
+    "820 808 0:94 /home/op/.local/share/docker/volumes/9f2c1e88d1c64d0c9b61d0c5c8f0e7a2b3d4c5e6f7a8b9c0d1e2f3a4b5c6d7e8/_data /data rw,relatime - ext4 /dev/sda1 rw",
+  )[0];
+  assert.equal(classifyMount(rootless), "anonymous-volume", "rootless Docker anonymous volumes are 64-hex too");
+
+  const podman = parseMountInfo(
+    "820 808 0:94 /var/lib/containers/storage/volumes/myenv/_data /data rw,relatime - ext4 /dev/sda1 rw",
+  )[0];
+  assert.equal(classifyMount(podman), "named-volume", "Podman named volumes pass");
+
+  // A host directory that merely ends in /_data is a bind mount that passes
+  // (safe direction: never falsely refused), even if the label says named.
+  const awkward = parseMountInfo("820 808 0:94 /srv/shared/_data /workspace rw,relatime - ext4 /dev/sda1 rw")[0];
+  assert.equal(classifyMount(awkward), "named-volume");
 });
