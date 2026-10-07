@@ -374,7 +374,39 @@ ${createdBlock}
   </div>
   <button class="primary" type="submit">Create and enrol</button>
 </form>
-<p class="hint">The next page shows the new account's authenticator secret and recovery codes: relay them to their owner, then they sign in and change the password themselves.</p>`,
+<p class="hint">The next page shows the new account's authenticator secret and recovery codes: relay them to their owner, then they sign in and change the password themselves.</p>
+<p class="hint"><a href="/_auth/github">GitHub credentials</a> — authenticate once here and every cloud environment this container provisions inherits it.</p>`,
+  });
+}
+
+export function githubPage({ login, hasToken, saved, error } = {}) {
+  const status = hasToken
+    ? `<p class="hint" style="display:inline">Authenticated as <strong>${escapeHtml(login ?? "unknown")}</strong>. Every cloud environment this container provisions inherits these credentials.</p>`
+    : `<p class="hint">No GitHub credentials stored. Environments created now start without gh or git access to GitHub.</p>`;
+  const savedBlock = saved
+    ? `<p class="hint">Stored. Cloud environments created from now on are authenticated as <strong>${escapeHtml(saved)}</strong>.</p>`
+    : "";
+  return layout({
+    title: "GitHub credentials",
+    body: `
+<h1>GitHub credentials</h1>
+<p class="lead">Authenticate once here, in the container. Every cloud environment you create afterwards inherits these credentials for gh and git — no per-environment login, nothing stored on the target machines.</p>
+${errorBlock(error)}
+${savedBlock}
+${status}
+<form method="post" action="/_auth/github" autocomplete="off">
+  <div class="field">
+    <label for="token">Personal access token</label>
+    <input id="token" name="token" type="password" autocomplete="new-password" required>
+  </div>
+  <button class="primary" type="submit">Validate and store</button>
+</form>
+${hasToken ? `
+<form method="post" action="/_auth/github">
+  <input type="hidden" name="remove" value="1">
+  <button type="submit">Remove the stored credentials</button>
+</form>` : ""}
+<p class="hint">Create the token on GitHub (Settings → Developer settings → Personal access tokens) with the <code>repo</code> scope — or a fine-grained token limited to the repositories that matter. The token is validated against api.github.com before being written to <code>~/.config/gh/hosts.yml</code> on the data volume, mode 0600, where the gateway can read it and nothing else can.</p>`,
   });
 }
 

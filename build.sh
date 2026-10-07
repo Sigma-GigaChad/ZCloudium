@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 #
-# Builds the ZCode Web image from the pinned precompiled runtime.
+# Builds the ZCode Web image: the runtime compiled from the pinned ZCodium
+# sources with the patch series in patches/ (Remote SSH from the web client,
+# Cloud Environments). This is the product build, the one CI publishes.
 #
 #   ./build.sh                 -> ghcr.io/sigma-gigachad/z-cloudium:{<zcode.version>,latest}
 #   ./build.sh --push          -> same, then push to the configured registry
-#   ./build.sh --from-source   -> same tags, but the runtime is compiled from
-#                                 the pinned ZCodium sources with the patch
-#                                 series in patches/ (Remote SSH from the web
-#                                 client, Cloud Environments)
+#   ./build.sh --precompiled   -> the vendor tarball instead (no patch series,
+#                                 no remote workspace features): the check
+#                                 path, not the product
 #   IMAGE=my-registry/z-cloudium ./build.sh --push
-#   RUNTIME_URL=<another tarball> ./build.sh
 #
-# The precompiled path needs no toolchain at all; the --from-source path needs
-# nothing either (the compiler runs in the builder stage), only more time.
+# The from-source path needs nothing but Docker (the compiler runs in the
+# builder stage); a cold build takes about five minutes, then cache warmth
+# applies. The precompiled path is kept because some checks still run it: it
+# must never be pushed under the product tags.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -26,12 +28,13 @@ RUNTIME_URL="${RUNTIME_URL:-https://github.com/ZCodium-project/ZCodium/releases/
 FROM_SOURCE_REPO="${FROM_SOURCE_REPO:-https://github.com/ZCodium-project/ZCodium.git}"
 
 PUSH=0
-FROM_SOURCE=0
+FROM_SOURCE=1
 for arg in "$@"; do
   case "$arg" in
     --push) PUSH=1 ;;
     --from-source) FROM_SOURCE=1 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --precompiled) FROM_SOURCE=0 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -49,7 +52,7 @@ if [ "$FROM_SOURCE" = 1 ]; then
   # refused by the Dockerfile, and one without the pinned revision would not be
   # reproducible. Resolve the exact commit for the image's revision label.
   if [ -z "$(ls patches/*.patch 2>/dev/null)" ]; then
-    echo "patches/ carries no .patch file; --from-source would build a feature-less image." >&2
+    echo "patches/ carries no .patch file; the from-source build would be a feature-less image." >&2
     exit 1
   fi
   # Annotated tags list a tag object sha first: resolve the peeled ref, and
@@ -71,6 +74,13 @@ if [ "$FROM_SOURCE" = 1 ]; then
     --tag "$IMAGE:latest" \
     .
 else
+  # The tarball path must not ship under the product tags: it carries no patch
+  # series, so a push here would replace the product with a feature-less
+  # image. Local builds under the version tag are what the checks need.
+  if [ "$PUSH" = 1 ]; then
+    echo "Refusing to push a --precompiled build: it is the check path, not the product." >&2
+    exit 1
+  fi
   echo "    runtime : $RUNTIME_URL"
   echo "    sha256  : $EXPECTED_SHA"
   docker build \
@@ -78,7 +88,6 @@ else
     --build-arg "TARBALL_URL=$RUNTIME_URL" \
     --build-arg "TARBALL_SHA256=$EXPECTED_SHA" \
     --tag "$IMAGE:$VERSION" \
-    --tag "$IMAGE:latest" \
     .
 fi
 

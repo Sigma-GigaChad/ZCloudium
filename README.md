@@ -241,6 +241,21 @@ is reachable only through that gateway.
   tests the gateway (both compose files carry a commented override that probes
   `/api/server-info` instead).
 
+### GitHub credentials: authenticate once, in the container
+
+The owner's menu carries a **GitHub credentials** page (`/_auth/github`): paste
+a personal access token, it is validated against `api.github.com` and stored as
+a standard `hosts.yml` on the `/data` volume (mode 0600, directory 0700 — the
+same trust boundary as the accounts file). That single enrolment covers
+everything: every cloud environment this container provisions inherits gh and
+git access, and the credentials live in one place instead of one copy per
+machine. Removing the token from the same page takes it away from every
+future environment (environments already created keep their copy, like any
+machine you have logged out of after the fact).
+
+Fine-grained tokens work the same and limit the blast radius: scope them to the
+repositories the agent must reach.
+
 ### Turning authentication off
 
 `ZCLOUDIUM_AUTH=off` restores the previous behaviour of the image: the runtime
@@ -451,21 +466,21 @@ Two files, one single truth, and no value repeated in the build:
 
 | File | Content |
 | --- | --- |
-| `zcode.version` | the pinned upstream release tag (for example `v3.14.7`) |
-| `zcode.sha256` | the sha256 of that release tarball |
+| `zcode.version` | the pinned upstream release tag (for example `v3.14.7`) — the source revision the image compiles |
+| `zcode.sha256` | the sha256 of that release tarball, still guarding the precompiled check path |
 
-Every build path reads these two files and passes them as build arguments:
-`./build.sh`, `build.yml`, and the e2e job of `e2e.yml`. The Dockerfile carries no
-default for any of them and refuses to build when one is missing, so a path that
-forgets a pin fails at the first step instead of shipping an image that
-contradicts its own tag. That is not hypothetical: with the runtime tag in the
-Dockerfile as a default, a CI build of the 3.14.4 tree produced an image
-labelled 3.14.3, carrying the 3.14.3 runtime, that the workflow would have
-pushed as `3.14.4`. The smoke job now compares, rather than prints, the runtime
-inside the published image.
+The published image is the **product build**: `Dockerfile.from-source` compiles
+the runtime from the pinned ZCodium revision with the patch series in
+`patches/` (see "The from-source build carries the remote workspace features"
+below), because those features do not exist in the vendor tarball. The version
+tag still comes from `zcode.version` and the smoke job compares, rather than
+prints, the runtime inside the published image — the lesson of a build that
+once shipped the previous runtime under the new tag stands. The image's
+`org.opencontainers.image.revision` label carries the exact source commit, and
+the smoke job also verifies the image actually carries the patch series (one
+server marker, one web marker).
 
-One image tag per release, the sha256 written into a label
-(`org.opencontainers.image.revision`), and an automatic watch:
+One image tag per release, and an automatic watch:
 
 ```bash
 ./check-upstream.sh              # up to date? (exit 0) or new release? (exit 1)
@@ -476,7 +491,8 @@ REPO=zai-org/ZCode ./check-upstream.sh   # watch the original upstream instead
 
 The `upstream-check` workflow does that watch every week and **opens an issue**
 when a release comes out. It never modifies anything by itself: the bump stays
-an explicit decision.
+an explicit decision. Bumping means refreshing the patch series too — the
+recipe is in `patches/README.md`.
 
 ## Building the image yourself
 
@@ -485,17 +501,16 @@ an explicit decision.
 ./build.sh --push         # same, then push to the registry
 ```
 
-A build without any cache (`docker build --no-cache`, measured at 39 seconds on
-the development machine before the browser was part of the image, and faster
-now) downloads the 81 MB upstream tarball, verifies its
-sha256 and extracts it. A rebuild with a warm cache takes a few seconds. A local
-build satisfies the compose files directly, since they reference the same image
-name.
+That is the product build: the runtime is compiled in the builder stage from
+the pinned sources with the patch series (about five minutes cold, then cache
+warmth applies), so nothing but Docker is needed on the machine. The result
+satisfies the compose files directly, since they reference the same image name.
 
-The CI (`.github/workflows/build.yml`) rebuilds and publishes on every push to
-`main`, then a `smoke` job **starts the published image**, checks that the
-gateway answers and that the interface sits behind it. An image is not shipped
-without having been started.
+The CI (`.github/workflows/build.yml`) rebuilds that image and publishes it to
+ghcr.io on every push to `main`, then a `smoke` job **starts the published
+image**, checks that the gateway answers, that the interface sits behind it,
+and that the runtime the image carries is the one its tag claims. An image is
+not shipped without having been started.
 
 ## Hardening
 
@@ -649,7 +664,7 @@ The precompiled image runs the published tarball exactly as the fork ships it.
 The features that need runtime changes — opening Remote SSH sessions from the
 web client, and creating Cloud Environments — live in a small, reviewed patch
 series that `Dockerfile.from-source` applies to the pinned ZCodium revision
-before compiling it (`./build.sh --from-source`). The image it produces carries
+before compiling it (`./build.sh`). The image it produces carries
 the same gateway, entrypoint and hardening as the precompiled one; only the
 runtime differs, and the build proves the series reached the artefacts (it
 greps one server route and one web string after extraction).
@@ -676,11 +691,12 @@ WebSocket. In this image the web client connects Remote SSH targets like the
 desktop one, and the wizard's method list offers **Cloud Environment** instead
 of Docker: the wizard collects the SSH host and credentials plus an optional
 base image (default `ubuntu:26.04`) and an optional setup script, the server
-provisions a disposable container on that host, copies the host's GitHub CLI
-credentials into it (authenticate `gh` and `git` once on the machine, every
-environment inherits them), and the runtime connects into the container through
-the operator's SSH session — no sshd in the container, no published port, no
-Docker credentials on the machine running this image.
+provisions a disposable container on that host, propagates the GitHub
+credentials the owner stored once on the **GitHub credentials** page (the
+container's own `hosts.yml`; a `hosts.yml` on the SSH host is the fallback),
+and the runtime connects into the container through the operator's SSH
+session — no sshd in the container, no published port, no Docker credentials
+on the machine running this image.
 
 Environments persist on the host (the setup script runs once, dependencies
 survive between sessions) and are removed with `docker rm -f <name>` on that
