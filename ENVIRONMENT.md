@@ -100,8 +100,12 @@ and reachable only through it.
   **owner**; only it creates accounts. Any account uses the interface with the
   same rights — there are no roles beyond account management.
 - **GitHub credentials** (`/_auth/github`, owner only): the enrolment page for
-  the token that Cloud Environments inherit — see the README's
-  [remote work section](README.md#work-from-the-browser-ssh-hosts-and-cloud-environments).
+  the credentials Cloud Environments inherit. The main button runs the device
+  sign-in `gh auth login` runs (GitHub CLI's public application and scopes:
+  `repo`, `read:org`, `gist`, `workflow`) — GitHub shows a short code, you type
+  it at `github.com/login/device`, the waiting page polls and finishes by
+  itself. Pasting a token stays for fine-grained PATs. Both paths write the
+  same `hosts.yml` on the volume.
 - **Metrics** (`/_auth/metrics`): the Prometheus text format, behind the
   session — failed attempts, blocks, sessions issued, recovery codes used,
   proxied requests. Plain counters, no labels.

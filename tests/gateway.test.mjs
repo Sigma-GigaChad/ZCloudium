@@ -985,3 +985,135 @@ test("GitHub credentials: the owner stores a token once, the file is gh's own, n
       },
     },
   ));
+
+
+test("GitHub device flow: the owner signs in like gh auth login, the token lands in hosts.yml", () =>
+  withGateway(
+    async ({ base, dataDir, advance }) => {
+      const { session } = await completeSetup(base);
+
+      // Step 1: starting the flow asks GitHub for a code pair, then the
+      // waiting page shows the short code and the address to type it at.
+      const start = await post(base, "/_auth/github/device", {}, session);
+      assert.equal(start.status, 303);
+      assert.equal(start.headers.get("location"), "/_auth/github/device");
+
+      const waiting = await fetch(`${base}/_auth/github/device`, { headers: { cookie: session } });
+      const waitingPage = await waiting.text();
+      assert.match(waitingPage, /data-testid="device-user-code">WXYZ-1234</);
+      assert.match(waitingPage, /github\.com\/login\/device/);
+      assert.match(waitingPage, /http-equiv="refresh" content="5; url=\/_auth\/github\/device\/check"/);
+      // The device code is the one secret of the flow and never reaches a page.
+      assert.doesNotMatch(waitingPage, /device-flow-device-code/);
+
+      // Step 2: the first check is held back (GitHub named a five second
+      // interval), then reports pending while the code is not typed yet.
+      const heldBack = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(heldBack.status, 303, "the first poll respects the interval GitHub named");
+      advance(6_000);
+
+      const pending = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(pending.status, 303);
+      assert.equal(pending.headers.get("location"), "/_auth/github/device", "pending sends the browser back to the waiting page");
+
+      // Step 3: the user has typed the code; the next check completes the
+      // sign-in and writes the same hosts.yml the token form writes. The
+      // gateway creeps its poll interval by one second per cycle, so clear it.
+      advance(8_000);
+      authorized = true;
+      const done = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(done.status, 303);
+      assert.equal(done.headers.get("location"), "/_auth/github?saved=octocat");
+
+      const stored = await readFile(join(dataDir, ".config", "gh", "hosts.yml"), "utf8");
+      assert.match(stored, /oauth_token: gho_device_flow_token/m);
+      assert.match(stored, /user: octocat/m);
+      const { stat } = await import("node:fs/promises");
+      assert.equal((await stat(join(dataDir, ".config", "gh", "hosts.yml"))).mode & 0o777, 0o600);
+
+      // The flow is spent: another check redirects to the credentials page.
+      advance(6_000);
+      const spent = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(spent.headers.get("location"), "/_auth/github");
+    },
+    {
+      githubApiFetch: deviceFlowStub(),
+    },
+  ));
+
+test("GitHub device flow: expired codes clean up, cancel clears the flow, non-owners are refused", () =>
+  withGateway(
+    async ({ base, now, advance }) => {
+      const { session } = await completeSetup(base, now);
+
+      const start = await post(base, "/_auth/github/device", {}, session);
+      assert.equal(start.status, 303);
+
+      // Expiry: GitHub's expires_in has passed, so the check cleans up and
+      // says so instead of waiting forever.
+      advance(16 * 60 * 1000);
+      const expired = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(expired.status, 303);
+      assert.match(expired.headers.get("location") ?? "", /error=The%20device%20code%20expired/);
+      // And the flow is gone: the waiting page redirects back to the form.
+      const gone = await fetch(`${base}/_auth/github/device`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(gone.headers.get("location"), "/_auth/github");
+
+      // Cancel clears whatever flow was pending.
+      await post(base, "/_auth/github/device", {}, session);
+      const cancelled = await post(base, "/_auth/github/device/cancel", {}, session);
+      assert.equal(cancelled.status, 303);
+      assert.equal(cancelled.headers.get("location"), "/_auth/github");
+      const afterCancel = await fetch(`${base}/_auth/github/device`, { headers: { cookie: session }, redirect: "manual" });
+      assert.equal(afterCancel.headers.get("location"), "/_auth/github");
+
+      // Non-owners are refused on every device route, like on the form.
+      const created = await post(base, "/_auth/users", { username: "colleague", password: "a-fine-long-passphrase", password2: "a-fine-long-passphrase" }, session);
+      const setupCookie = cookieFrom(created, "zc_setup");
+      const enroll = await fetch(`${base}/_auth/setup/totp`, { headers: { cookie: setupCookie } });
+      const secret = (await enroll.text()).match(/id="otp-secret"[^>]*>\s*([A-Z2-7\s]+?)\s*</)?.[1]?.replace(/\s+/g, "");
+      await post(base, "/_auth/setup/totp", { code: totp(secret, { at: now() }) }, setupCookie);
+      advance(30_000);
+      const login = await post(base, "/_auth/login", { username: "colleague", password: "a-fine-long-passphrase" });
+      const verified = await post(base, "/_auth/verify", { code: totp(secret, { at: now() }) }, cookieFrom(login, "zc_login"));
+      const colleagueSession = cookieFrom(verified, "zc_sess");
+      const refusedStart = await post(base, "/_auth/github/device", {}, colleagueSession);
+      assert.equal(refusedStart.status, 403);
+      const refusedCheck = await fetch(`${base}/_auth/github/device/check`, { headers: { cookie: colleagueSession } });
+      assert.equal(refusedCheck.status, 403);
+    },
+    {
+      githubApiFetch: deviceFlowStub(),
+    },
+  ));
+
+/**
+ * The GitHub device-flow stub, routed by URL: device/code always answers a
+ * fixed pair, token polling stays pending until the test flips the flag, and
+ * the /user lookup names the login. `authorized` is reset per test.
+ */
+let authorized = false;
+function deviceFlowStub() {
+  authorized = false;
+  return async (url) => {
+    if (String(url).endsWith("/login/device/code")) {
+      return new Response(JSON.stringify({
+        device_code: "device-flow-device-code",
+        user_code: "WXYZ-1234",
+        verification_uri: "https://github.com/login/device",
+        expires_in: 900,
+        interval: 5,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (String(url).endsWith("/login/oauth/access_token")) {
+      if (!authorized) {
+        return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ access_token: "gho_device_flow_token", token_type: "bearer", scope: "repo,read:org,gist,workflow" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (String(url) === "https://api.github.com/user") {
+      return new Response(JSON.stringify({ login: "octocat" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("{}", { status: 404 });
+  };
+}
