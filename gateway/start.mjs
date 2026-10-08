@@ -399,6 +399,11 @@ export async function start({
 }
 
 async function main() {
+  // Everything this container persists is the operator's own state (accounts,
+  // session key, credentials, attachments): private by default. The gateway's
+  // writes already set explicit modes; this catches everything else, including
+  // the runtime and agent children, which inherit it.
+  process.umask(0o077);
   try {
     await start();
   } catch (error) {

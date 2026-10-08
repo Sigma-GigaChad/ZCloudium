@@ -1,0 +1,732 @@
+From 3bc96f7db547d08098ade8faaf0e1790981d0b76 Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Thu, 8 Oct 2026 14:01:55 +0200
+Subject: [PATCH 1/2] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
+ =?UTF-8?q?=20SSH-only=20remote=20workspaces,=20staged=20attachments,=20wo?=
+ =?UTF-8?q?rking=20MCP=20settings?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. /ws/remote/:id exposes the complete remote channel set (the same
+   ProxyChannel.toService service proxies RemoteServiceAccess builds) instead
+   of four services; the remote connection is disposed when the browser socket
+   closes, and POST /api/dispose-remote/:id releases an attached connection.
+   Ticket ids come from randomUUID. Web platform.connectRemote drives the
+   upstream HTTP contract: POST /api/connect-remote, WS attach on the ticket,
+   renderer-side session registration with the resolved target.
+
+2. The remote wizard offers SSH only in web: Docker and WSL connect to the
+   machine running the client, which only the desktop has (isDesktop gate).
+
+3. POST /api/stage-attachment writes uploaded bytes into the agent's own
+   space ({dataRoot}/tmp/paste-attachments/YYYY-MM-DD, dir 0700, file 0600 —
+   the desktop temp-text writer's layout) and returns a real agent-readable
+   path. The web platform's createTempTextAttachment uses it, and the composer
+   stages binary files that have no inlinable content, so zip/docx/... become
+   real files instead of a send-time failure. The 20 MiB protocol cap stands.
+
+4. MCP settings work in web: the platform's load/save delegate to the
+   server-side mcp-sync channel (already exposed to web clients), which
+   reads/writes the agent's own ~/.zcode/cli/config.json atomically.
+---
+ packages/server/src/attachmentStage.ts        |  73 +++++++++++
+ packages/server/src/http.ts                   |  47 +++++--
+ packages/server/src/remoteBridge.ts           | 122 ++++++++++++++++++
+ packages/ui/src/Root.tsx                      |   1 +
+ packages/ui/src/SSHDialog.tsx                 |   3 +
+ .../ui/src/hooks/useRemoteConnectionForm.ts   |  14 +-
+ packages/ui/src/lib/chatAttachments.ts        |  23 ++++
+ .../src/v4/composer/useComposerAttachments.ts |  38 +++++-
+ packages/web/src/main.tsx                     |  98 +++++++++++---
+ 9 files changed, 379 insertions(+), 40 deletions(-)
+ create mode 100644 packages/server/src/attachmentStage.ts
+ create mode 100644 packages/server/src/remoteBridge.ts
+
+diff --git a/packages/server/src/attachmentStage.ts b/packages/server/src/attachmentStage.ts
+new file mode 100644
+index 0000000..f80118a
+--- /dev/null
++++ b/packages/server/src/attachmentStage.ts
+@@ -0,0 +1,73 @@
++import { randomUUID } from "node:crypto";
++import { mkdir, writeFile } from "node:fs/promises";
++import { basename, extname, join } from "node:path";
++import type { Hono } from "hono";
++import { getZCodeDataRootDir } from "@zcode/services/node";
++
++/**
++ * Stage an attachment into the server's own filesystem.
++ *
++ * The web composer uploads bytes over this route instead of carrying a local
++ * path like the desktop does: the browser has no filesystem, and the agent
++ * runs on THIS machine, so a file written here is exactly what the desktop's
++ * temp-text writer produces on its host — a real, agent-readable path.
++ *
++ * Layout and permissions mirror the desktop writer deliberately:
++ * `{dataRoot}/tmp/paste-attachments/YYYY-MM-DD/<safe-name>-<uuid8><ext>`,
++ * directories 0700, files 0600. Staged files are the operator's own pasted or
++ * uploaded content, and must not become readable by anyone but the agent's
++ * user.
++ */
++
++/** Same ceiling as the chat upload protocol (attachmentMaxBytes, 20 MiB). */
++export const STAGE_MAX_BYTES = 20 * 1024 * 1024;
++
++const SAFE_NAME = /[^a-zA-Z0-9._-]+/g;
++
++export function sanitizeStagedFilename(raw: string): string {
++  const base = basename(String(raw ?? "")).trim() || "attachment";
++  const stem = base.slice(0, 64).replace(SAFE_NAME, "-").replace(/^[-.]+/, "") || "attachment";
++  const ext = extname(stem).slice(0, 16);
++  return `${stem.slice(0, stem.length - ext.length) || "attachment"}-${randomUUID().slice(0, 8)}${ext}`;
++}
++
++export function stagedAttachmentDir(now = new Date()): string {
++  const day = now.toISOString().slice(0, 10);
++  return join(getZCodeDataRootDir(), "tmp", "paste-attachments", day);
++}
++
++export async function stageAttachmentBytes(
++  name: string,
++  bytes: Uint8Array,
++): Promise<{ filename: string; path: string; sizeBytes: number }> {
++  if (bytes.byteLength > STAGE_MAX_BYTES) {
++    throw new Error(`Attachment exceeds the ${Math.floor(STAGE_MAX_BYTES / 1024 / 1024)} MiB web limit`);
++  }
++  const filename = sanitizeStagedFilename(name);
++  const dir = stagedAttachmentDir();
++  await mkdir(dir, { recursive: true, mode: 0o700 });
++  const path = join(dir, filename);
++  await writeFile(path, bytes, { mode: 0o600 });
++  return { filename, path, sizeBytes: bytes.byteLength };
++}
++
++export function registerAttachmentStageRoutes(app: Hono): void {
++  // The body is the raw file (octet-stream) or raw text; the query carries the
++  // client-side filename for extension and display. 413 past the protocol cap.
++  app.post("/api/stage-attachment", async (c) => {
++    const bytes = new Uint8Array(await c.req.arrayBuffer());
++    if (bytes.byteLength === 0) {
++      return c.json({ error: "Empty attachment" }, 400);
++    }
++    if (bytes.byteLength > STAGE_MAX_BYTES) {
++      return c.json({ error: `Attachment exceeds the ${Math.floor(STAGE_MAX_BYTES / 1024 / 1024)} MiB web limit` }, 413);
++    }
++    try {
++      const staged = await stageAttachmentBytes(c.req.query("name") ?? "attachment", bytes);
++      return c.json(staged);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      return c.json({ error: message }, 500);
++    }
++  });
++}
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index 8c38f91..357c7ef 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -19,10 +19,6 @@ import {
+   ServiceCollection,
+   IZCodeAgentService,
+   createZCodeAgentConnectionScope,
+-  IFileService,
+-  IGitService,
+-  ISystemService,
+-  ITerminalService,
+   IBotsService,
+   IProviderProvisioningTargetService,
+ } from "@zcode/services";
+@@ -39,6 +35,8 @@ import {
+   type ServerRemoteWorkspaceInfo,
+ } from "@zcode/shared";
+ import { connectRemote, createRemoteBackend, type RemoteConnection } from "./remote/index.js";
++import { remoteServiceCollection } from "./remoteBridge.js";
++import { registerAttachmentStageRoutes } from "./attachmentStage.js";
+ import { createHostCapabilityStore } from "./hostCapability.js";
+ 
+ function wrapWebSocket(ws: WebSocket): ISocket {
+@@ -127,8 +125,13 @@ function setupChannelServer(
+ /** 存储 web 模式下的远程连接，key 为随机 ID */
+ const remoteConnections = new Map<string, RemoteConnection>();
+ 
++/** ticket 消费后、WS 尚未断开的远程连接；dispose 端点按 id 找到它们 */
++const attachedRemoteConnections = new Map<string, { connection: RemoteConnection; ws: WebSocket }>();
++
++// zcloudium: randomUUID instead of Math.random — the id guards a full remote
++// control capability, so it should be unguessable, not merely unique.
+ function generateId(): string {
+-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
++  return randomUUID();
+ }
+ 
+ interface HttpServerOptions {
+@@ -366,6 +369,24 @@ export function createHttpServer(
+     }
+   });
+ 
++  // zcloudium: le compositeur web dépose ici les pièces jointes binaires ou le
++  // texte collé — écrits dans l'espace de l'agent, avec un vrai chemin.
++  registerAttachmentStageRoutes(app);
++
++  // zcloudium: 显式释放一条已 attach 的远程连接（web 端 disposeRemoteSession 调用）。
++  // 关闭 WS 会触发上面的 close 处理，这里主动 dispose 保证两次都幂等。
++  app.post("/api/dispose-remote/:id", (c) => {
++    const id = c.req.param("id");
++    const attached = attachedRemoteConnections.get(id);
++    if (!attached) {
++      return c.json({ ok: false }, 404);
++    }
++    attachedRemoteConnections.delete(id);
++    attached.ws.close();
++    attached.connection.dispose();
++    return c.json({ ok: true });
++  });
++
+   const handleBotCallback = async (c: Context) => {
+     const provider = c.req.param("provider") as BotProvider;
+     if (!botProviders.includes(provider)) {
+@@ -432,14 +453,18 @@ export function createHttpServer(
+           // 一个连接只给一个 WS 客户端使用，取出后从 Map 移除
+           remoteConnections.delete(id);
+ 
+-          // 将远程 services 包装为 ServiceCollection，复用 exposeOnChannelServer 统一注册
+-          const remoteServices = new ServiceCollection()
+-            .register(IFileService, connection.services.fileService)
+-            .register(IGitService, connection.services.gitService)
+-            .register(ISystemService, connection.services.systemService)
+-            .register(ITerminalService, connection.services.terminalService);
++          // zcloudium: 桥接远端 host 暴露的全部 channels（见 remoteBridge.ts），
++          // 浏览器拿到的 accessor 与桌面端一致，web 模式才能打开远程 workspace。
++          const remoteServices = remoteServiceCollection(connection);
+ 
+           setupChannelServer(ws.raw as WebSocket, remoteServices, "web-remote-replayable");
++          // zcloudium: ticket 消费后连接只由这条 WS 持有：浏览器断开（刷新/取消）
++          // 即释放远端连接，否则 SSH backend 与远端 server 进程会一直挂着。
++          attachedRemoteConnections.set(id, { connection, ws: ws.raw as WebSocket });
++          (ws.raw as WebSocket).on("close", () => {
++            attachedRemoteConnections.delete(id);
++            connection.dispose();
++          });
+         },
+       };
+     }),
+diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
+new file mode 100644
+index 0000000..1aff54c
+--- /dev/null
++++ b/packages/server/src/remoteBridge.ts
+@@ -0,0 +1,122 @@
++import { ProxyChannel, type IChannel } from "@zcode/rpc";
++import {
++  ServiceCollection,
++  IBotsService,
++  IBroadcastService,
++  IClientConfigService,
++  IClientScenesService,
++  ICodingPlanSubscriptionService,
++  ICommandsService,
++  IConversationShareService,
++  ICredentialService,
++  ICuaPermissionService,
++  IFeedbackService,
++  IFileService,
++  IFileWatcherService,
++  IGitCheckpointService,
++  IGitService,
++  IHooksService,
++  IMcpSyncService,
++  IMediaPreviewService,
++  IMemoryService,
++  IModelSelectionService,
++  IOAuthService,
++  IOffPeakTaskService,
++  IOnboardingRecordService,
++  IPluginManagementService,
++  IPluginsService,
++  IPluginSyncService,
++  IPromptAttachmentTransferService,
++  IProviderSettingsService,
++  ISkillsService,
++  ISkillSyncService,
++  ISettingService,
++  ISettingsSyncService,
++  ISubagentsService,
++  ISystemService,
++  ITerminalService,
++  IUsageStatsService,
++  IWindowControllerService,
++  IZCodeAgentService,
++  IZCodeSessionService,
++  IZCodeTaskService,
++  type ServiceDescriptor,
++} from "@zcode/services";
++import type { RemoteConnection } from "./remote/index.js";
++
++/**
++ * Bridge the full remote service set onto a local WebSocket.
++ *
++ * `/ws/remote/:id` used to expose only four services, which is why web mode
++ * could not open a remote workspace: the renderer needs the same accessor the
++ * desktop one has. This mirrors the channel list of `RemoteServiceAccess`
++ * (packages/client/src/remoteServiceAccess.ts) one for one, registering
++ * service-shaped proxies over the connection's channel client — the same
++ * objects upstream's accessor builds, so `exposeOnChannelServer` can wrap them
++ * exactly like it wraps local services.
++ *
++ * `IProviderProvisioningTargetService` is deliberately absent, like on the
++ * desktop renderer boundary: provisioning carries cross-Environment
++ * credentials and is a trusted-host-only capability (see the override in
++ * setupChannelServer).
++ */
++export function remoteServiceCollection(connection: RemoteConnection): ServiceCollection {
++  const descriptors: ServiceDescriptor<unknown>[] = [
++    IFileService,
++    IMediaPreviewService,
++    IGitService,
++    IGitCheckpointService,
++    ISystemService,
++    ITerminalService,
++    ISettingService,
++    IOnboardingRecordService,
++    ICredentialService,
++    IBroadcastService,
++    IZCodeTaskService,
++    IWindowControllerService,
++    IZCodeAgentService,
++    IZCodeSessionService,
++    ICuaPermissionService,
++    IConversationShareService,
++    IBotsService,
++    IFileWatcherService,
++    IOAuthService,
++    IProviderSettingsService,
++    IModelSelectionService,
++    IUsageStatsService,
++    ICodingPlanSubscriptionService,
++    IClientConfigService,
++    IClientScenesService,
++    IOffPeakTaskService,
++    ISkillsService,
++    ISkillSyncService,
++    IMcpSyncService,
++    IPluginSyncService,
++    IPluginsService,
++    IPluginManagementService,
++    ISubagentsService,
++    ICommandsService,
++    IHooksService,
++    IMemoryService,
++    ISettingsSyncService,
++    IFeedbackService,
++    IPromptAttachmentTransferService,
++  ];
++
++  const collection = new ServiceCollection();
++  for (const descriptor of descriptors) {
++    // Register service-shaped proxies, the same shape exposeOnChannelServer
++    // expects (it wraps every value in ProxyChannel.fromService, which
++    // dispatches by method name on the object): a raw {call, listen} channel
++    // adapter would die on the first RPC with "Method not found". toService
++    // proxies round-trip through fromService: method access becomes a call,
++    // on* access a buffered listen.
++    collection.register(
++      descriptor,
++      ProxyChannel.toService<Record<string, unknown>>(
++        connection.client.getChannel<IChannel>(descriptor.channelName),
++      ),
++    );
++  }
++  return collection;
++}
+diff --git a/packages/ui/src/Root.tsx b/packages/ui/src/Root.tsx
+index 659b751..97c4719 100644
+--- a/packages/ui/src/Root.tsx
++++ b/packages/ui/src/Root.tsx
+@@ -851,6 +851,7 @@ function RootInner({
+       onSelectProject={handleSelectRemoteProject}
+       onCancelSession={handleCancelRemoteProject}
+       localWorkspacePath={localWorkspacePathForRemoteConnection}
++      isDesktop={isDesktop}
+       isWindowsDesktop={isWindowsDesktop}
+       remoteWorkspaceSessions={remoteWorkspaceSessions}
+       open={remoteConnectionDialogOpen}
+diff --git a/packages/ui/src/SSHDialog.tsx b/packages/ui/src/SSHDialog.tsx
+index f252336..bf7b72f 100644
+--- a/packages/ui/src/SSHDialog.tsx
++++ b/packages/ui/src/SSHDialog.tsx
+@@ -55,6 +55,7 @@ interface RemoteConnectionDialogProps {
+   open?: boolean;
+   onOpenChange?: (open: boolean) => void;
+   hideTriggerWhenClosed?: boolean;
++  isDesktop?: boolean;
+   isWindowsDesktop?: boolean;
+   remoteWorkspaceSessions?: RemoteWorkspaceSessionEntry[];
+   onFlowActiveChange?: (active: boolean) => void;
+@@ -75,6 +76,7 @@ export function RemoteConnectionDialog({
+   open: controlledOpen,
+   onOpenChange,
+   hideTriggerWhenClosed = false,
++  isDesktop = false,
+   isWindowsDesktop = false,
+   remoteWorkspaceSessions = [],
+   onFlowActiveChange,
+@@ -139,6 +141,7 @@ export function RemoteConnectionDialog({
+     currentRuntimeOptionsError,
+   } = useRemoteConnectionForm({
+     open,
++    isDesktop,
+     isWindowsDesktop,
+     preferredKind,
+     preferredWslDistro,
+diff --git a/packages/ui/src/hooks/useRemoteConnectionForm.ts b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+index 865316a..b9acea2 100644
+--- a/packages/ui/src/hooks/useRemoteConnectionForm.ts
++++ b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+@@ -16,7 +16,7 @@ import {
+ type RemoteKind = RemoteTarget["kind"];
+ export type SSHAuthMethod = "password" | "privateKey";
+ 
+-function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
++function buildAvailableKinds(options: { isDesktop: boolean; isWindowsDesktop: boolean }): RemoteKind[] {
+   const kinds: RemoteKind[] = ["ssh"];
+   // 远程连接入口里 WSL 和 SSH 同属主机类连接。
+   // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
+@@ -26,17 +26,23 @@ function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind
+   // Docker入口之前完全依赖预探测结果决定是否展示。
+   // 当探测能力暂时不可用、或用户还没切到 Docker 时，入口会直接消失，
+   // 用户甚至不知道这里支持 Docker 连接。改为始终展示入口，切换后再懒加载探测结果。
+-  kinds.push("docker");
++  // zcloudium: Docker/WSL 连接的是运行客户端的本机——只有桌面端才有“本机”。
++  // Web 向导保持 SSH-only，避免展示一个探测必然为空的入口。
++  if (options.isDesktop) {
++    kinds.push("docker");
++  }
+   return kinds;
+ }
+ 
+ export function useRemoteConnectionForm({
+   open,
++  isDesktop,
+   isWindowsDesktop,
+   preferredKind,
+   preferredWslDistro,
+ }: {
+   open: boolean;
++  isDesktop: boolean;
+   isWindowsDesktop: boolean;
+   preferredKind?: RemoteKind;
+   preferredWslDistro?: string;
+@@ -75,8 +81,8 @@ export function useRemoteConnectionForm({
+   const dockerOptionsActiveLoadIdRef = useRef(0);
+   const dockerOptionsInFlightLoadIdRef = useRef<number | null>(null);
+   const availableKinds = useMemo(
+-    () => buildAvailableKinds({ isWindowsDesktop }),
+-    [isWindowsDesktop],
++    () => buildAvailableKinds({ isDesktop, isWindowsDesktop }),
++    [isDesktop, isWindowsDesktop],
+   );
+ 
+   useEffect(() => {
+diff --git a/packages/ui/src/lib/chatAttachments.ts b/packages/ui/src/lib/chatAttachments.ts
+index c1612a7..ccaa6a1 100644
+--- a/packages/ui/src/lib/chatAttachments.ts
++++ b/packages/ui/src/lib/chatAttachments.ts
+@@ -58,6 +58,29 @@ export interface ChatComposerAttachment {
+ 
+ const PDF_MIME_TYPE = "application/pdf";
+ 
++/**
++ * zcloudium: en web, un fichier qui n'a ni chemin local ni contenu inlinable
++ * (image/vidéo/PDF/texte) échouerait au moment de l'envoi. Ceux-là sont
++ * déposés au préalable dans l'espace de l'agent via /api/stage-attachment,
++ * qui rend un vrai chemin — les autres suivent le flux inline existant.
++ */
++export function isWebStageableAttachment(attachment: {
++  filename: string;
++  mimeType: string;
++  file?: File;
++}): boolean {
++  const mimeType = normalizeComposerMimeType(
++    attachment.mimeType || inferAttachmentMimeType(attachment.filename),
++  );
++  if (mimeType.startsWith("image/") || mimeType.startsWith("video/") || mimeType === PDF_MIME_TYPE) {
++    return false;
++  }
++  if (attachment.file && isTextLikeAttachment(attachment)) {
++    return false;
++  }
++  return true;
++}
++
+ function normalizeComposerMimeType(mimeType: string): string {
+   const normalized = mimeType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+   return normalized === PDF_MIME_TYPE ? PDF_MIME_TYPE : mimeType;
+diff --git a/packages/ui/src/v4/composer/useComposerAttachments.ts b/packages/ui/src/v4/composer/useComposerAttachments.ts
+index 1e0377c..252c211 100644
+--- a/packages/ui/src/v4/composer/useComposerAttachments.ts
++++ b/packages/ui/src/v4/composer/useComposerAttachments.ts
+@@ -14,6 +14,7 @@ import {
+   createClipboardTextAttachmentFilenameForDate,
+   createClipboardTextPathComposerAttachment,
+   formatAttachmentSize,
++  isWebStageableAttachment,
+   revokeChatComposerAttachment,
+   serializeChatComposerAttachment,
+   shouldCreateClipboardTextAttachment,
+@@ -679,8 +680,9 @@ export function useComposerAttachments(
+ 
+   const addAttachmentFiles = useCallback(
+     (selectedFiles: File[]) => {
+-      addPreparedAttachments(
+-        selectedFiles.map((file) => {
++      void (async () => {
++        const prepared: ChatComposerAttachment[] = [];
++        for (const file of selectedFiles) {
+           let localPath: string | undefined;
+           try {
+             const resolvedPath = platform.getPathForFile?.(file);
+@@ -689,9 +691,35 @@ export function useComposerAttachments(
+             // Electron 32+ 的 File 需要经 preload webUtils 解析；失败时仍可走 Web bytes。
+             logger.warn("[v4-composer-attachments] 解析附件本地路径失败", error);
+           }
+-          return createChatComposerAttachment(file, localPath);
+-        }),
+-      );
++          const attachment = createChatComposerAttachment(file, localPath);
++          // zcloudium: en web, les binaires (zip, docx…) n'ont ni chemin ni
++          // contenu inlinable — on les dépose dans l'espace de l'agent, qui
++          // reçoit un vrai chemin de fichier au lieu d'un échec à l'envoi.
++          if (!attachment.localPath && attachment.file && isWebStageableAttachment(attachment)) {
++            try {
++              const bytes = new Uint8Array(await attachment.file.arrayBuffer());
++              const response = await fetch(
++                `/api/stage-attachment?name=${encodeURIComponent(file.name)}`,
++                { method: "POST", headers: { "content-type": "application/octet-stream" }, body: bytes },
++              );
++              if (response.ok) {
++                const staged = (await response.json()) as { path: string; sizeBytes: number };
++                attachment.localPath = staged.path;
++                attachment.sizeBytes = staged.sizeBytes;
++              } else {
++                const body = (await response.json().catch(() => ({}))) as { error?: string };
++                logger.warn(
++                  `[v4-composer-attachments] staging refusé (${response.status}): ${body.error ?? ""}`,
++                );
++              }
++            } catch (error) {
++              logger.warn("[v4-composer-attachments] staging impossible", error);
++            }
++          }
++          prepared.push(attachment);
++        }
++        addPreparedAttachments(prepared);
++      })();
+     },
+     [addPreparedAttachments, platform],
+   );
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 052eab8..9eb9b43 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -6,6 +6,7 @@ import {
+   ZCodeIntlProvider,
+   generateMobileDeviceFingerprint,
+   playTaskNotificationSound,
++  registerRemoteWorkspaceSession,
+   setStreamClientId,
+   type Theme,
+ } from "@zcode/ui";
+@@ -17,6 +18,7 @@ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOA
+ import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
+ import { resolveWebCommunityUrl, resolveWebHelpConfig } from "./communityUrl.js";
+ import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
++import { stripRemoteTargetSecrets } from "@zcode/shared";
+ import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
+ 
+ function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
+@@ -99,7 +101,10 @@ function renderWebAuthCallbackPage(): void {
+   );
+ }
+ 
+-function createWebPlatform(): IPlatformService {
++/** The accessor connectViaWebSocket resolves to, without importing @zcode/services. */
++type WebServices = Awaited<ReturnType<typeof connectViaWebSocket>>;
++
++function createWebPlatform(services: WebServices): IPlatformService {
+   return {
+     canSelectFilePath: false,
+     // Web 端无法打开系统目录选择框
+@@ -108,34 +113,87 @@ function createWebPlatform(): IPlatformService {
+     selectFile: () => Promise.resolve(null),
+     selectFiles: () => Promise.resolve([]),
+     getPathForFile: () => null,
+-    createTempTextAttachment: () =>
+-      Promise.reject(new Error("Temporary text attachments require a desktop host")),
++    // zcloudium: le serveur écrit le texte dans son propre espace (.zcode/tmp),
++    // lisible par l'agent — le même contrat que l'écrivain desktop.
++    async createTempTextAttachment(payload) {
++      const response = await fetch(
++        `/api/stage-attachment?name=${encodeURIComponent(payload.filename ?? "paste.txt")}`,
++        { method: "POST", headers: { "content-type": "text/plain; charset=utf-8" }, body: payload.text },
++      );
++      const body = (await response.json().catch(() => ({}))) as { filename?: string; path?: string; sizeBytes?: number; error?: string };
++      if (!response.ok || !body.path) {
++        throw new Error(body.error ?? `Failed to stage the pasted text (${response.status})`);
++      }
++      return {
++        filename: body.filename ?? "paste.txt",
++        localPath: body.path,
++        mimeType: "text/plain",
++        sizeBytes: body.sizeBytes ?? payload.text.length,
++      };
++    },
+     onRemoteConnectionLog: () => () => {},
+     onRemoteSessionClosed: () => () => {},
+     onBotRemoteWorkspaceReconnected: () => () => {},
+     // Web 端无多窗口管理
+     activateOrSetWorkspace: () => Promise.resolve({ activated: false }),
+-    // TODO(web-remote-workspace): 普通 Web 模式先只保证 server 本地工作区可用。
+-    // 远程 WebSocket 只暴露部分 service，与 Root/RemoteServiceAccess 需要的完整
+-    // accessor 不匹配，直接打开 ?remote=<id> 会在项目向导或首屏卡住。
+-    connectRemote(options: RemoteTarget) {
+-      return Promise.resolve({
+-        success: false,
+-        error: `Remote connect is not supported in Web mode yet: ${options.kind}`,
+-      });
++    // zcloudium: le contrat upstream prévoit « Web: HTTP API » — POST
++    // /api/connect-remote établit la connexion côté serveur et rend un ticket
++    // one-shot ; l'accessor complet est servi sur /ws/remote/<ticket>, et la
++    // session est enregistrée côté renderer comme sur desktop (cible résolue,
++    // secrets strippés, pour que l'historique se reconnecte au même hôte).
++    async connectRemote(options: RemoteTarget) {
++      try {
++        const response = await fetch("/api/connect-remote", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify(options),
++        });
++        const payload = (await response.json().catch(() => ({}))) as { id?: string; error?: string };
++        if (!response.ok || !payload.id) {
++          return {
++            success: false,
++            error: payload.error ?? `Remote connect failed (${response.status})`,
++          };
++        }
++        const sessionId = payload.id;
++        const remoteServices = await connectViaWebSocket(
++          `${resolveDefaultWsOrigin()}/ws/remote/${sessionId}`,
++          { onClose: () => {} },
++        );
++        registerRemoteWorkspaceSession({
++          sessionId,
++          target: stripRemoteTargetSecrets(options),
++          services: remoteServices,
++        });
++        return { success: true, sessionId };
++      } catch (error) {
++        return {
++          success: false,
++          error: error instanceof Error ? error.message : String(error),
++        };
++      }
+     },
+     cancelPendingRemoteConnection: (_requestId?: string) => Promise.resolve(),
+-    disposeRemoteSession: () => Promise.resolve(),
++    async disposeRemoteSession(sessionId: string) {
++      await fetch(`/api/dispose-remote/${encodeURIComponent(sessionId)}`, {
++        method: "POST",
++      }).catch(() => undefined);
++    },
+     isDockerAvailable: () => Promise.resolve(false),
+     listWSLDistros: () => Promise.resolve([]),
+     listDockerContainers: () => Promise.resolve([]),
+     listSSHConfigAliases: () => Promise.resolve([]),
+-    loadMcpFromUserDirectory: () => Promise.resolve({ servers: [] }),
+-    saveMcpToUserDirectory: () =>
+-      Promise.resolve({
+-        success: false,
+-        error: "MCP native directory management requires a desktop attachment",
+-      }),
++    // zcloudium: délégation au canal mcp-sync, déjà exposé aux clients web —
++    // la page MCP liste et persiste dans le config.json de l'agent.
++    loadMcpFromUserDirectory: (request) => services.mcpSyncService.loadMcpFromUserDirectory(request),
++    saveMcpToUserDirectory: async (request) => {
++      try {
++        await services.mcpSyncService.saveMcpToUserDirectory(request);
++        return { success: true };
++      } catch (error) {
++        return { success: false, error: error instanceof Error ? error.message : String(error) };
++      }
++    },
+     migrateLegacyCommonMcp: () =>
+       Promise.resolve({
+         servers: {},
+@@ -352,7 +410,7 @@ async function bootstrapWebApp() {
+     const services = await connectViaWebSocket(bootstrap.wsUrl, {
+       onClose: () => {},
+     });
+-    const platform = createWebPlatform();
++    const platform = createWebPlatform(services);
+     document.title = "ZCodium - Web + Server";
+ 
+     root.render(
+@@ -371,7 +429,7 @@ async function bootstrapWebApp() {
+             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
+             preferDirectoryBrowser
+             supportsEmbeddedBrowser={false}
+-            allowRemoteWorkspace={false}
++            allowRemoteWorkspace
+           />
+         </ZCodeIntlProvider>
+       </AppErrorBoundary>,
+-- 
+2.56.0
+
+
+From c1905e69e76b420fffcd9d6ddbfe2f7e3b533518 Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Thu, 8 Oct 2026 14:46:52 +0200
+Subject: [PATCH 2/2] zcloudium: reject oversized staging by declared length,
+ catch the composer staging loop
+
+---
+ packages/server/src/attachmentStage.ts                | 6 ++++++
+ packages/ui/src/v4/composer/useComposerAttachments.ts | 4 +++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/packages/server/src/attachmentStage.ts b/packages/server/src/attachmentStage.ts
+index f80118a..b9872b2 100644
+--- a/packages/server/src/attachmentStage.ts
++++ b/packages/server/src/attachmentStage.ts
+@@ -55,6 +55,12 @@ export function registerAttachmentStageRoutes(app: Hono): void {
+   // The body is the raw file (octet-stream) or raw text; the query carries the
+   // client-side filename for extension and display. 413 past the protocol cap.
+   app.post("/api/stage-attachment", async (c) => {
++    // Reject before buffering: the cap is checked again after the read, but
++    // an honest content-length spares the memory entirely.
++    const declared = Number(c.req.header("content-length") ?? 0);
++    if (Number.isFinite(declared) && declared > STAGE_MAX_BYTES) {
++      return c.json({ error: `Attachment exceeds the ${Math.floor(STAGE_MAX_BYTES / 1024 / 1024)} MiB web limit` }, 413);
++    }
+     const bytes = new Uint8Array(await c.req.arrayBuffer());
+     if (bytes.byteLength === 0) {
+       return c.json({ error: "Empty attachment" }, 400);
+diff --git a/packages/ui/src/v4/composer/useComposerAttachments.ts b/packages/ui/src/v4/composer/useComposerAttachments.ts
+index 252c211..59fc67a 100644
+--- a/packages/ui/src/v4/composer/useComposerAttachments.ts
++++ b/packages/ui/src/v4/composer/useComposerAttachments.ts
+@@ -719,7 +719,9 @@ export function useComposerAttachments(
+           prepared.push(attachment);
+         }
+         addPreparedAttachments(prepared);
+-      })();
++      })().catch((error) => {
++        logger.warn("[v4-composer-attachments] 附件添加失败", error);
++      });
+     },
+     [addPreparedAttachments, platform],
+   );
+-- 
+2.56.0
+

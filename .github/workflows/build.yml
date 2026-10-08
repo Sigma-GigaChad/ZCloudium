@@ -2,17 +2,22 @@ name: build-image
 
 # Builds the image and publishes it to GHCR.
 #
-# The pins live in zcode.version and zcode.sha256, and this workflow is one of
-# the three places that turn them into build arguments. The Dockerfile refuses a
-# build that is missing one, so no pin can be forgotten silently.
+# The published image is the PRODUCT: the runtime is compiled from the pinned
+# ZCodium revision with the patch series in patches/, because the web
+# essentials (Remote SSH from the web client — SSH only —, staged attachments,
+# working MCP settings) do not exist in the vendor tarball. Dockerfile.from-source carries the same
+# gateway, entrypoint and probe as the precompiled path, refuses an empty patch
+# set, applies the series with a check pass, exercises the RPC bridge over two
+# in-memory hops, and greps one server route and one web string in the
+# extracted artefacts — a build that silently missed the patches cannot exist.
 #
-# The Dockerfile also verifies the integrity of the runtime itself (sha256
-# pinned in the repository, setuid scan) and refuses to build on a mismatch.
+# The version still comes from zcode.version, and the runtime version the image
+# carries is compared against it in the smoke job; the pin is the source
+# revision, labelled with its exact commit.
 #
 # A `smoke` job then pulls the published image into a real container and checks
 # that the gateway answers and that the interface sits behind it: an image is
-# not shipped without having been started. It also proves the persistence
-# pre-check refuses a container launched without volumes.
+# not shipped without having been started.
 
 on:
   push:
@@ -38,23 +43,33 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The single place that reads the pins. `list` is what the build step
-      # passes as build arguments, in the shape docker/build-push-action reads.
+      # The single place that reads the pins. The version tag is what the build
+      # passes as ZCODE_REF; the exact commit is resolved for the revision
+      # label, the same way build.sh --from-source does.
       - name: Read the pins
         id: version
         run: |
           tag="$(tr -d '[:space:]' < zcode.version)"
           sha="$(tr -d '[:space:]' < zcode.sha256)"
+          if [ -z "$(ls patches/*.patch 2>/dev/null)" ]; then
+            echo "patches/ carries no .patch file; the from-source build would be refused anyway." >&2
+            exit 1
+          fi
+          commit="$(git ls-remote https://github.com/ZCodium-project/ZCodium.git "refs/tags/${tag}^{}" | awk '{print $1}')"
+          commit="${commit:-$(git ls-remote https://github.com/ZCodium-project/ZCodium.git "refs/tags/${tag}" | awk '{print $1}')}"
+          if [ -z "$commit" ]; then
+            echo "Tag ${tag} not found on ZCodium-project/ZCodium." >&2
+            exit 1
+          fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           {
             echo "list<<EOF"
-            echo "ZCODIUM_VERSION=${tag}"
-            echo "TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/${tag}/zcodium-${tag#v}.tar.gz"
-            echo "TARBALL_SHA256=${sha}"
+            echo "ZCODE_REF=${tag}"
+            echo "ZCODE_COMMIT=${commit}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "Pinned runtime: ${tag} (sha256 ${sha})"
+          echo "Pinned runtime: ${tag} @ ${commit} (sha256 pin ${sha} still guards the precompiled path)"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -69,6 +84,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ./Dockerfile.from-source
           push: true
           build-args: ${{ steps.version.outputs.list }}
           tags: |
@@ -149,6 +165,17 @@ jobs:
           runtime="$(docker exec smoke node /opt/zcodium/bin/zcode.mjs --version)"
           echo "runtime: ${runtime}"
           test "${runtime}" = "${{ needs.build.outputs.version }}"
+
+      # The published image must be the patched one: the remote workspace
+      # features are the reason the from-source path exists, and the vendor
+      # tarball does not carry them. Two markers, one on each side.
+      - name: Check that the image carries the patch series
+        run: |
+          server="$(docker exec smoke grep -c 'api/stage-attachment' /opt/zcodium/server/entry-http.js)"
+          web="$(docker exec smoke sh -c 'grep -l api/connect-remote /opt/zcodium/web/assets/*.js | head -1')"
+          echo "server markers: ${server}, web marker: ${web}"
+          test "${server}" -ge 1
+          test -n "${web}"
 
       - name: Cleanup
         if: always()

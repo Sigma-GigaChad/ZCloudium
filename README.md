@@ -38,9 +38,12 @@ browser                                             ┌┴───────�
   container is disposable by construction, and heavier work belongs on a
   dedicated machine reached with ZCode's Remote SSH from the desktop app.
 
-The runtime is the ZCodium fork's, pinned to a release and shipped exactly as
-the fork publishes it — no runtime patches. The gateway is an additive layer:
-it imports no application code and an upstream update cannot break it.
+The runtime is the ZCodium fork's, pinned to a release, compiled from source
+with a small reviewed patch series that enables the web essentials: **Remote
+SSH from the browser** (SSH only), **staged web attachments** (real files in
+the agent's space, not just inline images), and a **working MCP settings
+page** — ([patches/README.md](patches/README.md)). The gateway is an additive
+layer: it imports no application code and an upstream update cannot break it.
 
 ## Quick start
 
@@ -119,13 +122,14 @@ read, not an accident.
 
 The agent in the container works in `/workspace` — that is the sandbox. To
 work on real projects, ZCode's own **Remote SSH** feature points it at a
-dedicated development machine, from the desktop application. The container
-stays disposable; the machine owns its credentials and its hardening; nothing
-needs to be widened here.
-
-The stock web interface does not open remote connections (the runtime answers
-*not supported in Web mode yet*): the workspace it serves is the container's.
-That is a feature of the sandbox, not a gap to work around.
+dedicated development machine — from the wizard's *Remote connection* dialog,
+in the browser like in the desktop app. This image enables the SSH method
+only: Docker and WSL connect to the machine running the client, which only
+the desktop has. The container stays disposable; the machine owns its
+credentials and its hardening; nothing needs to be widened here. SSH
+credentials are stored encrypted (AES-GCM, file mode 0600) on the container's
+own volume — the trust boundary documented in
+[SECURITY.md](SECURITY.md).
 
 ## Deployment profiles
 
@@ -155,17 +159,20 @@ volume itself).
 
 ## Versions and builds
 
-- `latest` on ghcr.io follows the pinned release in `zcode.version`: the
-  vendor tarball, verified against `zcode.sha256` at build time. CI publishes
-  it on every merge to `main`, and the smoke job starts the published image
-  before letting it ship.
+- `latest` on ghcr.io follows the pinned release in `zcode.version`, compiled
+  from source with the patch series; CI publishes it on every merge to `main`,
+  and the smoke job starts the published image before letting it ship — it
+  checks the runtime version against the tag, that the patch series reached
+  the artefacts, and that an unmounted container is refused.
 - Freeze a version with `image: ghcr.io/sigma-gigachad/z-cloudium:3.14.7`
   (tags: `latest`, `<version>`, `sha-<commit>`).
 - `./check-upstream.sh` compares the pin against the latest release (exit 0 or
   1); CI runs it weekly and opens an issue on a new release; `--bump` applies
-  one — it updates both pins, and nothing else.
-- Build it yourself with `./build.sh` (39 seconds, no toolchain needed: the
-  image only downloads, verifies and extracts).
+  one. Bumping includes refreshing the patch series — recipe in
+  [patches/README.md](patches/README.md).
+- Build it yourself with `./build.sh` (the product build: the compiler runs in
+  the builder stage, nothing but Docker is needed, about five minutes cold).
+  `--precompiled` exists for checks and refuses `--push`.
 
 ## Documentation
 

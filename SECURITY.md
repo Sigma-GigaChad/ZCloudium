@@ -195,7 +195,15 @@ What it does not do:
   boundary, and the budget being on disk is what makes a restart not reset it;
 - the failure counter is persisted with every change, so restarting no longer
   clears it; a block still ends after five minutes and the budget still starts
-  again after it, as before.
+  again after it, as before;
+- **SSH credentials and staged attachments live on the volume by design.**
+  Remote SSH credentials entered in the wizard are stored in
+  `<config>/credentials.json` — AES-GCM encrypted, file mode 0600, written
+  atomically; web attachments are staged under `.zcode/tmp/paste-attachments/`
+  (directory 0700, files 0600). The container runs with umask 077, so anything
+  else it writes is private to the agent's user too. Anyone who can read the
+  volume can therefore also read the SSH credentials: the volume is the trust
+  boundary, and that is exactly where the operator asked them to live.
 
 Defaults worth knowing: sessions last 12 hours (set `ZCLOUDIUM_SESSION_TTL_HOURS`
 to change it, a positive number of hours, anything else is refused and replaced
@@ -308,10 +316,13 @@ Read this before launching the full access profile.
 6. **Network egress is not filtered.** The agent can reach everything the VM
    reaches. The control that really counts against exfiltration is at the network
    level (VLAN, outbound firewall rules), not inside the container.
-7. **The runtime comes from a third party** (the ZCodium fork). Integrity is
-   verified by a pinned hash, the presence of setuid binaries is checked, but the
-   code has not been audited. The runtime is shipped exactly as the fork
-   publishes it: no line of it is patched by this project.
+7. **The runtime comes from a third party** (the ZCodium fork), and this image
+   compiles it with a small patch series (`patches/`, documented and reviewed:
+   SSH-only remote workspaces from the web client, staged web attachments,
+   working MCP settings). The series is additive and upstream-shaped, but it is
+   still this project's code running inside a third-party runtime — read
+   `patches/README.md` before trusting the boundary. Integrity of the pinned
+   sources is labelled with the exact commit.
 8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.
