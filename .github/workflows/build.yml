@@ -3,9 +3,9 @@ name: build-image
 # Builds the image and publishes it to GHCR.
 #
 # The published image is the PRODUCT: the runtime is compiled from the pinned
-# ZCodium revision with the patch series in patches/, because the remote
-# workspace features (Remote SSH from the web client, Cloud Environments) do
-# not exist in the vendor tarball. Dockerfile.from-source carries the same
+# ZCodium revision with the patch series in patches/, because the web
+# essentials (Remote SSH from the web client — SSH only —, staged attachments,
+# working MCP settings) do not exist in the vendor tarball. Dockerfile.from-source carries the same
 # gateway, entrypoint and probe as the precompiled path, refuses an empty patch
 # set, applies the series with a check pass, exercises the RPC bridge over two
 # in-memory hops, and greps one server route and one web string in the

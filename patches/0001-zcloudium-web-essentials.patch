@@ -1,9 +1,9 @@
 From 3bc96f7db547d08098ade8faaf0e1790981d0b76 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:01:55 +0200
-Subject: [PATCH] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94=20SSH?=
- =?UTF-8?q?-only=20remote=20workspaces,=20staged=20attachments,=20working?=
- =?UTF-8?q?=20MCP=20settings?=
+Subject: [PATCH 1/2] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
+ =?UTF-8?q?=20SSH-only=20remote=20workspaces,=20staged=20attachments,=20wo?=
+ =?UTF-8?q?rking=20MCP=20settings?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -680,6 +680,37 @@ index 052eab8..9eb9b43 100644
            />
          </ZCodeIntlProvider>
        </AppErrorBoundary>,
+-- 
+2.56.0
+
+
+From 226ca4d586a78afdc88df3b1e65da1ec2eaa630f Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Thu, 8 Oct 2026 14:46:52 +0200
+Subject: [PATCH 2/2] zcloudium: reject oversized staging by declared length;
+ catch composer IIFE
+
+---
+ packages/server/src/attachmentStage.ts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/packages/server/src/attachmentStage.ts b/packages/server/src/attachmentStage.ts
+index f80118a..b9872b2 100644
+--- a/packages/server/src/attachmentStage.ts
++++ b/packages/server/src/attachmentStage.ts
+@@ -55,6 +55,12 @@ export function registerAttachmentStageRoutes(app: Hono): void {
+   // The body is the raw file (octet-stream) or raw text; the query carries the
+   // client-side filename for extension and display. 413 past the protocol cap.
+   app.post("/api/stage-attachment", async (c) => {
++    // Reject before buffering: the cap is checked again after the read, but
++    // an honest content-length spares the memory entirely.
++    const declared = Number(c.req.header("content-length") ?? 0);
++    if (Number.isFinite(declared) && declared > STAGE_MAX_BYTES) {
++      return c.json({ error: `Attachment exceeds the ${Math.floor(STAGE_MAX_BYTES / 1024 / 1024)} MiB web limit` }, 413);
++    }
+     const bytes = new Uint8Array(await c.req.arrayBuffer());
+     if (bytes.byteLength === 0) {
+       return c.json({ error: "Empty attachment" }, 400);
 -- 
 2.56.0
 
