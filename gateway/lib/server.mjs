@@ -32,14 +32,6 @@ import {
   verifySession,
 } from "./session.mjs";
 import {
-  pollDeviceToken,
-  readGitHubCredentials,
-  removeGitHubCredentials,
-  requestDeviceCode,
-  validateGitHubToken,
-  writeGitHubCredentials,
-} from "./github.mjs";
-import {
   findUser,
   hasUsers,
   ownerOf,
@@ -252,8 +244,6 @@ export async function createGateway({
   tls = null,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
-  // Injectable so the GitHub token validation never touches the network in tests.
-  githubApiFetch = fetch,
 } = {}) {
   if (!dataDir) {
     throw new Error("createGateway requires a dataDir");
@@ -268,9 +258,6 @@ export async function createGateway({
   // The budget survives the process: a restarted container keeps the blocks and
   // the counts it had, which is the whole point of persisting it.
   const failures = new Map(Object.entries(await readFailures(dataDir)));
-  // Pending GitHub device flows, keyed by username: one per owner at most,
-  // gone at restart (a flow is a code that expires in minutes anyway).
-  const deviceFlows = new Map();
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
   const upgradedSockets = new Set();
@@ -765,177 +752,6 @@ export async function createGateway({
         seeOther(res, `${AUTH_PREFIX}/setup/totp`, [
           pendingCookie(PENDING_SETUP_COOKIE, pending, PENDING_TTL_SECONDS),
         ]);
-        return;
-      }
-    }
-
-    // GitHub credentials: authenticate once, in the container, and every cloud
-    // environment this container provisions inherits them. The file the page
-    // writes is the same hosts.yml gh reads, at the runtime's $HOME, so the
-    // provisioning path and the page share one source of truth.
-    if (pathname === `${AUTH_PREFIX}/github`) {
-      const session = sessionOf(req);
-      if (!session) {
-        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(`${AUTH_PREFIX}/github`)}`);
-        return;
-      }
-      const fresh = await readUsers(dataDir);
-      const owner = ownerOf(fresh);
-      const isOwner = owner !== null && owner.name === session.user;
-      if (!isOwner) {
-        html(res, 403, pages.messagePage({
-          title: "Not allowed",
-          heading: "Owner only",
-          message: "Only the owner manages the credentials that environments inherit.",
-        }));
-        return;
-      }
-
-      if (req.method === "GET") {
-        const credentials = await readGitHubCredentials(dataDir);
-        html(res, 200, pages.githubPage({
-          hasToken: credentials.present,
-          login: credentials.login,
-          saved: url.searchParams.get("saved"),
-          error: url.searchParams.get("error"),
-        }));
-        return;
-      }
-
-      if (req.method === "POST") {
-        const form = await readForm(req, maxBodyBytes);
-        if (form.remove === "1") {
-          await removeGitHubCredentials(dataDir);
-          seeOther(res, `${AUTH_PREFIX}/github`);
-          return;
-        }
-        const token = String(form.token ?? "").trim();
-        const verdict = await validateGitHubToken(token, githubApiFetch);
-        if (!verdict.ok) {
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(verdict.error)}`);
-          return;
-        }
-        await writeGitHubCredentials(dataDir, { login: verdict.login, token });
-        logger(`[auth] GitHub credentials stored for ${verdict.login}`);
-        seeOther(res, `${AUTH_PREFIX}/github?saved=${encodeURIComponent(verdict.login)}`);
-        return;
-      }
-    }
-
-    // The device flow, the same sign-in `gh auth login` runs: GitHub shows a
-    // short code, the operator types it at github.com/login/device, GitHub
-    // hands back a token, and it lands in the same hosts.yml the token form
-    // writes. State lives in memory on purpose: a flow is short lived (GitHub
-    // expires it in minutes), and a restart mid-flow just means typing a new
-    // code. Owner only — these credentials are what every environment inherits.
-    if (
-      pathname === `${AUTH_PREFIX}/github/device` ||
-      pathname === `${AUTH_PREFIX}/github/device/check` ||
-      pathname === `${AUTH_PREFIX}/github/device/cancel`
-    ) {
-      const session = sessionOf(req);
-      if (!session) {
-        redirect(res, `${AUTH_PREFIX}/login?next=${encodeURIComponent(`${AUTH_PREFIX}/github`)}`);
-        return;
-      }
-      const fresh = await readUsers(dataDir);
-      const owner = ownerOf(fresh);
-      const isOwner = owner !== null && owner.name === session.user;
-      if (!isOwner) {
-        html(res, 403, pages.messagePage({
-          title: "Not allowed",
-          heading: "Owner only",
-          message: "Only the owner manages the credentials that environments inherit.",
-        }));
-        return;
-      }
-
-      if (pathname === `${AUTH_PREFIX}/github/device/cancel`) {
-        if (req.method === "POST") {
-          deviceFlows.delete(session.user);
-          seeOther(res, `${AUTH_PREFIX}/github`);
-          return;
-        }
-      }
-
-      if (pathname === `${AUTH_PREFIX}/github/device` && req.method === "POST") {
-        const requested = await requestDeviceCode(githubApiFetch);
-        if (!requested.ok) {
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(requested.error)}`);
-          return;
-        }
-        deviceFlows.set(session.user, { ...requested, lastPollAtMs: now(), intervalSeconds: requested.intervalSeconds });
-        seeOther(res, `${AUTH_PREFIX}/github/device`);
-        return;
-      }
-
-      if (pathname === `${AUTH_PREFIX}/github/device` && req.method === "GET") {
-        const flow = deviceFlows.get(session.user);
-        if (!flow) {
-          seeOther(res, `${AUTH_PREFIX}/github`);
-          return;
-        }
-        html(res, 200, pages.githubDevicePage({
-          userCode: flow.userCode,
-          verificationUri: flow.verificationUri,
-          expiresInSeconds: Math.max(0, Math.round((flow.expiresAtMs - now()) / 1000)),
-        }));
-        return;
-      }
-
-      // The waiting page's meta refresh lands here: one poll attempt per
-      // cycle, never faster than the interval GitHub named.
-      if (pathname === `${AUTH_PREFIX}/github/device/check` && req.method === "GET") {
-        const flow = deviceFlows.get(session.user);
-        if (!flow) {
-          seeOther(res, `${AUTH_PREFIX}/github`);
-          return;
-        }
-        if (now() >= flow.expiresAtMs) {
-          deviceFlows.delete(session.user);
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent("The device code expired before it was entered. Start the sign-in again.")}`);
-          return;
-        }
-        if (now() - flow.lastPollAtMs < flow.intervalSeconds * 1000) {
-          seeOther(res, `${AUTH_PREFIX}/github/device`);
-          return;
-        }
-        flow.lastPollAtMs = now();
-        if (typeof flow.intervalSeconds === "number" && flow.intervalSeconds < 15) {
-          flow.intervalSeconds = flow.intervalSeconds + 1;
-        }
-        const verdict = await pollDeviceToken(flow.deviceCode, githubApiFetch);
-        if (verdict.status === "pending") {
-          if (verdict.slowDown) {
-            // RFC 8628 §3.5: the interval just used, plus five seconds.
-            flow.intervalSeconds = flow.intervalSeconds + 5;
-          }
-          seeOther(res, `${AUTH_PREFIX}/github/device`);
-          return;
-        }
-        if (verdict.status === "expired") {
-          deviceFlows.delete(session.user);
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent("The device code expired before it was entered. Start the sign-in again.")}`);
-          return;
-        }
-        if (verdict.status !== "authorized") {
-          deviceFlows.delete(session.user);
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(verdict.error ?? "The GitHub sign-in failed.")}`);
-          return;
-        }
-        // Authorized: resolve the login, then write the same hosts.yml the
-        // token form writes. A token GitHub just handed out should still say
-        // who it belongs to; if the answer is unusable, fail loudly.
-        const who = await validateGitHubToken(verdict.token, githubApiFetch);
-        if (!who.ok) {
-          deviceFlows.delete(session.user);
-          seeOther(res, `${AUTH_PREFIX}/github?error=${encodeURIComponent(who.error)}`);
-          return;
-        }
-        await writeGitHubCredentials(dataDir, { login: who.login, token: verdict.token });
-        deviceFlows.delete(session.user);
-        logger(`[auth] GitHub credentials stored for ${who.login} (device flow)`);
-        seeOther(res, `${AUTH_PREFIX}/github?saved=${encodeURIComponent(who.login)}`);
         return;
       }
     }

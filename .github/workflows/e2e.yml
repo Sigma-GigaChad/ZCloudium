@@ -32,31 +32,26 @@ env:
 jobs:
   playwright:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      # Same pins as build.yml, same single reading point. The image under test
-      # is the product build: the runtime compiled from the pinned revision with
-      # the patch series, because the remote workspace features under test do
-      # not exist in the vendor tarball.
+      # Same pins as build.yml, same single reading point. Without this step the
+      # image under test would be built from the Dockerfile alone, and the
+      # Dockerfile refuses to build without the pins.
       - name: Read the pins
         id: pins
         run: |
           tag="$(tr -d '[:space:]' < zcode.version)"
-          if [ -z "$(ls patches/*.patch 2>/dev/null)" ]; then
-            echo "patches/ carries no .patch file; the from-source build would be refused anyway." >&2
-            exit 1
-          fi
-          commit="$(git ls-remote https://github.com/ZCodium-project/ZCodium.git "refs/tags/${tag}^{}" | awk '{print $1}')"
-          commit="${commit:-$(git ls-remote https://github.com/ZCodium-project/ZCodium.git "refs/tags/${tag}" | awk '{print $1}')}"
+          sha="$(tr -d '[:space:]' < zcode.sha256)"
           {
             echo "list<<EOF"
-            echo "ZCODE_REF=${tag}"
-            echo "ZCODE_COMMIT=${commit}"
+            echo "ZCODIUM_VERSION=${tag}"
+            echo "TARBALL_URL=https://github.com/ZCodium-project/ZCodium/releases/download/${tag}/zcodium-${tag#v}.tar.gz"
+            echo "TARBALL_SHA256=${sha}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "Runtime under test: ${tag} @ ${commit}"
+          echo "Runtime under test: ${tag}"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -64,7 +59,6 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile.from-source
           push: false
           load: true
           build-args: ${{ steps.pins.outputs.list }}

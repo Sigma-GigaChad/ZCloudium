@@ -99,13 +99,6 @@ and reachable only through it.
 - **Accounts** (`/_auth/users`, owner only): the first wizard's account is the
   **owner**; only it creates accounts. Any account uses the interface with the
   same rights — there are no roles beyond account management.
-- **GitHub credentials** (`/_auth/github`, owner only): the enrolment page for
-  the credentials Cloud Environments inherit. The main button runs the device
-  sign-in `gh auth login` runs (GitHub CLI's public application and scopes:
-  `repo`, `read:org`, `gist`, `workflow`) — GitHub shows a short code, you type
-  it at `github.com/login/device`, the waiting page polls and finishes by
-  itself. Pasting a token stays for fine-grained PATs. Both paths write the
-  same `hosts.yml` on the volume.
 - **Metrics** (`/_auth/metrics`): the Prometheus text format, behind the
   session — failed attempts, blocks, sessions issued, recovery codes used,
   proxied requests. Plain counters, no labels.
@@ -157,7 +150,7 @@ Two paths hold the instance; both must be mounts:
 
 | Path | Holds | Shipped as |
 | --- | --- | --- |
-| `/data` (`HOME`, `ZCODE_DATA_BASE_DIR`) | accounts, session key, TLS certificate, GitHub credentials, settings, skills, agent configuration | named volume `z-cloudium-data` |
+| `/data` (`HOME`, `ZCODE_DATA_BASE_DIR`) | accounts, session key, TLS certificate, settings, skills, agent configuration | named volume `z-cloudium-data` |
 | `/workspace` (`ZCODE_SERVER_WORKSPACE`) | the agent's files: projects, git repositories | named volume `z-cloudium-workspace` |
 
 Before anything else starts, the entrypoint reads the container's mount table
