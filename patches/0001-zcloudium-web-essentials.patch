@@ -684,15 +684,16 @@ index 052eab8..9eb9b43 100644
 2.56.0
 
 
-From 226ca4d586a78afdc88df3b1e65da1ec2eaa630f Mon Sep 17 00:00:00 2001
+From c1905e69e76b420fffcd9d6ddbfe2f7e3b533518 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:46:52 +0200
-Subject: [PATCH 2/2] zcloudium: reject oversized staging by declared length;
- catch composer IIFE
+Subject: [PATCH 2/2] zcloudium: reject oversized staging by declared length,
+ catch the composer staging loop
 
 ---
- packages/server/src/attachmentStage.ts | 6 ++++++
- 1 file changed, 6 insertions(+)
+ packages/server/src/attachmentStage.ts                | 6 ++++++
+ packages/ui/src/v4/composer/useComposerAttachments.ts | 4 +++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
 
 diff --git a/packages/server/src/attachmentStage.ts b/packages/server/src/attachmentStage.ts
 index f80118a..b9872b2 100644
@@ -711,6 +712,21 @@ index f80118a..b9872b2 100644
      const bytes = new Uint8Array(await c.req.arrayBuffer());
      if (bytes.byteLength === 0) {
        return c.json({ error: "Empty attachment" }, 400);
+diff --git a/packages/ui/src/v4/composer/useComposerAttachments.ts b/packages/ui/src/v4/composer/useComposerAttachments.ts
+index 252c211..59fc67a 100644
+--- a/packages/ui/src/v4/composer/useComposerAttachments.ts
++++ b/packages/ui/src/v4/composer/useComposerAttachments.ts
+@@ -719,7 +719,9 @@ export function useComposerAttachments(
+           prepared.push(attachment);
+         }
+         addPreparedAttachments(prepared);
+-      })();
++      })().catch((error) => {
++        logger.warn("[v4-composer-attachments] 附件添加失败", error);
++      });
+     },
+     [addPreparedAttachments, platform],
+   );
 -- 
 2.56.0
 
