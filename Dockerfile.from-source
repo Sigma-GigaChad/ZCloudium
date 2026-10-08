@@ -1,0 +1,165 @@
+# syntax=docker/dockerfile:1
+
+# ZCode Web, built FROM THE ZCodium SOURCES with the z-cloudium patch series.
+#
+# This is a full product image: it carries the same gateway, entrypoint and
+# hardening as the precompiled Dockerfile, plus the patch series in patches/
+# which enables the remote workspace features this build exists for:
+#   - the web client can open Remote SSH sessions (the complete service bridge
+#     on /ws/remote/:id, platform.connectRemote over the HTTP API) — SSH only;
+#   - web attachments are staged into the agent's own filesystem (real paths);
+#   - the MCP settings page persists through the server-side mcp-sync channel.
+#
+# Provenance, stated plainly: the precompiled path pins a tarball sha256, this
+# path pins the source revision (the tag, labelled with its exact commit) plus
+# the patch file the build applies. Tarballs carry mtimes, so the build is not
+# bit-for-bit reproducible — the version label is the source revision, never a
+# hash of the output.
+#
+# The series is deliberately small and additive (see patches/README.md): new
+# files for every new capability, small marked hunks in the few edited files,
+# and upstream behaviour without it.
+#
+# glibc base is mandatory (bookworm, not alpine): the runtime package embeds the
+# precompiled node-pty binaries (@lydell/node-pty-linux-x64) and no musl variant
+# is published by scripts/zcode-distribution/assets.mjs.
+
+ARG NODE_VERSION=24.14.0
+
+FROM node:${NODE_VERSION}-bookworm AS builder
+
+ARG ZCODE_REPO=https://github.com/ZCodium-project/ZCodium.git
+ARG ZCODE_REF=v3.14.7
+ARG PNPM_VERSION=10.33.2
+
+ENV CI=1 \
+    HUSKY=0 \
+    COREPACK_ENABLE_PROJECT_SPEC=0 \
+    ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    ZCODE_SKIP_REMOTE_ASSETS=1
+
+# python3/make/g++: a safety net when a native dependency has no prebuilt for
+# linux-x64. It exists in this stage only.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "pnpm@${PNPM_VERSION}"
+
+WORKDIR /src
+
+# The patch series is a build input, and an empty one must fail the build: an
+# image compiled without it would silently miss every feature this path exists
+# for.
+COPY patches /patches
+RUN if [ -z "$(ls -A /patches/*.patch 2>/dev/null)" ]; then \
+      echo "patches/ carries no .patch file: refusing to build a feature-less image." >&2; \
+      exit 1; \
+    fi
+
+# The bridge contract (a toService proxy must survive exposeOnChannelServer and
+# carry calls AND events) is exactly the failure class a typecheck cannot see:
+# it is exercised over two in-memory channel hops before anything else runs.
+COPY scripts/validate-remote-bridge.mts /src/packages/server/validate-remote-bridge.mts
+
+# Fetch a single revision: accepts a tag, a branch or a SHA. `--branch` does not
+# handle SHAs, hence the fetch plus FETCH_HEAD.
+RUN git init -q . \
+ && git remote add origin "${ZCODE_REPO}" \
+ && git fetch -q --depth 1 origin "${ZCODE_REF}" \
+ && git checkout -q FETCH_HEAD \
+ && git submodule update --init --recursive || true
+
+# Apply, but never silently: --check first, so a series that no longer fits the
+# revision fails with the offending hunks listed instead of a half-applied tree.
+RUN git apply --check /patches/*.patch \
+ && git apply /patches/*.patch
+
+# The vendor's own release workflow (ZCodium .github/workflows/release.yml) builds
+# the tarball with exactly three steps: install --frozen-lockfile, then
+# `pnpm typecheck`, then `pnpm build:zcode`. `typecheck` is `tsc -b` over the
+# project references: it is what emits packages/shared/dist/index.js, which has no
+# build script of its own and which the SEA asset collector requires.
+RUN pnpm install --frozen-lockfile \
+ && pnpm prepare:desktop-runtime || true \
+ && pnpm exec tsx packages/server/validate-remote-bridge.mts
+
+RUN pnpm typecheck
+
+# --base-url only feeds the generated install.sh, which is not used here.
+# The fork's tarball is named zcodium-<version>.tar.gz and its top directory is
+# zcodium/, so the extraction strips the component exactly like the precompiled
+# path does with the official one. The two greps prove the patch series actually
+# reached the built artefacts (one server route, one web string), not just the
+# source tree.
+RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
+ && mkdir -p /out/zcodium \
+ && tar -xzf "$(ls dist/zcode/releases/*/*.tar.gz | head -n 1)" --strip-components=1 -C /out/zcodium \
+ && test -f /out/zcodium/bin/zcode.mjs \
+ && test -f /out/zcodium/server/entry-http.js \
+ && grep -q "/api/stage-attachment" /out/zcodium/server/entry-http.js \
+ && grep -qr "api/connect-remote" /out/zcodium/web/assets/
+
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+
+ARG ZCODE_REPO=https://github.com/ZCodium-project/ZCodium.git
+ARG ZCODE_REF=v3.14.7
+ARG ZCODE_COMMIT
+
+LABEL org.opencontainers.image.title="z-cloudium" \
+      org.opencontainers.image.description="ZCode Web behind an authentication gateway, built from the ZCodium sources with the z-cloudium patch series (ZCodium ${ZCODE_REF})" \
+      org.opencontainers.image.version="${ZCODE_REF}" \
+      org.opencontainers.image.revision="${ZCODE_COMMIT}" \
+      org.opencontainers.image.source="${ZCODE_REPO}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# git/curl: the agent runs real shell commands in its workspace and uses them
+# constantly. less/procps: convenience (pagers, ps). openssl: the gateway
+# terminates TLS with a certificate it generates itself.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      less \
+      openssl \
+      procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /data /workspace \
+ && chown node:node /data /workspace
+
+# The patched runtime, and the same gateway and entrypoint the precompiled image
+# carries: one authentication story, whichever build path produced the runtime.
+COPY --from=builder --chown=node:node /out/zcodium /opt/zcodium
+COPY gateway /opt/cloudium/gateway
+
+# The `node` user (uid 1000) comes from the base image: no user creation, no uid
+# conflict, and no privilege by default.
+ENV ZCODE_DATA_BASE_DIR=/data \
+    ZCODE_SERVER_WORKSPACE=/workspace \
+    ZCODE_MODEL_TELEMETRY_ENABLED=0 \
+    HOME=/data
+
+RUN ln -sfn /opt/zcodium/bin/zcode.mjs /usr/local/bin/zcode
+
+VOLUME ["/data"]
+
+WORKDIR /workspace
+
+## Unprivileged user by default. The container hardening (cap_drop,
+## no-new-privileges, read-only rootfs) lives in the compose files.
+USER node
+EXPOSE 3030
+
+# Same probe contract as the precompiled image: /_auth/health over http or
+# https depending on ZCLOUDIUM_TLS, so a deployment switches build path without
+# switching healthcheck.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "const off=['off','false','0','no','disabled'].includes(String(process.env.ZCLOUDIUM_TLS||'').trim().toLowerCase()); const on=!off; if(!on){fetch('http://127.0.0.1:3030/_auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));} else {require('node:https').get({host:'127.0.0.1',port:3030,path:'/_auth/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));}"
+
+# The entrypoint starts the runtime on loopback and puts the gateway on the
+# published port, exactly like the precompiled image.
+ENTRYPOINT ["node", "/opt/cloudium/gateway/start.mjs"]
