@@ -193,12 +193,6 @@ What it does not do:
   `/data/auth/failures.json`. Anyone who can read the volume can run the
   instance, add an account, or wipe the failure budget: the volume is the trust
   boundary, and the budget being on disk is what makes a restart not reset it;
-- the owner's GitHub credentials live on the same volume, in
-  `/data/.config/gh/hosts.yml` (mode 0600, written only after
-  `api.github.com` accepted the token, owner-only page). That is a real
-  GitHub token, so the volume boundary now carries GitHub write access to
-  whatever the token scopes; treat the token like the accounts file, and
-  prefer a fine-grained one scoped to the repositories the agent must reach;
 - the failure counter is persisted with every change, so restarting no longer
   clears it; a block still ends after five minutes and the budget still starts
   again after it, as before.
@@ -316,12 +310,8 @@ Read this before launching the full access profile.
    level (VLAN, outbound firewall rules), not inside the container.
 7. **The runtime comes from a third party** (the ZCodium fork). Integrity is
    verified by a pinned hash, the presence of setuid binaries is checked, but the
-   code has not been audited. If that is not acceptable, `./build.sh`
-   compiles the fork's sources in your builder and applies the
-   small patch series in `patches/` (documented, reviewed, and what enables
-   Remote SSH from the web client and Cloud Environments) — the trade is the
-   vendor's published artefact for your own build of reviewed sources, which
-   costs minutes and stops being bit-for-bit reproducible.
+   code has not been audited. The runtime is shipped exactly as the fork
+   publishes it: no line of it is patched by this project.
 8. **The API key lives in the volume** (`/data` or `$HOME/.zcode`), in clear
    text, and the container can read it. That is inherent to a tool that must use
    it.

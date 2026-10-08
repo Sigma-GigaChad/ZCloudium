@@ -4,8 +4,7 @@
 #
 # Why not a build from source: the runtime is published as is (a tarball plus
 # its sha256), so there is no pnpm, no Electron and no Node toolchain in the
-# image, and the build takes seconds instead of half an hour. Building from the
-# sources upstream is still available in Dockerfile.from-source.
+# image, and the build takes seconds instead of half an hour.
 #
 # The extracted runtime contains bin/ (the runner), server/ (HTTP plus
 # WebSocket), web/ (the client) and agent/ (the agent), plus its own

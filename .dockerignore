@@ -1,12 +1,7 @@
-# The build context serves the Dockerfiles, the gateway sources and the patch
-# series (Dockerfile.from-source applies patches/ to the pinned source tree).
-# Keeping the context minimal avoids sending the whole repository to the daemon.
+# The build context only serves the Dockerfile and the gateway sources, which
+# are copied into the image. Keeping the context minimal avoids sending the
+# whole repository to the daemon.
 *
 !Dockerfile
-!Dockerfile.from-source
 !gateway
 !gateway/**
-!patches
-!patches/**
-!scripts
-!scripts/validate-remote-bridge.mts

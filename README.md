@@ -34,14 +34,12 @@ browser                                             ┌┴───────�
   required (the container refuses to start without them, instead of silently
   throwing your work away), telemetry is off, the port binds to localhost, and
   the container runs unprivileged with a read-only filesystem.
-- **Remote work built in.** From the browser, the agent connects to SSH hosts
-  and provisions **Cloud Environments** — disposable dev containers on a
-  machine of yours, with a setup script and your GitHub credentials inherited.
-  The container stays a sandbox; the heavy work happens where your code lives.
+- **A sandbox that stays a sandbox.** The agent works in volumes, the
+  container is disposable by construction, and heavier work belongs on a
+  dedicated machine reached with ZCode's Remote SSH from the desktop app.
 
-The runtime is the ZCodium fork's, pinned to a release, plus a small reviewed
-patch series that enables the remote workspace features
-([patches/README.md](patches/README.md)). The gateway is an additive layer:
+The runtime is the ZCodium fork's, pinned to a release and shipped exactly as
+the fork publishes it — no runtime patches. The gateway is an additive layer:
 it imports no application code and an upstream update cannot break it.
 
 ## Quick start
@@ -117,29 +115,17 @@ read, not an accident.
 | Container | unprivileged, read-only rootfs, `cap_drop: ALL` | a compromise does not persist and has no privileges to use |
 | Host | x86-64 Linux | the runtime ships linux-x64 `node-pty` binaries; there is no arm64 build yet |
 
-## Work from the browser: SSH hosts and Cloud Environments
+## Pointing the agent at a real machine
 
-The wizard's **Remote connection** dialog offers two things beyond the local
-workspace:
+The agent in the container works in `/workspace` — that is the sandbox. To
+work on real projects, ZCode's own **Remote SSH** feature points it at a
+dedicated development machine, from the desktop application. The container
+stays disposable; the machine owns its credentials and its hardening; nothing
+needs to be widened here.
 
-- **SSH (Remote host)** — the agent connects to any machine you can SSH to and
-  works there. From the browser, like from the desktop app.
-- **Cloud Environment** — a disposable dev container, provisioned on that SSH
-  host at the moment you create it: base image of your choice (default
-  `ubuntu:26.04`), an optional setup script that installs whatever the project
-  needs, and your GitHub credentials inherited from the container — the
-  environment can clone and push the moment it exists. No sshd inside, no
-  published port, no Docker credentials on the machine running ZCloudium:
-  everything travels through your SSH session. The environment persists
-  (dependencies survive between sessions) until you remove it.
-
-GitHub credentials are enrolled **once, in this container**: the owner's menu
-has a *GitHub credentials* page whose main button runs the same device
-sign-in as `gh auth login` — GitHub shows a short code, you type it at
-`github.com/login/device`, the token lands on the `/data` volume. It is
-GitHub CLI's own application and scopes; there is nothing to register.
-Paste-a-token stays for fine-grained PATs, which the device flow cannot
-create.
+The stock web interface does not open remote connections (the runtime answers
+*not supported in Web mode yet*): the workspace it serves is the container's.
+That is a feature of the sandbox, not a gap to work around.
 
 ## Deployment profiles
 
@@ -169,17 +155,17 @@ volume itself).
 
 ## Versions and builds
 
-- `latest` on ghcr.io follows the pinned release in `zcode.version`, compiled
-  from source with the patch series; CI publishes it on every merge to `main`,
-  and the smoke job starts the published image before letting it ship.
+- `latest` on ghcr.io follows the pinned release in `zcode.version`: the
+  vendor tarball, verified against `zcode.sha256` at build time. CI publishes
+  it on every merge to `main`, and the smoke job starts the published image
+  before letting it ship.
 - Freeze a version with `image: ghcr.io/sigma-gigachad/z-cloudium:3.14.7`
   (tags: `latest`, `<version>`, `sha-<commit>`).
 - `./check-upstream.sh` compares the pin against the latest release (exit 0 or
   1); CI runs it weekly and opens an issue on a new release; `--bump` applies
-  one. Bumping includes refreshing the patch series — recipe in
-  [patches/README.md](patches/README.md).
-- Build it yourself with `./build.sh` (product, from source) — nothing but
-  Docker is needed; `--precompiled` exists for checks and refuses `--push`.
+  one — it updates both pins, and nothing else.
+- Build it yourself with `./build.sh` (39 seconds, no toolchain needed: the
+  image only downloads, verifies and extracts).
 
 ## Documentation
 
@@ -187,18 +173,16 @@ volume itself).
 | --- | --- |
 | [ENVIRONMENT.md](ENVIRONMENT.md) | every variable: TLS, auth off, session lifetime, proxy trust, volume layout, backups, the volume pre-check |
 | [SECURITY.md](SECURITY.md) | what is hardened, what is not, and why — the honest threat model |
-| [patches/README.md](patches/README.md) | the runtime patch series and the upstream-bump recipe |
 | [e2e/](e2e/) | the 20 Playwright specs that run against the real image |
 
 ## What has been verified
 
-Everything above is enforced or tested, not just written: 112 unit tests
+Everything above is enforced or tested, not just written: 114 unit tests
 (`node --test --test-force-exit`) cover the gateway and the entrypoint
 including the volume pre-check; 20 Playwright specs run against the real image
 on every push to `main` (wizard, sessions, WebSocket, redirects, throttle);
 the CI smoke job starts the published image, checks the gateway, the runtime
-version against the tag, the patch-series markers, and that an unmounted
-container is refused. The full reasoning about what this cannot fix lives in
+version against the tag, and that an unmounted container is refused. The full reasoning about what this cannot fix lives in
 [SECURITY.md](SECURITY.md).
 
 ## Acknowledgements
