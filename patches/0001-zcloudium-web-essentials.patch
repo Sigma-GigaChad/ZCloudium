@@ -796,7 +796,7 @@ index 357c7ef..d65e927 100644
 2.56.0
 
 
-From 7419463170b4bc86b287b825993c8ec776211d9f Mon Sep 17 00:00:00 2001
+From 0baf8ca8c9a756424eb4c1f629958a8bfc3dce90 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 20:33:08 +0200
 Subject: [PATCH 4/4] =?UTF-8?q?zcloudium:=20durable=20server-side=20remote?=
@@ -835,13 +835,13 @@ defects, both fixed.
    session is still alive (dedupe), as a real reconnect when it died.
    Desktop keeps its own host-side reattach path.
 ---
- packages/server/src/http.ts                   | 208 ++++++++++++----
- packages/server/src/remoteSessionRegistry.ts  | 232 ++++++++++++++++++
+ packages/server/src/http.ts                   | 208 ++++++++++++---
+ packages/server/src/remoteSessionRegistry.ts  | 248 ++++++++++++++++++
  packages/ui/src/Root.tsx                      |   6 +
  packages/ui/src/root/types.ts                 |   7 +
  .../ui/src/root/useRemoteWorkspaceHistory.ts  |  61 ++++-
  packages/web/src/main.tsx                     |  17 +-
- 6 files changed, 484 insertions(+), 47 deletions(-)
+ 6 files changed, 500 insertions(+), 47 deletions(-)
  create mode 100644 packages/server/src/remoteSessionRegistry.ts
 
 diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
@@ -1135,10 +1135,10 @@ index d65e927..afaaf06 100644
      }),
 diff --git a/packages/server/src/remoteSessionRegistry.ts b/packages/server/src/remoteSessionRegistry.ts
 new file mode 100644
-index 0000000..3c8a4ec
+index 0000000..626bee6
 --- /dev/null
 +++ b/packages/server/src/remoteSessionRegistry.ts
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,248 @@
 +import { randomUUID } from "node:crypto";
 +import type { WebSocket } from "ws";
 +import type { RemoteTarget } from "@zcode/shared";
@@ -1251,43 +1251,59 @@ index 0000000..3c8a4ec
 +      return { ...(await inflight), reused: true };
 +    }
 +
-+    // Same-target connects racing on different scopes: one wins the SSH
-+    // channel, the loser disposes its duplicate and multiplexes on the winner.
-+    // Without this, the loser's connections.set would orphan the winner's
-+    // entry and strand its sessions with a map no cleanup path can reach.
-+    let pending = this.connecting.get(fingerprint);
-+    if (!pending) {
-+      let connection: RemoteConnection | undefined;
-+      const onDidRemoteClose = () => {
-+        if (connection) {
-+          this.handleRemoteClose(connection);
-+        }
-+      };
-+      pending = connect(onDidRemoteClose).then((value) => {
-+        connection = value;
-+        this.connections.set(fingerprint, {
-+          connection,
-+          fingerprint,
-+          sessionIds: new Set(),
-+        });
-+        return connection;
-+      });
-+      this.connecting.set(fingerprint, pending);
-+      pending.finally(() => this.connecting.delete(fingerprint));
-+    }
-+    const connection = await pending;
-+    const winner = this.connections.get(fingerprint);
-+    if (!winner || winner.connection !== connection) {
-+      try {
-+        connection.dispose();
-+      } catch {
-+        // Already closing — dispose is internally guarded upstream.
++    const creation = (async () => {
++      // A live connection for the same target multiplexes a new workspace scope
++      // without redeploying; only an unknown target opens a new SSH channel.
++      const cached = this.connections.get(fingerprint);
++      if (cached) {
++        const id = this.registerSession(cached, scope, scopeKey);
++        return { id, reused: true };
 +      }
-+      const id = this.registerSession(winner!, scope, scopeKey);
-+      return { id, reused: true };
-+    }
-+    const id = this.registerSession(winner, scope, scopeKey);
-+    return { id, reused: false };
++
++      // Same-target connects racing on different scopes serialize here: one
++      // caller creates the SSH channel, the others multiplex onto it (reused).
++      // Without this, the loser's connections.set would orphan the winner's
++      // entry and strand its sessions with a map no cleanup path can reach.
++      let pending = this.connecting.get(fingerprint);
++      const isCreator = !pending;
++      if (!pending) {
++        let connection: RemoteConnection | undefined;
++        const onDidRemoteClose = () => {
++          if (connection) {
++            this.handleRemoteClose(connection);
++          }
++        };
++        pending = connect(onDidRemoteClose).then((value) => {
++          connection = value;
++          this.connections.set(fingerprint, {
++            connection,
++            fingerprint,
++            sessionIds: new Set(),
++          });
++          return connection;
++        });
++        // Detached cleanup: absorbs the rejection so a failed connect
++        // (unreachable host, auth, deploy) never becomes an unhandledRejection
++        // — there is no process-level handler, and every caller handles its own
++        // await of the scoped promise below.
++        void pending.finally(() => this.connecting.delete(fingerprint)).catch(() => undefined);
++        this.connecting.set(fingerprint, pending);
++      }
++      const connection = await pending;
++      const entry = this.connections.get(fingerprint);
++      if (!entry) {
++        // The remote died during the registration tick; its close already
++        // swept everything. The request fails, no state is corrupted.
++        throw new Error("Remote connection closed during connect");
++      }
++      const id = this.registerSession(entry, scope, scopeKey);
++      // reused=false only for the caller whose connect created the channel —
++      // the route wires the runtime-preferences bridge exactly once on that.
++      return { id, reused: !isCreator };
++    })().finally(() => this.inflight.delete(scopeKey));
++
++    this.inflight.set(scopeKey, creation);
++    return creation;
 +  }
 +
 +  /** Attach a browser socket: its lifecycle no longer owns the session. */
