@@ -1595,37 +1595,402 @@ index 9eb9b43..b90ec8d 100644
 2.56.0
 
 
-From 70f983d22527e0c7f6ab38f0b60110fe70931eec Mon Sep 17 00:00:00 2001
+From ec496da30e784c77930c8c4bb8810fdcba28ece1 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 21:43:24 +0200
-Subject: [PATCH 5/5] zcloudium: no SPA fallback for hashed assets, plus a web
- anti-FOUC guard
+Subject: [PATCH 5/5] =?UTF-8?q?zcloudium:=20carte=20Machine=20courante=20+?=
+ =?UTF-8?q?=20cl=C3=A9=20h=C3=B4te=20au=20format=20OpenSSH?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-An index.html restored by the browser after a redeployment references
-the previous build's hashed assets. The static handler's SPA fallback
-answered those with 200 + index.html (text/html), so the browser parsed
-HTML as CSS and painted the app without a single style rule — reload
-fixed it by revalidating index.html. Two fixes:
-
-- /assets/* that does not exist now answers 404 instead of the SPA
-  fallback (the fallback remains for app routes);
-- the web entry, after first render, probes whether Tailwind actually
-  applied (a .hidden probe must compute display:none) and reloads ONCE
-  when it did not — sessionStorage-guarded against loops, cleared when
-  styles are healthy.
+La carte « Machine courante » du wizard web connecte l'agent à la
+machine Docker hôte par la porte SSH : détecte l'IP du bridge, génère
+une paire ed25519 dans le volume (0600/0644/0700), affiche la clé
+publique à installer une fois, substitue la clé privée côté route
+(hostMachine:true écrase toute privateKeyPath client). Desktop jamais
+impacté (gate supportsHostMachineConnect). Format privé = OpenSSH
+(openssh-key-v1 sérialisé à la main) : node:crypto n'exporte pas ce
+format et le ssh2 embarqué refuse le PKCS#8 ed25519.
 ---
- packages/server/src/http.ts |  7 +++++++
- packages/web/src/main.tsx   | 19 +++++++++++++++++++
- 2 files changed, 26 insertions(+)
+ packages/server/src/hostMachine.ts            | 328 ++++++++++++++++++
+ packages/server/src/http.ts                   |  36 ++
+ packages/shared/src/platform.ts               |   7 +
+ packages/shared/src/remoteTarget.ts           |   6 +
+ packages/shared/src/server-remote.ts          |   3 +
+ packages/shared/src/test-ids.ts               |   2 +
+ packages/shared/src/validation.ts             |   3 +
+ .../ui/src/RemoteConnectionDialogContent.tsx  |  79 ++++-
+ packages/ui/src/SSHDialog.tsx                 |   7 +-
+ .../ui/src/hooks/useRemoteConnectionForm.ts   | 120 ++++++-
+ packages/ui/src/i18n/locales/en-US.ts         |   4 +
+ packages/ui/src/i18n/locales/zh-CN.ts         |   4 +
+ packages/ui/src/lib/remoteConnectionWizard.ts |  32 +-
+ packages/web/src/main.tsx                     |  40 ++-
+ 14 files changed, 644 insertions(+), 27 deletions(-)
+ create mode 100644 packages/server/src/hostMachine.ts
 
+diff --git a/packages/server/src/hostMachine.ts b/packages/server/src/hostMachine.ts
+new file mode 100644
+index 0000000..a1db1dc
+--- /dev/null
++++ b/packages/server/src/hostMachine.ts
+@@ -0,0 +1,328 @@
++import {
++  createPrivateKey,
++  createPublicKey,
++  generateKeyPairSync,
++  type KeyObject,
++} from "node:crypto";
++import { readFileSync } from "node:fs";
++import { chmod, mkdir, readFile, stat as statFn, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++import { Hono } from "hono";
++import { getZCodeDataRootDir } from "@zcode/services/node";
++
++/**
++ * zcloudium: carte « machine courante » du wizard web — l'agent du conteneur
++ * se connecte en SSH à la machine Docker hôte pour accéder à sa CLI et à ses
++ * utilitaires. Le serveur détient la clé privée (jamais sortie du process),
++ * la clé publique doit être installée dans ~/.ssh/authorized_keys de la cible.
++ */
++
++const HOST_MACHINE_DIR_RELATIVE = "ssh/host-machine";
++const HOST_MACHINE_PRIVATE_KEY_NAME = "id_ed25519";
++const HOST_MACHINE_PUBLIC_KEY_NAME = "id_ed25519.pub";
++const HOST_MACHINE_KEY_COMMENT = "zcloudium-host-machine";
++
++/**
++ * isHostMachineEnabled : ON par défaut, opinionated ; seules les valeurs
++ * explicitement négatives de ZCLOUDIUM_HOST_MACHINE (insensible à la casse,
++ * trimmées) désactivent la carte. Un env vide ou absent laisse la feature active.
++ */
++export function isHostMachineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
++  const raw = env.ZCLOUDIUM_HOST_MACHINE;
++  if (raw === undefined) {
++    return true;
++  }
++  const normalized = raw.trim().toLowerCase();
++  if (normalized === "") {
++    return true;
++  }
++  return !["off", "false", "0", "no", "disabled"].includes(normalized);
++}
++
++/**
++ * readDefaultGatewayIp : parse /proc/net/route (Linux) pour retrouver l'IP de
++ * la passerelle par défaut (colonne Gateway de la ligne de destination 00000000).
++ * Le fichier stocke les adresses en hexadécimal little-endian, donc 010014AC
++ * devient 172.20.0.1. Retourne null si le fichier est absent/illisible ou si
++ * aucune route par défaut n'est déclarée — le conteneur tourne alors hors Docker
++ * bridge et l'opérateur doit renseigner ZCLOUDIUM_HOST_SSH_HOST explicitement.
++ */
++export function readDefaultGatewayIp(): string | null {
++  // Lecture synchrone tolérée : /proc/net/route est un pseudo-fichier kernel,
++  // l'I/O est immédiate et ne bloque jamais sur un disk I/O réel.
++  let contents: string;
++  try {
++    contents = readFileSync("/proc/net/route", "utf8");
++  } catch {
++    return null;
++  }
++
++  const lines = contents.split("\n");
++  // Ligne d'en-tête "Iface\tDestination\tGateway\t..." : à ignorer.
++  for (let i = 1; i < lines.length; i += 1) {
++    const line = lines[i]?.trim();
++    if (!line) {
++      continue;
++    }
++    const fields = line.split(/\s+/);
++    if (fields.length < 3) {
++      continue;
++    }
++    const destination = fields[1];
++    const gateway = fields[2];
++    if (destination !== "00000000" || !gateway || gateway === "00000000") {
++      continue;
++    }
++    if (gateway.length !== 8) {
++      continue;
++    }
++    // Little-endian : les octets arrivent par paquets de 2 hex dans l'ordre inverse
++    // de l'adresse IP. 010014AC → AC.14.00.01 → 172.20.0.1.
++    const a = parseInt(gateway.slice(6, 8), 16);
++    const b = parseInt(gateway.slice(4, 6), 16);
++    const c = parseInt(gateway.slice(2, 4), 16);
++    const d = parseInt(gateway.slice(0, 2), 16);
++    if ([a, b, c, d].some((part) => Number.isNaN(part))) {
++      return null;
++    }
++    return `${a}.${b}.${c}.${d}`;
++  }
++  return null;
++}
++
++function getHostMachineDir(): string {
++  return join(getZCodeDataRootDir(), HOST_MACHINE_DIR_RELATIVE);
++}
++
++function getHostMachinePrivateKeyPathInternal(): string {
++  return join(getHostMachineDir(), HOST_MACHINE_PRIVATE_KEY_NAME);
++}
++
++function getHostMachinePublicKeyPath(): string {
++  return join(getHostMachineDir(), HOST_MACHINE_PUBLIC_KEY_NAME);
++}
++
++/**
++ * Convertit une KeyObject publique ed25519 au format OpenSSH texte
++ * (ssh-ed25519 AAAA... commentaire). Le format est :
++ *   uint32_BE(len("ssh-ed25519")) + "ssh-ed25519" + uint32_BE(len(raw)) + raw(32)
++ * puis base64. L'export SPKI/DER contient la raw key dans ses 32 derniers octets.
++ */
++function formatOpenSshEd25519PublicKey(publicKey: KeyObject): string {
++  const der = publicKey.export({ type: "spki", format: "der" }) as Buffer;
++  // Ed25519 SPKI DER = 12 octets d'en-tête ASN.1 + 32 octets de clé brute.
++  const keyTag = Buffer.from("ssh-ed25519", "ascii");
++  const rawKey = der.subarray(der.length - 32);
++  const blob = Buffer.alloc(4 + keyTag.length + 4 + rawKey.length);
++  let offset = 0;
++  blob.writeUInt32BE(keyTag.length, offset);
++  offset += 4;
++  keyTag.copy(blob, offset);
++  offset += keyTag.length;
++  blob.writeUInt32BE(rawKey.length, offset);
++  offset += 4;
++  rawKey.copy(blob, offset);
++  return `ssh-ed25519 ${blob.toString("base64")} ${HOST_MACHINE_KEY_COMMENT}`;
++}
++
++/**
++ * ensureHostMachineKeypair : génère UNE FOIS un couple ed25519 et le persiste
++ * dans {getZCodeDataRootDir()}/ssh/host-machine/. Le dossier est 0700, la clé
++ * privée 0600, la publique 0644 — même contrat qu'un ~/.ssh créé à la main.
++ * Réutilise la clé existante si présente : la clé publique affichée dans le
++ * wizard reste stable d'un redémarrage à l'autre, sinon l'opérateur devrait
++ * re-ajouter authorized_keys après chaque restart du conteneur.
++ */
++export async function ensureHostMachineKeypair(): Promise<{
++  privateKeyPath: string;
++  publicKey: string;
++}> {
++  const dir = getHostMachineDir();
++  const privateKeyPath = getHostMachinePrivateKeyPathInternal();
++  const publicKeyPath = getHostMachinePublicKeyPath();
++
++  await mkdir(dir, { recursive: true, mode: 0o700 });
++
++  let privateKeyExists = false;
++  try {
++    const st = await statFn(privateKeyPath);
++    privateKeyExists = st.isFile();
++  } catch {
++    privateKeyExists = false;
++  }
++
++  if (privateKeyExists) {
++    // Réemploi : on s'assure que les permissions n'ont pas dérivé (montage volume
++    // typiquement), sans toucher au contenu — une réécriture effacerait le lien
++    // authorized_keys déjà installé côté hôte.
++    await chmod(privateKeyPath, 0o600).catch(() => undefined);
++    let cachedPublic: string | null = null;
++    try {
++      cachedPublic = (await readFile(publicKeyPath, "utf8")).trim();
++    } catch {
++      cachedPublic = null;
++    }
++    if (cachedPublic) {
++      return { privateKeyPath, publicKey: cachedPublic };
++    }
++    // Clé publique manquante : on la régénère à partir de la privée stockée
++    // plutôt que de forcer une nouvelle génération (ce qui casserait le lien
++    // authorized_keys de l'hôte). createPublicKey(KeyObject) suffit pour
++    // dériver la publique depuis un PEM privé ed25519.
++    const privateKeyPem = await readFile(privateKeyPath);
++    const privateKeyLoaded = createPrivateKey(privateKeyPem);
++    const publicKey = formatOpenSshEd25519PublicKey(createPublicKey(privateKeyLoaded));
++    await writeFile(publicKeyPath, `${publicKey}\n`, { mode: 0o644 });
++    return { privateKeyPath, publicKey };
++  }
++
++  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
++  const publicOpenSsh = formatOpenSshEd25519PublicKey(publicKey);
++  // OpenSSH private format, pas PKCS#8 : le ssh2 embarqué refuse le PKCS#8
++  // ed25519 ("Unsupported key format", vérifié en bout-en-bout contre la cible).
++  const privateOpenSsh = toOpenSshPrivatePem(privateKey, publicKey, HOST_MACHINE_KEY_COMMENT);
++
++  await writeFile(privateKeyPath, privateOpenSsh, { mode: 0o600 });
++  await writeFile(publicKeyPath, `${publicOpenSsh}\n`, { mode: 0o644 });
++  // Re-force 0700 sur le dossier après écriture : mkdir a posé le mode à la création
++  // mais ne le réapplique pas si le dossier existait déjà (umask du runtime).
++  await chmod(dir, 0o700).catch(() => undefined);
++  await chmod(privateKeyPath, 0o600).catch(() => undefined);
++  await chmod(publicKeyPath, 0o644).catch(() => undefined);
++
++  return { privateKeyPath, publicKey: publicOpenSsh };
++}
++
++/**
++ * zcloudium: sérialise une clé ed25519 au format OpenSSH privé non chiffré
++ * ("openssh-key-v1"). node:crypto n'exporte pas ce format, et le ssh2 embarqué
++ * refuse le PKCS#8 pour ed25519 ("Unsupported key format", vérifié en bout-en-bout).
++ * Wire format documenté : magic + cipher/kdf "none" + 1 clé + section privée
++ * (checkint x2, type, pub, priv = seed 32 o + pub 32 o, comment, padding 1..n).
++ */
++function toOpenSshPrivatePem(
++  privateKey: KeyObject,
++  publicKey: KeyObject,
++  comment: string,
++): string {
++  const lenPrefixed = (buf: Buffer): Buffer => {
++    const head = Buffer.alloc(4);
++    head.writeUInt32BE(buf.length, 0);
++    return Buffer.concat([head, buf]);
++  };
++
++  const keyType = Buffer.from("ssh-ed25519");
++  const publicRaw = publicKey.export({ format: "der", type: "spki" }) as Buffer;
++  const publicRaw32 = publicRaw.subarray(publicRaw.length - 32);
++  const privateDer = privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
++  const privateSeed = privateDer.subarray(privateDer.length - 32);
++
++  const check = Buffer.from("7a9f31c2", "hex");
++  const pubBlob = Buffer.concat([lenPrefixed(keyType), lenPrefixed(publicRaw32)]);
++  const privSection = Buffer.concat([
++    check,
++    check,
++    lenPrefixed(keyType),
++    lenPrefixed(publicRaw32),
++    lenPrefixed(privateSeed),
++    lenPrefixed(Buffer.from(comment, "utf8")),
++  ]);
++  const padLength = 8 - (privSection.length % 8);
++  const padding = Buffer.alloc(padLength > 0 ? padLength : 0);
++  padding.forEach((_, i) => {
++    padding[i] = i + 1;
++  });
++  const paddedPriv = Buffer.concat([privSection, padding]);
++
++  const head = Buffer.concat([
++    Buffer.from("openssh-key-v1\n", "utf8"),
++    lenPrefixed(Buffer.from("none")),
++    lenPrefixed(Buffer.from("none")),
++    lenPrefixed(Buffer.alloc(0)),
++    lenPrefixed(Buffer.from([0, 0, 0, 1])),
++    lenPrefixed(pubBlob),
++    lenPrefixed(paddedPriv),
++  ]);
++
++  const b64 = head.toString("base64");
++  const wrapped = b64.match(/.{1,70}/g) ?? [b64];
++  return [
++    "-----BEGIN OPENSSH PRIVATE KEY-----",
++    ...wrapped,
++    "-----END OPENSSH PRIVATE KEY-----",
++    "",
++  ].join("\n");
++}
++
++export function getHostMachinePrivateKeyPath(): string {
++  return getHostMachinePrivateKeyPathInternal();
++}
++
++/**
++ * resolveHostMachineHost : ordre de résolution —
++ *   1. ZCLOUDIUM_HOST_SSH_HOST (override explicite, cas où la gateway n'est
++ *      pas joignable depuis le conteneur, ex. réseau host) ;
++ *   2. readDefaultGatewayIp() (cas Docker bridge standard) ;
++ *   3. undefined — le wizard affichera un champ pré-rempli vide.
++ */
++function resolveHostMachineHost(env: NodeJS.ProcessEnv = process.env): string | undefined {
++  const override = env.ZCLOUDIUM_HOST_SSH_HOST?.trim();
++  if (override) {
++    return override;
++  }
++  return readDefaultGatewayIp() ?? undefined;
++}
++
++function resolveHostMachineUsername(env: NodeJS.ProcessEnv = process.env): string {
++  return env.ZCLOUDIUM_HOST_SSH_USER?.trim() ?? "";
++}
++
++/**
++ * registerHostMachineRoutes : GET /api/host-machine. La gateway Hono exige déjà
++ * la session pour /api/* (middleware token du createHttpServer principal), donc
++ * aucune authentification supplémentaire ici — la réponse ne contient que des
++ * métadonnées non secrètes (host, port, username, publicKey). La clé privée
++ * n'est JAMAIS renvoyée ; elle reste cantonnée au processus serveur.
++ */
++export function registerHostMachineRoutes(app: Hono): void {
++  app.get("/api/host-machine", async (c) => {
++    if (!isHostMachineEnabled()) {
++      return c.json({ enabled: false });
++    }
++    const host = resolveHostMachineHost();
++    const username = resolveHostMachineUsername();
++    let keypair: { privateKeyPath: string; publicKey: string };
++    try {
++      keypair = await ensureHostMachineKeypair();
++    } catch (error) {
++      // Échec clef : ne pas tomber en 500 brut, exposer un enabled=false pour
++      // que le wizard masque proprement la carte au lieu de bloquer l'UX.
++      // Sanitize : error.message contient typiquement le chemin absolu du
++      // fichier fautif (EACCES … '/data/ssh/host-machine/id_ed25519'), ce qui
++      // fuiterait le layout filesystem dans les logs. On logue uniquement le
++      // code d'erreur stable + la classe d'exception.
++      const code =
++        error && typeof error === "object" && "code" in error
++          ? String((error as { code?: unknown }).code)
++          : undefined;
++      const name = error instanceof Error ? error.name : undefined;
++      console.warn(
++        "[zcode-server:host-machine] ensureHostMachineKeypair failed",
++        { name, code },
++      );
++      return c.json({ enabled: false });
++    }
++    // zcloudium: privateKeyPath volontairement ABSENT de la réponse — la spec
++    // sécurité interdit de révéler quoi que ce soit du chemin de la clé privée
++    // (ni son contenu, ni son emplacement). Le client n'en a pas besoin : la
++    // substitution côté POST /api/connect-remote appelle le même getter interne
++    // (getHostMachinePrivateKeyPath) directement côté serveur.
++    return c.json({
++      enabled: true,
++      host,
++      port: 22,
++      username,
++      publicKey: keypair.publicKey,
++    });
++  });
++}
 diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
-index afaaf06..1408562 100644
+index afaaf06..609bf4d 100644
 --- a/packages/server/src/http.ts
 +++ b/packages/server/src/http.ts
-@@ -313,6 +313,13 @@ function isTokenProtectedPath(pathname: string): boolean {
+@@ -46,6 +46,11 @@ import {
+ import { remoteServiceCollection } from "./remoteBridge.js";
+ import { registerAttachmentStageRoutes } from "./attachmentStage.js";
+ import { createHostCapabilityStore } from "./hostCapability.js";
++import {
++  getHostMachinePrivateKeyPath,
++  isHostMachineEnabled,
++  registerHostMachineRoutes,
++} from "./hostMachine.js";
+ 
+ function wrapWebSocket(ws: WebSocket): ISocket {
+   const onData = new Emitter<VSBuffer>();
+@@ -252,6 +257,9 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
+     capabilities: {
+       desktopContinuous: true,
+       websocketRpc: true,
++      // zcloudium: carte « machine courante » du wizard web ; desktop ne voit
++      // pas ce champ, son absence vaut false pour la détection UI.
++      ...(isHostMachineEnabled() ? { hostMachine: true } : {}),
+     },
+   };
+ }
+@@ -313,6 +321,13 @@ function isTokenProtectedPath(pathname: string): boolean {
  }
  
  function isStaticFallbackAllowed(pathname: string): boolean {
@@ -1639,11 +2004,675 @@ index afaaf06..1408562 100644
    return !isTokenProtectedPath(pathname);
  }
  
+@@ -449,6 +464,23 @@ export function createHttpServer(
+     }
+     const body = parsedBody.data;
+ 
++    // zcloudium: carte « machine courante » — le client ne choisit JAMAIS un
++    // chemin de clé serveur. Le flag hostMachine est substitué ici, de façon
++    // à écraser toute privateKeyPath fournie. Supprimé avant le parse du backend
++    // pour que SSHConnectOptions reste strictement le contrat du wire format.
++    //
++    // Ordre de validation : sshConnectOptionsSchema (validation.ts) déclare
++    // hostMachine: z.boolean().optional(), ce qui permet au remoteTargetSchema
++    // discriminé ci-dessus d'accepter le flag sans strip. Sans cette entrée
++    // schema, zod rejetterait le body avant que la substitution ne s'exécute
++    // et la feature serait morte à l'entrée. Tout changement du flag côté
++    // schema doit donc rester synchronisé avec cette substitution.
++    if (body.kind === "ssh" && body.hostMachine === true) {
++      const sshBody = body as import("@zcode/shared").SSHConnectOptions;
++      sshBody.privateKeyPath = getHostMachinePrivateKeyPath();
++      delete sshBody.hostMachine;
++    }
++
+     // zcloudium: desktop injecte l'URL des assets distants à la compilation;
+     // le bundle serveur ne l'a pas, donc on la fournit ici — l'override env
+     // d'abord (même contrat que desktop), sinon les assets GitHub de la release
+@@ -509,6 +541,10 @@ export function createHttpServer(
+   // texte collé — écrits dans l'espace de l'agent, avec un vrai chemin.
+   registerAttachmentStageRoutes(app);
+ 
++  // zcloudium: métadonnées de la carte « machine courante » (hôte Docker).
++  // La gateway token couvre déjà /api/* — aucun middleware additionnel ici.
++  registerHostMachineRoutes(app);
++
+   // zcloudium: libération d'une session logique ; la connexion SSH partagée
+   // reste en cache (parité desktop : elle meurt via onDidRemoteClose ou au
+   // redémarrage du serveur). Un id inconnu renvoie 404 `{ok:false}` pour que
+diff --git a/packages/shared/src/platform.ts b/packages/shared/src/platform.ts
+index 503608f..f8210e3 100644
+--- a/packages/shared/src/platform.ts
++++ b/packages/shared/src/platform.ts
+@@ -524,6 +524,13 @@ export interface IPlatformService {
+   /** 当前平台的文件选择框是否能返回 agent 可访问的本地绝对路径 */
+   canSelectFilePath?: boolean;
+ 
++  /**
++   * zcloudium: le wizard web peut proposer la carte « machine courante » (SSH vers
++   * l'hôte Docker) quand le serveur l'autorise via capabilities.hostMachine ;
++   * desktop ne pose jamais ce flag → la carte reste absente côté bureau.
++   */
++  supportsHostMachineConnect?: boolean;
++
+   /** 打开系统目录选择框，返回选中路径或 null */
+   selectDirectory(): Promise<string | null>;
+ 
+diff --git a/packages/shared/src/remoteTarget.ts b/packages/shared/src/remoteTarget.ts
+index 090289c..0fc48f4 100644
+--- a/packages/shared/src/remoteTarget.ts
++++ b/packages/shared/src/remoteTarget.ts
+@@ -12,6 +12,12 @@ export interface SSHConnectOptions {
+   privateKeyPassphrase?: string;
+   assetInstallMode?: RemoteAssetInstallMode;
+   resourcePackages?: RemoteResourcePackageSelection;
++  /**
++   * Flag web-only : le navigateur ne choisit JAMAIS un chemin de clé serveur.
++   * Quand true, le serveur substitue sa propre clé machine courante (see hostMachine.ts)
++   * et ignore toute privateKeyPath fournie. Absent côté desktop.
++   */
++  hostMachine?: boolean;
+ }
+ 
+ export interface WSLConnectOptions {
+diff --git a/packages/shared/src/server-remote.ts b/packages/shared/src/server-remote.ts
+index e81c2c6..9d1d89b 100644
+--- a/packages/shared/src/server-remote.ts
++++ b/packages/shared/src/server-remote.ts
+@@ -19,6 +19,9 @@ export const serverRemoteInfoSchema = z.object({
+     desktopContinuous: z.literal(true),
+     websocketRpc: z.literal(true),
+     // 旧 Server 缺少新增 dynamic event，必须先声明能力再订阅，避免异常打进对端读循环。
++    // zcloudium: la carte « machine courante » du wizard web — absente côté desktop,
++    // donc facultative ; l'omission équivaut à false pour préserver le contrat existant.
++    hostMachine: z.boolean().optional(),
+   }),
+ });
+ 
+diff --git a/packages/shared/src/test-ids.ts b/packages/shared/src/test-ids.ts
+index 5b4dba3..46c363b 100644
+--- a/packages/shared/src/test-ids.ts
++++ b/packages/shared/src/test-ids.ts
+@@ -157,6 +157,8 @@ export const TID_REMOTE_KIND_SSH = "remote-kind-ssh";
+ export const TID_REMOTE_KIND_WSL = "remote-kind-wsl";
+ /** 远程连接方式切换到 Docker */
+ export const TID_REMOTE_KIND_DOCKER = "remote-kind-docker";
++/** zcloudium: 远程连接方式切换到机器当前机 (host) */
++export const TID_REMOTE_KIND_HOST = "remote-kind-host";
+ /** SSH 主机地址输入框 */
+ export const TID_SSH_HOST_INPUT = "ssh-host-input";
+ /** SSH 端口号输入框 */
+diff --git a/packages/shared/src/validation.ts b/packages/shared/src/validation.ts
+index 85b5a64..45cc6db 100644
+--- a/packages/shared/src/validation.ts
++++ b/packages/shared/src/validation.ts
+@@ -73,6 +73,9 @@ export const sshConnectOptionsSchema = z.object({
+       selectedPackageIds: z.array(z.string().refine(isKnownRemoteResourcePackageId)).optional(),
+     })
+     .optional(),
++  // zcloudium: flag web-only ; le serveur substitue sa propre clé machine courante
++  // et écrase toute privateKeyPath fournie côté client (voir hostMachine.ts).
++  hostMachine: z.boolean().optional(),
+ });
+ 
+ export const wslConnectOptionsSchema = z.object({
+diff --git a/packages/ui/src/RemoteConnectionDialogContent.tsx b/packages/ui/src/RemoteConnectionDialogContent.tsx
+index 6a1b22f..510ebcb 100644
+--- a/packages/ui/src/RemoteConnectionDialogContent.tsx
++++ b/packages/ui/src/RemoteConnectionDialogContent.tsx
+@@ -8,7 +8,12 @@ import type {
+   SSHConfigAliasOption,
+   WSLDistro,
+ } from "@zcode/shared";
+-import { TID_REMOTE_KIND_DOCKER, TID_REMOTE_KIND_SSH, TID_REMOTE_KIND_WSL } from "@zcode/shared";
++import {
++  TID_REMOTE_KIND_DOCKER,
++  TID_REMOTE_KIND_HOST,
++  TID_REMOTE_KIND_SSH,
++  TID_REMOTE_KIND_WSL,
++} from "@zcode/shared";
+ import type {
+   IMcpSyncService,
+   IPluginSyncService,
+@@ -19,6 +24,7 @@ import type {
+ import {
+   AlertTriangleIcon,
+   ChevronRightIcon,
++  HardDriveIcon,
+   LoaderIcon,
+   MonitorCogIcon,
+   ServerIcon,
+@@ -26,7 +32,8 @@ import {
+ } from "lucide-react";
+ import { DirectoryBrowser } from "@/DirectoryBrowser.js";
+ import { RemoteConnectionFields } from "@/RemoteConnectionFields.js";
+-import type { SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
++import type { HostMachineInfo, SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
++import { type RemoteKind } from "@/hooks/useRemoteConnectionForm.js";
+ import { Button } from "@/components/ui/button.js";
+ import { cn } from "@/components/lib/utils.js";
+ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+@@ -37,7 +44,7 @@ import {
+ } from "@/settings/RemoteSyncActions.js";
+ export { RemoteConnectionConnectingStep } from "@/remote-connection/RemoteConnectionConnectingStep.js";
+ 
+-function getKindIcon(kind: RemoteTarget["kind"]) {
++function getKindIcon(kind: RemoteKind) {
+   switch (kind) {
+     case "ssh":
+       return ServerIcon;
+@@ -45,6 +52,24 @@ function getKindIcon(kind: RemoteTarget["kind"]) {
+       return MonitorCogIcon;
+     case "wsl":
+       return TerminalIcon;
++    // zcloudium: icône « machine courante » — un disque dur pour évoquer
++    // l'hôte physique sur lequel tourne le conteneur, distinct des serveurs
++    // distants (ServerIcon) et des conteneurs (MonitorCogIcon).
++    case "host":
++      return HardDriveIcon;
++  }
++}
++
++function getKindTestId(kind: RemoteKind): string {
++  switch (kind) {
++    case "ssh":
++      return TID_REMOTE_KIND_SSH;
++    case "wsl":
++      return TID_REMOTE_KIND_WSL;
++    case "docker":
++      return TID_REMOTE_KIND_DOCKER;
++    case "host":
++      return TID_REMOTE_KIND_HOST;
+   }
+ }
+ 
+@@ -55,9 +80,9 @@ export function RemoteConnectionKindStep({
+   onCancel,
+   onNext,
+ }: {
+-  kind: RemoteTarget["kind"];
+-  availableKinds: RemoteTarget["kind"][];
+-  onKindChange: (value: RemoteTarget["kind"]) => void;
++  kind: RemoteKind;
++  availableKinds: RemoteKind[];
++  onKindChange: (value: RemoteKind) => void;
+   onCancel: () => void;
+   onNext: () => void;
+ }) {
+@@ -75,13 +100,7 @@ export function RemoteConnectionKindStep({
+               key={value}
+               type="button"
+               onClick={() => onKindChange(value)}
+-              data-testid={
+-                value === "ssh"
+-                  ? TID_REMOTE_KIND_SSH
+-                  : value === "wsl"
+-                    ? TID_REMOTE_KIND_WSL
+-                    : TID_REMOTE_KIND_DOCKER
+-              }
++              data-testid={getKindTestId(value)}
+               className={cn(
+                 "flex min-h-32 flex-col items-start gap-4 rounded-2xl border p-4 text-start transition-colors",
+                 selected
+@@ -159,6 +178,7 @@ export function RemoteConnectionSettingsStep({
+   remoteWorkspaceSessions = [],
+   validationMessage,
+   loading,
++  hostMachineInfo,
+   onBack,
+   onHostChange,
+   onPortChange,
+@@ -177,7 +197,7 @@ export function RemoteConnectionSettingsStep({
+   onClearSelectedSshConfigAlias,
+   onConnect,
+ }: {
+-  kind: RemoteTarget["kind"];
++  kind: RemoteKind;
+   host: string;
+   port: string;
+   username: string;
+@@ -202,6 +222,9 @@ export function RemoteConnectionSettingsStep({
+   remoteWorkspaceSessions?: RemoteWorkspaceSessionEntry[];
+   validationMessage: string;
+   loading: boolean;
++  // zcloudium: métadonnées « machine courante » ; quand kind === "host" et que
++  // la publicKey est connue, le bloc clé est affiché sous les champs SSH.
++  hostMachineInfo?: HostMachineInfo | null;
+   onBack: () => void;
+   onHostChange: (value: string) => void;
+   onPortChange: (value: string) => void;
+@@ -222,6 +245,12 @@ export function RemoteConnectionSettingsStep({
+ }) {
+   const { intl } = useZCodeIntl();
+ 
++  // zcloudium: « host » n'est pas un kind réseau — côté wire c'est toujours
++  // un SSH (le serveur substitue sa propre clé machine courante). On mappe
++  // donc vers "ssh" pour RemoteConnectionFields, qui ne connaît que les trois
++  // kinds canoniques.
++  const effectiveFieldsKind: RemoteTarget["kind"] = kind === "host" ? "ssh" : kind;
++
+   return (
+     <div className="flex min-h-0 flex-1 flex-col gap-6 h-full">
+       <div
+@@ -238,7 +267,7 @@ export function RemoteConnectionSettingsStep({
+         ) : null}
+ 
+         <RemoteConnectionFields
+-          kind={kind}
++          kind={effectiveFieldsKind}
+           host={host}
+           port={port}
+           username={username}
+@@ -276,6 +305,26 @@ export function RemoteConnectionSettingsStep({
+           setManualDockerContainer={onManualDockerContainerChange}
+           refreshDockerContainers={onDockerContainersRefresh}
+         />
++
++        {/* zcloudium: bloc « machine courante » — affiche la clé publique à
++            installer sur la machine hôte. N'apparaît que si la carte host est
++            sélectionnée ET que le serveur a renvoyé une publicKey valide. */}
++        {kind === "host" && hostMachineInfo?.publicKey ? (
++          <div className="space-y-2 rounded-2xl border border-border bg-surface p-4">
++            <label className="block text-ui-base font-medium text-foreground">
++              {intl.formatMessage({ id: "remote.host.publicKeyLabel" })}
++            </label>
++            <pre
++              className="overflow-x-auto rounded-lg border border-border bg-background-alt p-3 font-mono text-ui-sm text-foreground select-all"
++              data-testid="remote-host-public-key"
++            >
++              {hostMachineInfo.publicKey}
++            </pre>
++            <p className="text-ui-sm text-foreground-subtle">
++              {intl.formatMessage({ id: "remote.host.publicKeyHelp" })}
++            </p>
++          </div>
++        ) : null}
+       </div>
+ 
+       <div className="flex items-center justify-end gap-3">
+diff --git a/packages/ui/src/SSHDialog.tsx b/packages/ui/src/SSHDialog.tsx
+index bf7b72f..f575cf1 100644
+--- a/packages/ui/src/SSHDialog.tsx
++++ b/packages/ui/src/SSHDialog.tsx
+@@ -121,6 +121,7 @@ export function RemoteConnectionDialog({
+     wslDistros,
+     dockerContainers,
+     availableKinds,
++    hostMachineInfo,
+     setKind,
+     setHost,
+     setPort,
+@@ -530,6 +531,7 @@ export function RemoteConnectionDialog({
+                     remoteWorkspaceSessions={remoteWorkspaceSessions}
+                     validationMessage={validationMessage}
+                     loading={loading}
++                    hostMachineInfo={hostMachineInfo}
+                     onBack={() => {
+                       resetFeedback();
+                       setCurrentStep("kind");
+@@ -557,7 +559,10 @@ export function RemoteConnectionDialog({
+ 
+                 {currentStep === "connecting" ? (
+                   <RemoteConnectionConnectingStep
+-                    kind={kind}
++                    // zcloudium: « host » est réduit à un SSH wire-target avant
++                    // l'étape connecting — on normalise pour rester dans le
++                    // contrat RemoteTarget["kind"] du composant.
++                    kind={kind === "host" ? "ssh" : kind}
+                     logs={connectionLogs}
+                     errorMessage={error}
+                     loading={loading}
+diff --git a/packages/ui/src/hooks/useRemoteConnectionForm.ts b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+index b9acea2..ab35f1f 100644
+--- a/packages/ui/src/hooks/useRemoteConnectionForm.ts
++++ b/packages/ui/src/hooks/useRemoteConnectionForm.ts
+@@ -13,10 +13,33 @@ import {
+   resolveDockerContainerSelectionAfterRefresh,
+ } from "@/lib/remoteConnectionDockerOptions.js";
+ 
+-type RemoteKind = RemoteTarget["kind"];
++/**
++ * zcloudium: le wizard web peut proposer une carte « machine courante » (kind "host")
++ * en plus des kinds réseau existants ; côté wire, "host" est toujours réduit à
++ * "ssh" + hostMachine=true (voir remoteConnectionWizard.ts). Le type est donc
++ * RemoteTarget["kind"] | "host" — desktop ne voit jamais "host" car il ne pose
++ * pas supportsHostMachineConnect, donc buildAvailableKinds ne le pousse pas.
++ */
++export type RemoteKind = RemoteTarget["kind"] | "host";
+ export type SSHAuthMethod = "password" | "privateKey";
+ 
+-function buildAvailableKinds(options: { isDesktop: boolean; isWindowsDesktop: boolean }): RemoteKind[] {
++/**
++ * zcloudium: métadonnées renvoyées par GET /api/host-machine et exposées au
++ * wizard. publicKey est la seule valeur affichée (la clé privée reste côté
++ * serveur). host/port/username servent de pré-remplissage éditable.
++ */
++export interface HostMachineInfo {
++  host?: string;
++  port: number;
++  username: string;
++  publicKey: string;
++}
++
++function buildAvailableKinds(options: {
++  isDesktop: boolean;
++  isWindowsDesktop: boolean;
++  supportsHostMachineConnect: boolean;
++}): RemoteKind[] {
+   const kinds: RemoteKind[] = ["ssh"];
+   // 远程连接入口里 WSL 和 SSH 同属主机类连接。
+   // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
+@@ -26,11 +49,17 @@ function buildAvailableKinds(options: { isDesktop: boolean; isWindowsDesktop: bo
+   // Docker入口之前完全依赖预探测结果决定是否展示。
+   // 当探测能力暂时不可用、或用户还没切到 Docker 时，入口会直接消失，
+   // 用户甚至不知道这里支持 Docker 连接。改为始终展示入口，切换后再懒加载探测结果。
+-  // zcloudium: Docker/WSL 连接的是运行客户端的本机——只有桌面端才有“本机”。
++  // zcloudium: Docker/WSL 连接的是运行客户端的本机——只有桌面端才有"本机"。
+   // Web 向导保持 SSH-only，避免展示一个探测必然为空的入口。
+   if (options.isDesktop) {
+     kinds.push("docker");
+   }
++  // zcloudium: « machine courante » est un SSH vers l'hôte Docker — web-only,
++  // gate par le flag plateforme (lui-même alimenté par serverInfo.capabilities).
++  // Desktop ne pose jamais supportsHostMachineConnect : la carte reste absente.
++  if (options.supportsHostMachineConnect) {
++    kinds.push("host");
++  }
+   return kinds;
+ }
+ 
+@@ -48,6 +77,7 @@ export function useRemoteConnectionForm({
+   preferredWslDistro?: string;
+ }) {
+   const platform = usePlatform();
++  const supportsHostMachineConnect = Boolean(platform.supportsHostMachineConnect);
+   const [kind, setKind] = useState<RemoteKind>("ssh");
+   const [host, setHostState] = useState("");
+   const [port, setPortState] = useState("22");
+@@ -77,12 +107,17 @@ export function useRemoteConnectionForm({
+   const [dockerOptionsLoading, setDockerOptionsLoading] = useState(false);
+   const [dockerOptionsLoaded, setDockerOptionsLoaded] = useState(false);
+   const [dockerOptionsError, setDockerOptionsError] = useState("");
++  // zcloudium: métadonnées « machine courante » ; null tant que la carte n'a pas
++  // été ouverte ou que le fetch a échoué. Le wizard s'en sert pour pré-remplir
++  // host/port/username et afficher la clé publique à installer.
++  const [hostMachineInfo, setHostMachineInfo] = useState<HostMachineInfo | null>(null);
++  const [hostMachineInfoLoaded, setHostMachineInfoLoaded] = useState(false);
+   const applyingSshAliasRef = useRef(false);
+   const dockerOptionsActiveLoadIdRef = useRef(0);
+   const dockerOptionsInFlightLoadIdRef = useRef<number | null>(null);
+   const availableKinds = useMemo(
+-    () => buildAvailableKinds({ isDesktop, isWindowsDesktop }),
+-    [isDesktop, isWindowsDesktop],
++    () => buildAvailableKinds({ isDesktop, isWindowsDesktop, supportsHostMachineConnect }),
++    [isDesktop, isWindowsDesktop, supportsHostMachineConnect],
+   );
+ 
+   useEffect(() => {
+@@ -115,6 +150,11 @@ export function useRemoteConnectionForm({
+     setDockerOptionsLoading(false);
+     setDockerOptionsError("");
+     setDockerContainers([]);
++    // zcloudium: reset de l'état « machine courante » à chaque ouverture pour
++    // forcer un refetch serveur (la clé publique peut changer si le volume est
++    // éphémère) et éviter qu'un ancien username/host ne reste affiché.
++    setHostMachineInfo(null);
++    setHostMachineInfoLoaded(false);
+     if (preferredKind && availableKinds.includes(preferredKind)) {
+       setKind(preferredKind);
+     }
+@@ -272,6 +312,70 @@ export function useRemoteConnectionForm({
+     refreshDockerContainers({ clearContainersOnError: true });
+   }, [dockerOptionsLoaded, kind, open, refreshDockerContainers]);
+ 
++  // zcloudium: fetch GET /api/host-machine UNE FOIS par ouverture du wizard
++  // quand la carte « host » est sélectionnée. Le flag hostMachineInfoLoaded est
++  // remis à false à chaque (ré)ouverture pour que les données serveur ne soient
++  // jamais stale entre deux sessions du wizard.
++  useEffect(() => {
++    if (!open || kind !== "host" || hostMachineInfoLoaded || !supportsHostMachineConnect) {
++      return;
++    }
++
++    let cancelled = false;
++    void (async () => {
++      try {
++        const response = await fetch("/api/host-machine", { cache: "no-store" });
++        if (!response.ok || cancelled) {
++          return;
++        }
++        const payload = (await response.json()) as {
++          enabled?: boolean;
++          host?: string;
++          port?: number;
++          username?: string;
++          publicKey?: string;
++        };
++        if (cancelled) {
++          return;
++        }
++        if (!payload.enabled || !payload.publicKey) {
++          setHostMachineInfoLoaded(true);
++          return;
++        }
++        setHostMachineInfo({
++          host: payload.host,
++          port: payload.port ?? 22,
++          username: payload.username ?? "",
++          publicKey: payload.publicKey,
++        });
++        // Pré-remplissage éditable : l'opérateur peut ajuster avant connect.
++        // Anti-race : on n'écrase que si le champ est toujours dans son état
++        // initial (vide pour host/username, "22" pour port). Si l'utilisateur
++        // a tapé avant la résolution du fetch, son input gagne. L'utilisation
++        // du setter fonctionnel capture l'état courant au moment de la mise à
++        // jour, pas la valeur au moment du fetch.
++        if (payload.host) {
++          setHostState((current) => (current === "" ? payload.host ?? current : current));
++        }
++        setPortState((current) =>
++          current === "22" ? String(payload.port ?? 22) : current,
++        );
++        setUsernameState((current) =>
++          current === "" ? payload.username ?? current : current,
++        );
++        setHostMachineInfoLoaded(true);
++      } catch {
++        if (!cancelled) {
++          setHostMachineInfoLoaded(true);
++        }
++      }
++    })();
++
++    return () => {
++      cancelled = true;
++    };
++  }, [hostMachineInfoLoaded, kind, open, supportsHostMachineConnect]);
++
+   const setHost = (value: string) => {
+     if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== host) {
+       setSelectedSshConfigAlias(null);
+@@ -312,7 +416,7 @@ export function useRemoteConnectionForm({
+       const nextUsername = aliasOption.username?.trim() ?? "";
+       const nextPrivateKeyPath = aliasOption.privateKeyPath?.trim() ?? "";
+ 
+-      // 切换 alias 时之前只覆盖“有值字段”，缺失字段会残留上一个 alias/手动输入值。
++      // 切换 alias 时之前只覆盖"有值字段"，缺失字段会残留上一个 alias/手动输入值。
+       // 这里改为全量覆盖：所有 SSH 字段都按当前 alias 重建，缺失值统一置空，避免状态串用。
+       setHostState(nextHost);
+       setPortState(nextPort);
+@@ -352,6 +456,10 @@ export function useRemoteConnectionForm({
+     wslDistros,
+     dockerContainers,
+     availableKinds,
++    // zcloudium: métadonnées « machine courante » ; null tant que la carte host
++    // n'a pas été ouverte ou que le fetch a échoué. Le wizard s'en sert pour
++    // afficher la clé publique à installer et pré-remplir host/port/username.
++    hostMachineInfo,
+     setKind,
+     setHost,
+     setPort,
+diff --git a/packages/ui/src/i18n/locales/en-US.ts b/packages/ui/src/i18n/locales/en-US.ts
+index 3843d0d..6051987 100644
+--- a/packages/ui/src/i18n/locales/en-US.ts
++++ b/packages/ui/src/i18n/locales/en-US.ts
+@@ -1783,9 +1783,13 @@ const enUS: Record<string, string> = {
+   "remote.kind.ssh": "SSH",
+   "remote.kind.wsl": "WSL",
+   "remote.kind.docker": "Docker",
++  "remote.kind.host": "Current machine",
+   "remote.kind.ssh.wizardDescription": "Remote host",
+   "remote.kind.wsl.wizardDescription": "Windows Subsystem for Linux",
+   "remote.kind.docker.wizardDescription": "Local container",
++  "remote.kind.host.wizardDescription": "The machine running this app",
++  "remote.host.publicKeyHelp": "Install this key in the machine's ~/.ssh/authorized_keys, then connect.",
++  "remote.host.publicKeyLabel": "Public key to install on the machine",
+   "remote.connect": "Connect",
+   "remote.connecting": "Connecting...",
+   "remote.minimize": "Minimize remote connection window",
+diff --git a/packages/ui/src/i18n/locales/zh-CN.ts b/packages/ui/src/i18n/locales/zh-CN.ts
+index 5bb9764..dc8f1ad 100644
+--- a/packages/ui/src/i18n/locales/zh-CN.ts
++++ b/packages/ui/src/i18n/locales/zh-CN.ts
+@@ -1657,9 +1657,13 @@ const zhCN: Record<string, string> = {
+   "remote.kind.ssh": "SSH",
+   "remote.kind.wsl": "WSL",
+   "remote.kind.docker": "Docker",
++  "remote.kind.host": "当前机器",
+   "remote.kind.ssh.wizardDescription": "远程主机",
+   "remote.kind.wsl.wizardDescription": "Windows Linux 子系统",
+   "remote.kind.docker.wizardDescription": "本地容器",
++  "remote.kind.host.wizardDescription": "运行本应用的机器",
++  "remote.host.publicKeyHelp": "将此密钥安装到机器的 ~/.ssh/authorized_keys 中，然后连接。",
++  "remote.host.publicKeyLabel": "要安装到机器上的公钥",
+   "remote.connect": "连接",
+   "remote.connecting": "正在连接...",
+   "remote.minimize": "收起远程连接窗口",
+diff --git a/packages/ui/src/lib/remoteConnectionWizard.ts b/packages/ui/src/lib/remoteConnectionWizard.ts
+index d1d54e2..e42b163 100644
+--- a/packages/ui/src/lib/remoteConnectionWizard.ts
++++ b/packages/ui/src/lib/remoteConnectionWizard.ts
+@@ -1,6 +1,6 @@
+ import type { RemoteAssetInstallMode, RemoteTarget } from "@zcode/shared";
+ import { isValidWslUser, normalizeRemoteResourcePackageSelection } from "@zcode/shared";
+-import type { SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
++import type { RemoteKind, SSHAuthMethod } from "@/hooks/useRemoteConnectionForm.js";
+ import type { RemoteWizardStep } from "@/RemoteConnectionWizardChrome.js";
+ 
+ type WizardIntlLike = {
+@@ -8,7 +8,7 @@ type WizardIntlLike = {
+ };
+ 
+ interface RemoteConnectionFormSnapshot {
+-  kind: RemoteTarget["kind"];
++  kind: RemoteKind;
+   host: string;
+   port: string;
+   username: string;
+@@ -27,7 +27,7 @@ interface RemoteConnectionFormSnapshot {
+ export function getRemoteWizardStepCopy(
+   intl: WizardIntlLike,
+   step: RemoteWizardStep,
+-  kind: RemoteTarget["kind"],
++  kind: RemoteKind,
+ ) {
+   switch (step) {
+     case "kind":
+@@ -41,6 +41,8 @@ export function getRemoteWizardStepCopy(
+         description: intl.formatMessage(
+           { id: "remote.settingsStepDescription" },
+           {
++            // zcloudium: kind "host" a son propre libellé i18n (remote.kind.host) ;
++            // on réutilise la même clef que les autres kinds pour le step description.
+             method: intl.formatMessage({ id: `remote.kind.${kind}` }),
+           },
+         ),
+@@ -141,6 +143,30 @@ export function buildRemoteTarget(
+         },
+       };
+     }
++    // zcloudium: « machine courante » → un SSH auquel on ajoute hostMachine=true ;
++    // le serveur substituera sa propre clé privée. Seuls host + username sont
++    // requis (ni password ni privateKeyPath : le serveur les fournit).
++    case "host": {
++      if (!snapshot.host || !snapshot.username) {
++        return {
++          errorMessage: intl.formatMessage({ id: "ssh.validation.required" }),
++        };
++      }
++
++      const hostSshConfigAlias = snapshot.selectedSshConfigAlias?.trim();
++
++      return {
++        target: {
++          kind: "ssh",
++          host: snapshot.host,
++          port: snapshot.port ? Number(snapshot.port) : undefined,
++          username: snapshot.username,
++          ...(hostSshConfigAlias ? { sshConfigAlias: hostSshConfigAlias } : {}),
++          assetInstallMode: snapshot.assetInstallMode,
++          hostMachine: true,
++        },
++      };
++    }
+   }
+ }
+ 
 diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
-index b90ec8d..3021a94 100644
+index b90ec8d..884bead 100644
 --- a/packages/web/src/main.tsx
 +++ b/packages/web/src/main.tsx
-@@ -447,6 +447,25 @@ async function bootstrapWebApp() {
+@@ -72,6 +72,9 @@ interface WebBootstrapResult {
+   initialTaskId?: string;
+   restoreSession?: boolean;
+   allowOpenWorkspace?: boolean;
++  // zcloudium: le serveur déclare capability « machine courante » ; reporté
++  // jusqu'à createWebPlatform pour conditionner la carte du wizard.
++  supportsHostMachineConnect?: boolean;
+ }
+ 
+ function isWebOAuthCallback(params: URLSearchParams): boolean {
+@@ -104,9 +107,16 @@ function renderWebAuthCallbackPage(): void {
+ /** The accessor connectViaWebSocket resolves to, without importing @zcode/services. */
+ type WebServices = Awaited<ReturnType<typeof connectViaWebSocket>>;
+ 
+-function createWebPlatform(services: WebServices): IPlatformService {
++function createWebPlatform(
++  services: WebServices,
++  options: { supportsHostMachineConnect?: boolean } = {},
++): IPlatformService {
+   return {
+     canSelectFilePath: false,
++    // zcloudium: carte « machine courante » du wizard web — uniquement quand
++    // le serveur déclare capabilities.hostMachine. Desktop ne pose jamais
++    // l'option → la carte reste absente côté bureau.
++    supportsHostMachineConnect: Boolean(options.supportsHostMachineConnect),
+     // Web 端无法打开系统目录选择框
+     selectDirectory: () => Promise.resolve(null),
+     // Web 端无法打开系统文件选择框
+@@ -363,6 +373,11 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+       ...(workspace?.workspaceIdentity
+         ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
+         : {}),
++      // zcloudium: le serveur déclare capability « machine courante » ;
++      // reporté jusqu'à createWebPlatform pour conditionner la carte du wizard.
++      ...(serverInfo.capabilities?.hostMachine
++        ? { supportsHostMachineConnect: true }
++        : {}),
+     };
+   } catch {
+     return { wsUrl };
+@@ -422,7 +437,9 @@ async function bootstrapWebApp() {
+     const services = await connectViaWebSocket(bootstrap.wsUrl, {
+       onClose: () => {},
+     });
+-    const platform = createWebPlatform(services);
++    const platform = createWebPlatform(services, {
++      supportsHostMachineConnect: bootstrap.supportsHostMachineConnect,
++    });
+     document.title = "ZCodium - Web + Server";
+ 
+     root.render(
+@@ -447,6 +464,25 @@ async function bootstrapWebApp() {
          </ZCodeIntlProvider>
        </AppErrorBoundary>,
      );
