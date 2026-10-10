@@ -1,7 +1,7 @@
 From 3bc96f7db547d08098ade8faaf0e1790981d0b76 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:01:55 +0200
-Subject: [PATCH 1/3] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
+Subject: [PATCH 1/4] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
  =?UTF-8?q?=20SSH-only=20remote=20workspaces,=20staged=20attachments,=20wo?=
  =?UTF-8?q?rking=20MCP=20settings?=
 MIME-Version: 1.0
@@ -687,7 +687,7 @@ index 052eab8..9eb9b43 100644
 From c1905e69e76b420fffcd9d6ddbfe2f7e3b533518 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:46:52 +0200
-Subject: [PATCH 2/3] zcloudium: reject oversized staging by declared length,
+Subject: [PATCH 2/4] zcloudium: reject oversized staging by declared length,
  catch the composer staging loop
 
 ---
@@ -734,7 +734,7 @@ index 252c211..59fc67a 100644
 From e1ea46dd3c8c8a0bdf3ee38b933f2cffb27569c3 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 19:19:38 +0200
-Subject: [PATCH 3/3] zcloudium: pass the remote-asset deploy options on web
+Subject: [PATCH 3/4] zcloudium: pass the remote-asset deploy options on web
  connect-remote
 
 Desktop builds inject their release-assets CDN URL at compile time,
@@ -792,6 +792,776 @@ index 357c7ef..d65e927 100644
        const id = generateId();
        remoteConnections.set(id, connection);
  
+-- 
+2.56.0
+
+
+From 039cbce1aca420856dab18b763b38cd0c346e202 Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Sat, 10 Oct 2026 20:33:08 +0200
+Subject: [PATCH 4/4] =?UTF-8?q?zcloudium:=20durable=20server-side=20remote?=
+ =?UTF-8?q?=20sessions=20=E2=80=94=20the=20browser=20is=20disposable,=20th?=
+ =?UTF-8?q?e=20work=20is=20not?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A browser refresh used to dispose the SSH connection and kill the
+runtime deployed on the target: background tasks died with the tab,
+and restoring a persisted conversation timed out. Two independent
+defects, both fixed.
+
+1. The one-shot ticket maps are replaced by a durable registry
+   (remoteSessionRegistry.ts): live connections keyed by target
+   identity (reused instead of redeployed), logical sessions scoped per
+   workspace and multiplexed onto their connection, browser sockets
+   attached and detached without ever disposing the session. The
+   connection dies only when the remote side closes (onDidRemoteClose),
+   when the operator disposes it, or on server restart. connect-remote
+   now also accepts the workspace context the web client forwards, so a
+   refresh re-attaches to the same session instantly instead of
+   redeploying.
+
+2. The runtime deployed in desktop-attached-remote mode asks its host
+   for session runtime preferences on cold resume (15 s timeout).
+   Desktop answers from its setting service; the web server never wired
+   that, so every persisted-session resume failed with
+   fault.subscribe.resumeFailed. The same bridge is now wired
+   server-side from the standalone server's setting service.
+
+3. The web entry passes autoReconnectRemoteWorkspaces: restored remote
+   tabs re-attach themselves on load — instantly when the server-side
+   session is still alive (dedupe), as a real reconnect when it died.
+   Desktop keeps its own host-side reattach path.
+---
+ packages/server/src/http.ts                   | 208 +++++++++++++----
+ packages/server/src/remoteSessionRegistry.ts  | 220 ++++++++++++++++++
+ packages/ui/src/Root.tsx                      |   6 +
+ packages/ui/src/root/types.ts                 |   7 +
+ .../ui/src/root/useRemoteWorkspaceHistory.ts  |  61 ++++-
+ packages/web/src/main.tsx                     |  17 +-
+ 6 files changed, 472 insertions(+), 47 deletions(-)
+ create mode 100644 packages/server/src/remoteSessionRegistry.ts
+
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index d65e927..afaaf06 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -18,6 +18,7 @@ import {
+ import {
+   ServiceCollection,
+   IZCodeAgentService,
++  ISettingService,
+   createZCodeAgentConnectionScope,
+   IBotsService,
+   IProviderProvisioningTargetService,
+@@ -25,6 +26,7 @@ import {
+ import { getZCodeDataRootDir } from "@zcode/services/node";
+ import {
+   botProviders,
++  DEFAULT_ZCODE_MODEL_CONTEXT_BUDGET_STRATEGY,
+   formatLogPrefix,
+   formatZodError,
+   remoteTargetSchema,
+@@ -34,8 +36,13 @@ import {
+   type BotProvider,
+   type ServerRemoteInfo,
+   type ServerRemoteWorkspaceInfo,
++  type ZCodeSessionRuntimePreferencesResult,
+ } from "@zcode/shared";
+-import { connectRemote, createRemoteBackend, type RemoteConnection } from "./remote/index.js";
++import { connectRemote, createRemoteBackend } from "./remote/index.js";
++import {
++  RemoteSessionRegistry,
++  type RemoteSessionScope,
++} from "./remoteSessionRegistry.js";
+ import { remoteServiceCollection } from "./remoteBridge.js";
+ import { registerAttachmentStageRoutes } from "./attachmentStage.js";
+ import { createHostCapabilityStore } from "./hostCapability.js";
+@@ -123,16 +130,78 @@ function setupChannelServer(
+   });
+ }
+ 
+-/** 存储 web 模式下的远程连接，key 为随机 ID */
+-const remoteConnections = new Map<string, RemoteConnection>();
+-
+-/** ticket 消费后、WS 尚未断开的远程连接；dispose 端点按 id 找到它们 */
+-const attachedRemoteConnections = new Map<string, { connection: RemoteConnection; ws: WebSocket }>();
+-
+-// zcloudium: randomUUID instead of Math.random — the id guards a full remote
+-// control capability, so it should be unguessable, not merely unique.
+-function generateId(): string {
+-  return randomUUID();
++// zcloudium: sessions distantes durables — le navigateur est jetable (refresh,
++// fermeture), la session SSH et le runtime déployé sur la cible ne doivent pas
++// l'être. Le registry remplace les anciennes maps one-shot : il déduplique les
++// connexions par empreinte de cible et attache/détache les sockets sans
++// disposer la connexion à la fermeture du WS.
++const remoteSessionRegistry = new RemoteSessionRegistry();
++
++/**
++ * zcloudium: pont runtime-preferences pour les sessions distantes web.
++ *
++ * Le runtime distant tourne en mode `desktop-attached-remote` : au cold-resume
++ * d'une session persistée il émet `session/requestRuntimePreferences` (timeout
++ * 15 s) vers l'hôte connecté. Desktop répond via
++ * `packages/desktop/src/host/remoteWorkspaceServiceCollection.ts` ; le serveur
++ * web n'a pas cette couche, il doit donc renvoyer la même résolution à partir
++ * du `ISettingService` local (autorité unique pour les réglages app-globaux,
++ * y compris en mode serveur). Pas de journalisation structurée desktop
++ * (runtimePreferencesLogger) : un console.warn suffit, le contrat reste
++ * strictement identique côté agent.
++ */
++function bridgeSessionRuntimePreferences(
++  connectionServices: { zcodeAgentService: IZCodeAgentService },
++  localSettingService: ISettingService,
++): void {
++  connectionServices.zcodeAgentService.onDynamicSessionRuntimePreferencesRequest()((request) => {
++    void (async () => {
++      let resolution:
++        | { status: "resolved"; preferences: ZCodeSessionRuntimePreferencesResult }
++        | { status: "failed"; message: string };
++      try {
++        // Même lecture autoritaire que desktop : pas de dépendance au setting
++        // lu par le runtime distant, qui n'a pas la même vue utilisateur.
++        const settings = await localSettingService.get();
++        resolution = {
++          status: "resolved",
++          preferences: {
++            askUserQuestionAutoResolutionEnabled:
++              settings.askUserQuestionAutoResolutionEnabled !== false,
++            nativeSearchEnhancementsEnabled: settings.nativeSearchEnhancementsEnabled !== false,
++            memoryEnabled: settings.memoryEnabled === true,
++            modelContextBudgetStrategy: DEFAULT_ZCODE_MODEL_CONTEXT_BUDGET_STRATEGY,
++            // remote workspace et hôte local partagent la même frontière de scope :
++            // la première exécution ne doit pas rebloquer sur un client config.
++            ...(request.scope === "user-execution" && settings.integratedTerminalShell
++              ? { integratedTerminalShell: settings.integratedTerminalShell }
++              : {}),
++          },
++        };
++      } catch (error) {
++        // -32603 : copie du code d'erreur desktop pour que l'agent distant
++        // reconnaisse la même catégorie d'échec de lecture de settings.
++        resolution = {
++          status: "failed",
++          // eslint-disable-next-line @typescript-eslint/no-explicit-any
++          message: error instanceof Error ? error.message : String(error),
++        };
++      }
++      try {
++        await connectionServices.zcodeAgentService.respondSessionRuntimePreferences({
++          requestId: request.requestId,
++          resolution,
++        });
++      } catch (error) {
++        // Pas de retry : la requête est à usage unique, un échec d'envoi est
++        // terminal pour ce requestId (parité desktop).
++        console.warn(
++          "[zcode-server:http] respondSessionRuntimePreferences failed:",
++          error instanceof Error ? error.message : String(error),
++        );
++      }
++    })();
++  });
+ }
+ 
+ interface HttpServerOptions {
+@@ -349,9 +418,32 @@ export function createHttpServer(
+   app.get("/ws/host", upgradeTrustedHostWebSocket);
+ 
+   // Web 模式下发起远程连接
++  // zcloudium: le registry durable remplace les maps one-shot. Le scope
++  // (workspacePath/workspaceIdentity) vient d'un champ optionnel `context`
++  // déposé dans le body brut avant le parse zod : deux navigateurs qui
++  // rouvrent le même workspace distant réutilisent la même session SSH et le
++  // runtime déployé, au lieu de redéployer à chaque refresh.
+   app.post("/api/connect-remote", async (c) => {
+-    const rawBody = await c.req.json();
+-    const parsedBody = remoteTargetSchema.safeParse(rawBody);
++    const rawBody = (await c.req.json().catch(() => undefined)) as unknown;
++    const contextField =
++      rawBody && typeof rawBody === "object"
++        ? (rawBody as { context?: unknown }).context
++        : undefined;
++    const scope: RemoteSessionScope =
++      contextField && typeof contextField === "object"
++        ? {
++            workspacePath:
++              typeof (contextField as { workspacePath?: unknown }).workspacePath === "string"
++                ? ((contextField as { workspacePath: string }).workspacePath)
++                : undefined,
++            workspaceIdentity:
++              typeof (contextField as { workspaceIdentity?: unknown }).workspaceIdentity === "string"
++                ? ((contextField as { workspaceIdentity: string }).workspaceIdentity)
++                : undefined,
++          }
++        : {};
++
++    const parsedBody = remoteTargetSchema.safeParse(rawBody ?? {});
+     if (!parsedBody.success) {
+       return c.json({ error: `Invalid request body: ${formatZodError(parsedBody.error)}` }, 400);
+     }
+@@ -364,15 +456,47 @@ export function createHttpServer(
+     const remoteCdnBaseUrl =
+       process.env.ZCODE_REMOTE_ASSET_CDN_BASE_URL?.trim() ||
+       `https://github.com/ZCodium-project/ZCodium/releases/download/v${ZCODE_VERSION}`;
++    const remoteCacheDir = join(getZCodeDataRootDir(), "tmp", "remote-assets-cache");
+ 
+     try {
+-      const backend = await createRemoteBackend(body);
+-      const connection = await connectRemote(backend, {
+-        remoteCdnBaseUrl,
+-        remoteCacheDir: join(getZCodeDataRootDir(), "tmp", "remote-assets-cache"),
+-      });
+-      const id = generateId();
+-      remoteConnections.set(id, connection);
++      const { id, reused } = await remoteSessionRegistry.connect(
++        body,
++        scope,
++        async (onDidRemoteClose) => {
++          const backend = await createRemoteBackend(body);
++          return connectRemote(backend, {
++            remoteCdnBaseUrl,
++            remoteCacheDir,
++            // le registry expose `(code: number) => void`, connectRemote attend
++            // `{ code: number }` : on fait le pont sans modifier le registry.
++            onDidRemoteClose: (event) => onDidRemoteClose(event.code),
++          });
++        },
++      );
++
++      // zcloudium: le bridge runtime-preferences n'est câblé qu'à la création
++      // effective de la connexion (pas sur réutilisation) : il souscrit à un
++      // event émis par le runtime distant, souscrire deux fois dupliquerait
++      // les réponses pour chaque requête de l'agent.
++      if (!reused) {
++        const session = remoteSessionRegistry.getSession(id);
++        if (session) {
++          const localSettingService = services.getOptional(ISettingService);
++          if (localSettingService) {
++            const agentService = session.connection.services.zcodeAgentService;
++            if (agentService) {
++              bridgeSessionRuntimePreferences(
++                { zcodeAgentService: agentService },
++                localSettingService,
++              );
++            } else {
++              log("ISettingService present but remote zcodeAgentService missing; bridge skipped");
++            }
++          } else {
++            log("ISettingService unavailable; runtime preferences bridge not wired");
++          }
++        }
++      }
+ 
+       return c.json({ id });
+     } catch (err: unknown) {
+@@ -385,17 +509,16 @@ export function createHttpServer(
+   // texte collé — écrits dans l'espace de l'agent, avec un vrai chemin.
+   registerAttachmentStageRoutes(app);
+ 
+-  // zcloudium: 显式释放一条已 attach 的远程连接（web 端 disposeRemoteSession 调用）。
+-  // 关闭 WS 会触发上面的 close 处理，这里主动 dispose 保证两次都幂等。
++  // zcloudium: libération d'une session logique ; la connexion SSH partagée
++  // reste en cache (parité desktop : elle meurt via onDidRemoteClose ou au
++  // redémarrage du serveur). Un id inconnu renvoie 404 `{ok:false}` pour que
++  // le client distingue une libération tardive d'un véritable oubli.
+   app.post("/api/dispose-remote/:id", (c) => {
+     const id = c.req.param("id");
+-    const attached = attachedRemoteConnections.get(id);
+-    if (!attached) {
++    const disposed = remoteSessionRegistry.disposeSession(id);
++    if (!disposed) {
+       return c.json({ ok: false }, 404);
+     }
+-    attachedRemoteConnections.delete(id);
+-    attached.ws.close();
+-    attached.connection.dispose();
+     return c.json({ ok: true });
+   });
+ 
+@@ -447,6 +570,9 @@ export function createHttpServer(
+   app.post("/api/bots/:provider/:botId", handleBotCallback);
+ 
+   // 远程连接的 WebSocket 端点，将远程 services 桥接给浏览器
++  // zcloudium: on attache la socket à la session durable sans jamais disposer
++  // la connexion à la fermeture : le navigateur qui refresh/reopen retombe sur
++  // la même session via son id, et le runtime déployé survit.
+   app.get(
+     "/ws/remote/:id",
+     upgradeWebSocket((c) => {
+@@ -457,26 +583,26 @@ export function createHttpServer(
+             ws.close(4000, "Missing remote connection id");
+             return;
+           }
+-          const connection = remoteConnections.get(id);
+-          if (!connection) {
++          const rawSocket = ws.raw as WebSocket;
++          if (!remoteSessionRegistry.attach(id, rawSocket)) {
++            ws.close(4004, "Remote connection not found");
++            return;
++          }
++          const session = remoteSessionRegistry.getSession(id);
++          if (!session) {
++            // attach a réussi mais la session a été évincée entre-temps :
++            // fermeture propre pour que le navigateur reparte de zéro.
+             ws.close(4004, "Remote connection not found");
+             return;
+           }
+-          // 一个连接只给一个 WS 客户端使用，取出后从 Map 移除
+-          remoteConnections.delete(id);
+ 
+           // zcloudium: 桥接远端 host 暴露的全部 channels（见 remoteBridge.ts），
+           // 浏览器拿到的 accessor 与桌面端一致，web 模式才能打开远程 workspace。
+-          const remoteServices = remoteServiceCollection(connection);
+-
+-          setupChannelServer(ws.raw as WebSocket, remoteServices, "web-remote-replayable");
+-          // zcloudium: ticket 消费后连接只由这条 WS 持有：浏览器断开（刷新/取消）
+-          // 即释放远端连接，否则 SSH backend 与远端 server 进程会一直挂着。
+-          attachedRemoteConnections.set(id, { connection, ws: ws.raw as WebSocket });
+-          (ws.raw as WebSocket).on("close", () => {
+-            attachedRemoteConnections.delete(id);
+-            connection.dispose();
+-          });
++          const remoteServices = remoteServiceCollection(session.connection);
++
++          setupChannelServer(rawSocket, remoteServices, "web-remote-replayable");
++          // aucun dispose sur fermeture WS — attach/detach uniquement, la
++          // connexion partagée reste en cache jusqu'à onDidRemoteClose.
+         },
+       };
+     }),
+diff --git a/packages/server/src/remoteSessionRegistry.ts b/packages/server/src/remoteSessionRegistry.ts
+new file mode 100644
+index 0000000..a0ebcec
+--- /dev/null
++++ b/packages/server/src/remoteSessionRegistry.ts
+@@ -0,0 +1,220 @@
++import { randomUUID } from "node:crypto";
++import type { WebSocket } from "ws";
++import type { RemoteTarget } from "@zcode/shared";
++import { buildSshRemoteHostKey } from "@zcode/shared";
++import type { RemoteConnection } from "./remote/index.js";
++
++/**
++ * Durable server-side remote sessions — the web counterpart of the desktop
++ * host's windowRemoteConnectionRegistry.
++ *
++ * The browser is disposable by design: it refreshes, it closes, the operator
++ * walks away for hours. The remote session (SSH backend + the runtime deployed
++ * on the target, where background tasks run) must NOT share that lifecycle.
++ * This registry therefore owns two layers, mirroring desktop:
++ *
++ * - live connections, keyed by target identity (an SSH channel is expensive:
++ *   reconnecting the same target reuses it instead of redeploying);
++ * - logical sessions, keyed by an unguessable id and scoped per workspace, each
++ *   multiplexed onto its connection and attached to zero or more browser
++ *   sockets at a time.
++ *
++ * Lifetimes: a session dies when the remote side closes (onDidRemoteClose —
++ * target rebooted, SSH cut), when the operator disposes it explicitly, or when
++ * this server restarts. A browser leaving never disposes anything.
++ */
++
++export interface RemoteSessionScope {
++  workspacePath?: string;
++  workspaceIdentity?: string;
++}
++
++interface ConnectionEntry {
++  connection: RemoteConnection;
++  fingerprint: string;
++  sessionIds: Set<string>;
++}
++
++interface SessionEntry {
++  id: string;
++  connection: RemoteConnection;
++  fingerprint: string;
++  scopeKey: string;
++  workspacePath?: string;
++  workspaceIdentity?: string;
++  sockets: Set<WebSocket>;
++}
++
++/** Target identity: what makes two connects "the same machine". */
++export function connectionFingerprint(target: RemoteTarget): string {
++  switch (target.kind) {
++    case "ssh":
++      // Same key desktop builds: host, port, user, key path — never the secret.
++      // `target` is already SSHConnectOptions when kind === "ssh"; passing it
++      // whole keeps the call aligned with buildSshRemoteHostKey's union.
++      return `ssh:${buildSshRemoteHostKey(target)}`;
++    case "wsl":
++      return `wsl:${target.distro ?? ""}:${target.user ?? ""}`;
++    case "docker":
++      // Desktop never reuses docker connections; neither do we.
++      return `docker:${randomUUID()}`;
++  }
++}
++
++export function scopeKeyFor(target: RemoteTarget, scope: RemoteSessionScope): string {
++  const workspace = scope.workspaceIdentity?.trim() || scope.workspacePath?.trim() || "";
++  return `${connectionFingerprint(target)}::${workspace}`;
++}
++
++export class RemoteSessionRegistry {
++  private readonly connections = new Map<string, ConnectionEntry>();
++  private readonly sessions = new Map<string, SessionEntry>();
++  private readonly inflight = new Map<string, Promise<{ id: string; reused: boolean }>>();
++
++  /** A session that is already live for this exact scope: instant re-attach. */
++  findLiveSessionId(scopeKey: string): string | undefined {
++    for (const [id, session] of this.sessions) {
++      if (session.scopeKey === scopeKey) {
++        return id;
++      }
++    }
++    return undefined;
++  }
++
++  getSession(id: string): SessionEntry | undefined {
++    return this.sessions.get(id);
++  }
++
++  /**
++   * Connect, deduplicated: an existing live session for the scope wins, an
++   * in-flight connect is shared, a live connection for the same target is
++   * multiplexed, and only a genuinely new target opens a new SSH connection.
++   */
++  async connect(
++    target: RemoteTarget,
++    scope: RemoteSessionScope,
++    connect: (onDidRemoteClose: (code: number) => void) => Promise<RemoteConnection>,
++  ): Promise<{ id: string; reused: boolean }> {
++    const fingerprint = connectionFingerprint(target);
++    const scopeKey = scopeKeyFor(target, scope);
++
++    const existingSession = this.findLiveSessionId(scopeKey);
++    if (existingSession) {
++      return { id: existingSession, reused: true };
++    }
++
++    const inflight = this.inflight.get(scopeKey);
++    if (inflight) {
++      return { ...(await inflight), reused: true };
++    }
++
++    const creation = (async () => {
++      // A live connection for the same target multiplexes a new workspace scope
++      // without redeploying; only an unknown target opens a new SSH channel.
++      const cached = this.connections.get(fingerprint);
++      if (cached) {
++        const id = this.registerSession(cached, scope, scopeKey);
++        return { id, reused: true };
++      }
++
++      let connection: RemoteConnection | undefined;
++      const onDidRemoteClose = () => {
++        if (connection) {
++          this.handleRemoteClose(connection);
++        }
++      };
++      connection = await connect(onDidRemoteClose);
++      const entry: ConnectionEntry = {
++        connection,
++        fingerprint,
++        sessionIds: new Set(),
++      };
++      this.connections.set(fingerprint, entry);
++      const id = this.registerSession(entry, scope, scopeKey);
++      return { id, reused: false };
++    })();
++
++    const settled = creation.finally(() => this.inflight.delete(scopeKey));
++    this.inflight.set(scopeKey, settled);
++    return settled;
++  }
++
++  /** Attach a browser socket: its lifecycle no longer owns the session. */
++  attach(id: string, ws: WebSocket): boolean {
++    const session = this.sessions.get(id);
++    if (!session) {
++      return false;
++    }
++    session.sockets.add(ws);
++    ws.on("close", () => {
++      session.sockets.delete(ws);
++    });
++    return true;
++  }
++
++  /** Explicit disposal of one logical session; the SSH connection is kept cached (desktop parity). */
++  disposeSession(id: string): boolean {
++    const session = this.sessions.get(id);
++    if (!session) {
++      return false;
++    }
++    this.evictSession(session);
++    return true;
++  }
++
++  private registerSession(
++    entry: ConnectionEntry,
++    scope: RemoteSessionScope,
++    scopeKey: string,
++  ): string {
++    const id = randomUUID();
++    const session: SessionEntry = {
++      id,
++      connection: entry.connection,
++      fingerprint: entry.fingerprint,
++      scopeKey,
++      workspacePath: scope.workspacePath,
++      workspaceIdentity: scope.workspaceIdentity,
++      sockets: new Set(),
++    };
++    entry.sessionIds.add(id);
++    this.sessions.set(id, session);
++    return id;
++  }
++
++  private evictSession(session: SessionEntry): void {
++    for (const ws of session.sockets) {
++      ws.close();
++    }
++    session.sockets.clear();
++    this.sessions.delete(session.id);
++    this.connections.get(session.fingerprint)?.sessionIds.delete(session.id);
++  }
++
++  /** The remote side died (or the SSH channel did): everything downstream dies with it. */
++  private handleRemoteClose(connection: RemoteConnection): void {
++    for (const [key, entry] of [...this.connections]) {
++      if (entry.connection !== connection) {
++        continue;
++      }
++      this.connections.delete(key);
++      for (const sessionId of entry.sessionIds) {
++        const session = this.sessions.get(sessionId);
++        if (session) {
++          // Closing the sockets is how the browser learns the session is gone;
++          // the UI then offers a real reconnect.
++          for (const ws of session.sockets) {
++            ws.close();
++          }
++          session.sockets.clear();
++          this.sessions.delete(sessionId);
++        }
++      }
++      try {
++        connection.dispose();
++      } catch (error) {
++        console.warn("[remote-session] dispose after remote close failed:", error);
++      }
++    }
++  }
++}
+diff --git a/packages/ui/src/Root.tsx b/packages/ui/src/Root.tsx
+index 97c4719..aafc8aa 100644
+--- a/packages/ui/src/Root.tsx
++++ b/packages/ui/src/Root.tsx
+@@ -148,6 +148,7 @@ function RootInner({
+   preferDirectoryBrowser,
+   supportsEmbeddedBrowser: explicitSupportsEmbeddedBrowser,
+   allowRemoteWorkspace = true,
++  autoReconnectRemoteWorkspaces = false,
+   initialWorkspaceLoadingFallback,
+ }: RootProps) {
+   useEffect(() => {
+@@ -529,6 +530,11 @@ function RootInner({
+     platform,
+     supportsSettings,
+     allowRemoteWorkspace,
++    // Web uniquement : quand le serveur porte des sessions durables, un
++    // refresh ne doit plus laisser les tabs distantes en état "disconnected".
++    // Desktop a son propre reattach via Host ; on n'active donc le flag que
++    // quand l'appelant web le demande explicitement.
++    autoReconnectRemoteWorkspaces,
+     // conversation backing workspace 只属于本地桌面主恢复链路；远程窗口和手机
+     // shared-host attachment 不能因此创建独立本地 runtime 或改变 replayable 边界。
+     ensureConversationWorkspaceOnRestore: isDesktop && restoreSession && !initialWorkspaceIdentity,
+diff --git a/packages/ui/src/root/types.ts b/packages/ui/src/root/types.ts
+index 99baa5c..be5988c 100644
+--- a/packages/ui/src/root/types.ts
++++ b/packages/ui/src/root/types.ts
+@@ -34,6 +34,13 @@ export interface RootProps {
+   supportsEmbeddedBrowser?: boolean;
+   /** 是否启用远程工作区能力，Web 普通模式先只支持本地 server 工作区 */
+   allowRemoteWorkspace?: boolean;
++  /**
++   * Web uniquement : ré-attache automatiquement les tabs distantes persistées
++   * au chargement (fire-and-forget par clé). Par défaut false : desktop a son
++   * propre reattach via la chaîne Host, et laisser la web faire de même sans
++   * opt-in relancerait des SSH à chaque refresh sans action utilisateur.
++   */
++  autoReconnectRemoteWorkspaces?: boolean;
+   /** 非桌面入口初始 workspace 注入前继续展示的 loading，桌面端不使用 */
+   initialWorkspaceLoadingFallback?: ReactNode;
+   /** Assistant code-comment 卡片灰度；默认关闭，关闭时保留原始 directive。 */
+diff --git a/packages/ui/src/root/useRemoteWorkspaceHistory.ts b/packages/ui/src/root/useRemoteWorkspaceHistory.ts
+index 4f5ce21..fc8d8fe 100644
+--- a/packages/ui/src/root/useRemoteWorkspaceHistory.ts
++++ b/packages/ui/src/root/useRemoteWorkspaceHistory.ts
+@@ -621,6 +621,7 @@ export function useRemoteWorkspaceHistory({
+   platform,
+   supportsSettings,
+   allowRemoteWorkspace = true,
++  autoReconnectRemoteWorkspaces = false,
+   ensureConversationWorkspaceOnRestore = false,
+   deferInactiveWorkspaceRestore = false,
+   unavailableWorkspacePath,
+@@ -634,6 +635,12 @@ export function useRemoteWorkspaceHistory({
+   platform: IPlatformService;
+   supportsSettings: boolean;
+   allowRemoteWorkspace?: boolean;
++  /**
++   * Web uniquement : quand le serveur porte des sessions durables, un refresh
++   * ne doit plus laisser les tabs distantes en état "disconnected". À laisser
++   * false côté desktop (son reattach passe par la chaîne Host).
++   */
++  autoReconnectRemoteWorkspaces?: boolean;
+   ensureConversationWorkspaceOnRestore?: boolean;
+   /** 仅 Desktop 主窗口：输入可用后再把 inactive workspace 加入 sidebar/task 数据源。 */
+   deferInactiveWorkspaceRestore?: boolean;
+@@ -970,6 +977,49 @@ export function useRemoteWorkspaceHistory({
+         conversationWorkspacePath,
+         restoreMode: deferInactiveWorkspaceRestore ? "active-first" : "all",
+       });
++
++      // zcloudium: sessions distantes durables côté serveur — quand le flag
++      // est vrai (web only, desktop a son propre reattach), on ré-attache
++      // fire-and-forget chaque tab distante qui vient d'être restaurée en
++      // état déconnecté. Le serveur retrouvera la session par scope et ne
++      // redéploiera pas le runtime. Les erreurs sont logged sans impacter
++      // le boot : une cible injoignable ne doit pas bloquer l'UI.
++      if (autoReconnectRemoteWorkspaces && allowRemoteWorkspaceRestore) {
++        const restoredTabs = tabStoreApi.getState().tabs;
++        const remoteKeysToReattach: string[] = [];
++        for (const tab of restoredTabs) {
++          if (!isWorkspaceTab(tab) || tab.remoteSessionId) {
++            continue;
++          }
++          const workspaceKey = buildWorkspaceSessionKey(tab);
++          const sessionEntry = persistedRemoteSessions.find(
++            (entry) => buildWorkspaceSessionKey(entry) === workspaceKey,
++          );
++          if (!sessionEntry) {
++            continue;
++          }
++          remoteKeysToReattach.push(workspaceKey);
++        }
++        for (const workspaceKey of remoteKeysToReattach) {
++          reconnectRemoteWorkspaceByKey({
++            workspaceKey,
++            canUseRemoteWorkspace,
++            getRemoteSessions: () => remoteWorkspaceSessionsRef.current,
++            runReconnectRemoteWorkspace,
++            options: {
++              activateWorkspaceAfterReconnect: false,
++              showErrorToast: false,
++              throwOnFailure: false,
++            },
++          }).catch((error) => {
++            logger.warn("[Root] auto-reattach remote workspace failed", {
++              workspaceKey,
++              error: error instanceof Error ? error.message : String(error),
++            });
++          });
++        }
++      }
++
+       return {
+         ...(conversationWorkspacePath
+           ? { excludedRecentProjectPaths: [conversationWorkspacePath] }
+@@ -981,8 +1031,11 @@ export function useRemoteWorkspaceHistory({
+     },
+     [
+       allowRemoteWorkspaceRestore,
++      autoReconnectRemoteWorkspaces,
++      canUseRemoteWorkspace,
+       deferInactiveWorkspaceRestore,
+       ensureConversationWorkspaceOnRestore,
++      runReconnectRemoteWorkspace,
+       services.fileService,
+       tabStoreApi,
+       unavailableWorkspacePath,
+@@ -1071,7 +1124,7 @@ export function useRemoteWorkspaceHistory({
+         return;
+       }
+ 
+-      // 远程历史入口与侧栏重连都可能命中“重连中被用户移除”的竞态。
++      // 远程历史入口与侧栏重连都可能命中"重连中被用户移除"的竞态。
+       // 这里抽成统一入口，确保两条路径共享相同的并发保护、保留校验与错误处理语义。
+       await openRemoteWorkspaceFromHistoryEntry({
+         workspaceKey,
+@@ -1128,7 +1181,7 @@ export function useRemoteWorkspaceHistory({
+       }
+ 
+       // 远端 host 退出后，tab 上的 remoteSessionId 之前不会被清空。
+-      // UI 因此持续显示“已连接”，并继续把请求路由到失效 session。
++      // UI 因此持续显示"已连接"，并继续把请求路由到失效 session。
+       // 这里在收到 main 进程的 session-close 事件时立即降级为断连态，后续只走用户手动重连。
+       tabStoreApi.setState((state) => ({
+         tabs: state.tabs.map((tab) =>
+@@ -1247,7 +1300,7 @@ export function useRemoteWorkspaceHistory({
+         bindRemoteWorkspacePath(resolvedWorkspacePath, sessionId);
+         bindRemoteWorkspaceIdentity(resolvedWorkspaceIdentity, sessionId);
+         // Bugfix: Bot 触发的远端重连发生在 main/host，不会经过侧栏手动重连的 React 流程。
+-        // 这里收到 main 的成功事件后，把已创建的 session 绑定回 tab 和远端历史，UI 才会从“未连接”变为“已连接”。
++        // 这里收到 main 的成功事件后，把已创建的 session 绑定回 tab 和远端历史，UI 才会从"未连接"变为"已连接"。
+         tabStoreApi.getState().ensureWorkspaceTab(resolvedWorkspacePath, {
+           remoteSessionId: sessionId,
+           remoteTarget: remoteSession.target,
+@@ -1340,7 +1393,7 @@ export function useRemoteWorkspaceHistory({
+           return;
+         }
+ 
+-        // 用户在侧栏“移除”远程 workspace 后，只删 tab 不够：
++        // 用户在侧栏"移除"远程 workspace 后，只删 tab 不够：
+         // remoteWorkspaceSessionsRef 仍被持久化补丁合并回 setting.json，
+         // 所以下次启动又会恢复同一个断连项。这里把显式移除视为删除远程历史，
+         // 同时清理该历史独占的 SSH 凭据，避免留下不可达的 credential key。
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 9eb9b43..b90ec8d 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -141,12 +141,24 @@ function createWebPlatform(services: WebServices): IPlatformService {
+     // one-shot ; l'accessor complet est servi sur /ws/remote/<ticket>, et la
+     // session est enregistrée côté renderer comme sur desktop (cible résolue,
+     // secrets strippés, pour que l'historique se reconnecte au même hôte).
+-    async connectRemote(options: RemoteTarget) {
++    // Le `context` (workspacePath/workspaceIdentity) est forwardé tel quel :
++    // le registry serveur s'en sert pour dédupliquer les sessions sur la même
++    // cible/workspace, afin qu'un refresh ne redéploie pas le runtime.
++    async connectRemote(
++      options: RemoteTarget,
++      requestId?: string,
++      context?: {
++        workspacePath: string;
++        workspaceIdentity?: string;
++        connectTrigger?: import("@zcode/shared").RemoteWorkspaceConnectTrigger;
++      },
++    ) {
++      void requestId;
+       try {
+         const response = await fetch("/api/connect-remote", {
+           method: "POST",
+           headers: { "content-type": "application/json" },
+-          body: JSON.stringify(options),
++          body: JSON.stringify({ ...options, context }),
+         });
+         const payload = (await response.json().catch(() => ({}))) as { id?: string; error?: string };
+         if (!response.ok || !payload.id) {
+@@ -430,6 +442,7 @@ async function bootstrapWebApp() {
+             preferDirectoryBrowser
+             supportsEmbeddedBrowser={false}
+             allowRemoteWorkspace
++            autoReconnectRemoteWorkspaces
+           />
+         </ZCodeIntlProvider>
+       </AppErrorBoundary>,
 -- 
 2.56.0
 
