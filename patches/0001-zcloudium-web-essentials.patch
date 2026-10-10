@@ -1,7 +1,7 @@
 From 3bc96f7db547d08098ade8faaf0e1790981d0b76 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:01:55 +0200
-Subject: [PATCH 1/4] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
+Subject: [PATCH 1/5] =?UTF-8?q?zcloudium:=20web=20essentials=20=E2=80=94?=
  =?UTF-8?q?=20SSH-only=20remote=20workspaces,=20staged=20attachments,=20wo?=
  =?UTF-8?q?rking=20MCP=20settings?=
 MIME-Version: 1.0
@@ -687,7 +687,7 @@ index 052eab8..9eb9b43 100644
 From c1905e69e76b420fffcd9d6ddbfe2f7e3b533518 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Thu, 8 Oct 2026 14:46:52 +0200
-Subject: [PATCH 2/4] zcloudium: reject oversized staging by declared length,
+Subject: [PATCH 2/5] zcloudium: reject oversized staging by declared length,
  catch the composer staging loop
 
 ---
@@ -734,7 +734,7 @@ index 252c211..59fc67a 100644
 From e1ea46dd3c8c8a0bdf3ee38b933f2cffb27569c3 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 19:19:38 +0200
-Subject: [PATCH 3/4] zcloudium: pass the remote-asset deploy options on web
+Subject: [PATCH 3/5] zcloudium: pass the remote-asset deploy options on web
  connect-remote
 
 Desktop builds inject their release-assets CDN URL at compile time,
@@ -799,7 +799,7 @@ index 357c7ef..d65e927 100644
 From 0baf8ca8c9a756424eb4c1f629958a8bfc3dce90 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 20:33:08 +0200
-Subject: [PATCH 4/4] =?UTF-8?q?zcloudium:=20durable=20server-side=20remote?=
+Subject: [PATCH 4/5] =?UTF-8?q?zcloudium:=20durable=20server-side=20remote?=
  =?UTF-8?q?=20sessions=20=E2=80=94=20the=20browser=20is=20disposable,=20th?=
  =?UTF-8?q?e=20work=20is=20not?=
 MIME-Version: 1.0
@@ -1591,6 +1591,84 @@ index 9eb9b43..b90ec8d 100644
            />
          </ZCodeIntlProvider>
        </AppErrorBoundary>,
+-- 
+2.56.0
+
+
+From 70f983d22527e0c7f6ab38f0b60110fe70931eec Mon Sep 17 00:00:00 2001
+From: ZCloudium <zcloudium@local>
+Date: Sat, 10 Oct 2026 21:43:24 +0200
+Subject: [PATCH 5/5] zcloudium: no SPA fallback for hashed assets, plus a web
+ anti-FOUC guard
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An index.html restored by the browser after a redeployment references
+the previous build's hashed assets. The static handler's SPA fallback
+answered those with 200 + index.html (text/html), so the browser parsed
+HTML as CSS and painted the app without a single style rule — reload
+fixed it by revalidating index.html. Two fixes:
+
+- /assets/* that does not exist now answers 404 instead of the SPA
+  fallback (the fallback remains for app routes);
+- the web entry, after first render, probes whether Tailwind actually
+  applied (a .hidden probe must compute display:none) and reloads ONCE
+  when it did not — sessionStorage-guarded against loops, cleared when
+  styles are healthy.
+---
+ packages/server/src/http.ts |  7 +++++++
+ packages/web/src/main.tsx   | 19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index afaaf06..1408562 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -313,6 +313,13 @@ function isTokenProtectedPath(pathname: string): boolean {
+ }
+ 
+ function isStaticFallbackAllowed(pathname: string): boolean {
++  // zcloudium: un asset hashé manquant doit répondre 404, jamais index.html.
++  // Le fallback SPA sur /assets/* servait du HTML à la place du CSS/JS quand
++  // un navigateur restaurait un index.html périmé (redéploiement = nouveaux
++  // hashes) — et la page se peignait sans aucune règle de style.
++  if (pathname.startsWith("/assets/")) {
++    return false;
++  }
+   return !isTokenProtectedPath(pathname);
+ }
+ 
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index b90ec8d..3021a94 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -447,6 +447,25 @@ async function bootstrapWebApp() {
+         </ZCodeIntlProvider>
+       </AppErrorBoundary>,
+     );
++
++    // zcloudium: garde anti-FOUC — si la feuille de style ne s'est pas
++    // appliquée au premier paint (index.html périmé restauré par le navigateur
++    // après un redéploiement : les hashes ont changé), un seul reload
++    // automatique ramène les hashes à jour ; le marqueur sessionStorage
++    // empêche la boucle infinie.
++    requestAnimationFrame(() => {
++      const probe = document.createElement("div");
++      probe.className = "hidden";
++      document.body.appendChild(probe);
++      const styled = getComputedStyle(probe).display === "none";
++      probe.remove();
++      if (!styled && !sessionStorage.getItem("zcloudium-style-reload")) {
++        sessionStorage.setItem("zcloudium-style-reload", "1");
++        location.reload();
++      } else if (styled) {
++        sessionStorage.removeItem("zcloudium-style-reload");
++      }
++    });
+   } catch (error) {
+     renderWebBootstrapError(error);
+   }
 -- 
 2.56.0
 
