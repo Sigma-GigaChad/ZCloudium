@@ -1595,7 +1595,7 @@ index 9eb9b43..b90ec8d 100644
 2.56.0
 
 
-From ec496da30e784c77930c8c4bb8810fdcba28ece1 Mon Sep 17 00:00:00 2001
+From b71d94c80264851a27a479ace4b56f002d56d425 Mon Sep 17 00:00:00 2001
 From: ZCloudium <zcloudium@local>
 Date: Sat, 10 Oct 2026 21:43:24 +0200
 Subject: [PATCH 5/5] =?UTF-8?q?zcloudium:=20carte=20Machine=20courante=20+?=
@@ -1610,10 +1610,11 @@ une paire ed25519 dans le volume (0600/0644/0700), affiche la clé
 publique à installer une fois, substitue la clé privée côté route
 (hostMachine:true écrase toute privateKeyPath client). Desktop jamais
 impacté (gate supportsHostMachineConnect). Format privé = OpenSSH
-(openssh-key-v1 sérialisé à la main) : node:crypto n'exporte pas ce
-format et le ssh2 embarqué refuse le PKCS#8 ed25519.
+(openssh-key-v1 sérialisé à la main, magic NUL + uint32 brut) :
+node:crypto n'exporte pas ce format et le ssh2 embarqué refuse le
+PKCS#8 ed25519.
 ---
- packages/server/src/hostMachine.ts            | 328 ++++++++++++++++++
+ packages/server/src/hostMachine.ts            | 330 ++++++++++++++++++
  packages/server/src/http.ts                   |  36 ++
  packages/shared/src/platform.ts               |   7 +
  packages/shared/src/remoteTarget.ts           |   6 +
@@ -1627,15 +1628,15 @@ format et le ssh2 embarqué refuse le PKCS#8 ed25519.
  packages/ui/src/i18n/locales/zh-CN.ts         |   4 +
  packages/ui/src/lib/remoteConnectionWizard.ts |  32 +-
  packages/web/src/main.tsx                     |  40 ++-
- 14 files changed, 644 insertions(+), 27 deletions(-)
+ 14 files changed, 646 insertions(+), 27 deletions(-)
  create mode 100644 packages/server/src/hostMachine.ts
 
 diff --git a/packages/server/src/hostMachine.ts b/packages/server/src/hostMachine.ts
 new file mode 100644
-index 0000000..a1db1dc
+index 0000000..b50c0fe
 --- /dev/null
 +++ b/packages/server/src/hostMachine.ts
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,330 @@
 +import {
 +  createPrivateKey,
 +  createPublicKey,
@@ -1872,12 +1873,14 @@ index 0000000..a1db1dc
 +  });
 +  const paddedPriv = Buffer.concat([privSection, padding]);
 +
++  // AUTH_MAGIC = "openssh-key-v1" + NUL terminal (sizeof du C string), et le
++  // nombre de clés est un uint32 BRUT (pas un string length-préfixé).
 +  const head = Buffer.concat([
-+    Buffer.from("openssh-key-v1\n", "utf8"),
++    Buffer.from("openssh-key-v1\0", "utf8"),
 +    lenPrefixed(Buffer.from("none")),
 +    lenPrefixed(Buffer.from("none")),
 +    lenPrefixed(Buffer.alloc(0)),
-+    lenPrefixed(Buffer.from([0, 0, 0, 1])),
++    Buffer.from([0, 0, 0, 1]),
 +    lenPrefixed(pubBlob),
 +    lenPrefixed(paddedPriv),
 +  ]);
@@ -1965,7 +1968,7 @@ index 0000000..a1db1dc
 +  });
 +}
 diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
-index afaaf06..609bf4d 100644
+index afaaf06..59bc63c 100644
 --- a/packages/server/src/http.ts
 +++ b/packages/server/src/http.ts
 @@ -46,6 +46,11 @@ import {
@@ -2019,7 +2022,7 @@ index afaaf06..609bf4d 100644
 +    // schema, zod rejetterait le body avant que la substitution ne s'exécute
 +    // et la feature serait morte à l'entrée. Tout changement du flag côté
 +    // schema doit donc rester synchronisé avec cette substitution.
-+    if (body.kind === "ssh" && body.hostMachine === true) {
++    if (body.kind === "ssh" && body.hostMachine === true && isHostMachineEnabled()) {
 +      const sshBody = body as import("@zcode/shared").SSHConnectOptions;
 +      sshBody.privateKeyPath = getHostMachinePrivateKeyPath();
 +      delete sshBody.hostMachine;
