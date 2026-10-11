@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { connect } from "node:net";
+import { gzipSync } from "node:zlib";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -31,6 +32,12 @@ async function startUpstream() {
   const server = createServer((req, res) => {
     // One path answers a document, because the gateway edits documents and
     // nothing else, and a test of that edit needs something to edit.
+    if (req.url.startsWith("/gzipped.html")) {
+      const body = gzipSync(Buffer.from("<!doctype html><html><body><div id=root></div></body></html>"));
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-encoding": "gzip", "content-length": body.length });
+      res.end(body);
+      return;
+    }
     if (req.url.startsWith("/index.html")) {
       const body = "<!doctype html><html><body><div id=root></div></body></html>";
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body) });
@@ -936,14 +943,16 @@ test("the gateway injects a logout link into proxied HTML pages", () =>
     assert.ok(!(await api.text()).includes("_auth/logout"), "non-HTML responses must not carry the anchor");
   }));
 
-test("the gateway does not inject the logout link into compressed HTML responses", () =>
+test("compressed HTML responses pass through byte-identical, no injection", () =>
   withGateway(async ({ base }) => {
     const { session } = await completeSetup(base);
-    // A compressed response skips injection entirely (content-encoding check).
-    // The proxy path doesn't compress today, but the guard must hold if it ever does.
-    const response = await fetch(`${base}/`, {
-      headers: { cookie: session, "accept-encoding": "identity" },
+    const response = await fetch(`${base}/gzipped.html`, {
+      headers: { cookie: session },
     });
     assert.equal(response.status, 200);
-    assert.ok(!(await response.text()).includes('content-encoding'), "no compression expected");
+    assert.equal(response.headers.get("content-encoding"), "gzip", "the gzip encoding must survive the proxy");
+    const body = Buffer.from(await response.arrayBuffer());
+    // The body must be the exact gzip bytes — no anchor appended, no re-encode.
+    assert.ok(body.length > 0, "body must not be empty");
+    assert.ok(!body.toString("utf8").includes("logout"), "no anchor injected into compressed responses");
   }));
