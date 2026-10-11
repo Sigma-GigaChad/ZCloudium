@@ -122,8 +122,10 @@ connection refused, not a warning, which is why this paragraph exists.
 
 What it does: it authenticates a browser session (password plus TOTP), it keeps
 the runtime off every published interface, and it owns the session cookies. It
-is a pure pass-through towards the application: it never edits an answer of the
-runtime, so the page the operator loads is exactly the page the runtime sends.
+is a pure pass-through towards the application, with one deliberate exception:
+a constant, same-origin logout anchor (no script, no request data) is injected
+before `</body>` in proxied HTML responses, because the upstream app has no
+logout UI of its own. Everything else passes through byte-identical.
 
 Every page of its own carries a closed content security policy
 (`default-src 'none'`, the one inline script allowed by its sha256 hash,

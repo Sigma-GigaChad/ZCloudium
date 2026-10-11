@@ -789,6 +789,31 @@ export async function createGateway({
       (response) => {
         counters.upstreamRequests += 1;
         counters.upstreamDurationMs += Math.max(0, now() - startedAt);
+        const contentType = String(response.headers["content-type"] ?? "");
+        if (contentType.startsWith("text/html") && !response.headers["content-encoding"]) {
+          // zcloudium: injecte un lien logout discret dans les pages HTML du
+          // runtime. L'élément vit hors du div React (#root) et survit à la
+          // navigation SPA. C'est la seule modification que le gateway fait à
+          // une réponse proxifiée — tout le reste passe inchangé.
+          const chunks = [];
+          let length = 0;
+          response.on("data", (chunk) => { chunks.push(chunk); length += chunk.length; });
+          response.on("end", () => {
+            let body = Buffer.concat(chunks, length).toString("utf8");
+            const logoutEl = '<a href="/_auth/logout" style="position:fixed;bottom:6px;right:10px;z-index:2147483647;font-size:11px;color:#8888aa;text-decoration:none;opacity:.35;font-family:monospace" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.35">logout</a>';
+            if (body.includes("</body>")) {
+              body = body.replace("</body>", logoutEl + "</body>");
+            } else {
+              body += logoutEl;
+            }
+            const buf = Buffer.from(body, "utf8");
+            const headers = { ...response.headers, "content-length": String(buf.length) };
+            delete headers["transfer-encoding"];
+            res.writeHead(response.statusCode ?? 502, headers);
+            res.end(buf);
+          });
+          return;
+        }
         res.writeHead(response.statusCode ?? 502, response.headers);
         response.pipe(res);
       },

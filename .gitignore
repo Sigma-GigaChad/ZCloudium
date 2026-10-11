@@ -15,3 +15,4 @@ compose.*.local.yml
 
 # Compose coherence test fixtures (tests/test-compose-checks.sh)
 *.yml.test
+.zcode/plans/
