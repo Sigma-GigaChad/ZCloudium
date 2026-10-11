@@ -790,7 +790,7 @@ export async function createGateway({
         counters.upstreamRequests += 1;
         counters.upstreamDurationMs += Math.max(0, now() - startedAt);
         const contentType = String(response.headers["content-type"] ?? "");
-        if (contentType.startsWith("text/html")) {
+        if (contentType.startsWith("text/html") && !response.headers["content-encoding"]) {
           // zcloudium: injecte un lien logout discret dans les pages HTML du
           // runtime. L'élément vit hors du div React (#root) et survit à la
           // navigation SPA. C'est la seule modification que le gateway fait à
@@ -807,10 +807,9 @@ export async function createGateway({
               body += logoutEl;
             }
             const buf = Buffer.from(body, "utf8");
-            res.writeHead(response.statusCode ?? 502, {
-              ...response.headers,
-              "content-length": String(buf.length),
-            });
+            const headers = { ...response.headers, "content-length": String(buf.length) };
+            delete headers["transfer-encoding"];
+            res.writeHead(response.statusCode ?? 502, headers);
             res.end(buf);
           });
           return;
