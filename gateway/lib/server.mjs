@@ -968,11 +968,12 @@ export async function createGateway({
           const requestLine = text.split("\r\n")[0] ?? "";
           const path = requestLine.split(" ")[1]?.split("?")[0] || "/";
           const host = /host:\s*(\S+)/i.exec(text)?.[1]?.trim() || "";
-          const redirect = `HTTP/1.1 301 Moved Permanently\r\n` +
+          socket.end(
+            `HTTP/1.1 301 Moved Permanently\r\n` +
             `Location: https://${host}${path}\r\n` +
             `Connection: close\r\n` +
-            `Content-Length: 0\r\n\r\n`;
-          socket.write(redirect, () => socket.end());
+            `Content-Length: 0\r\n\r\n`,
+          );
         } else {
           socket.destroy();
         }
