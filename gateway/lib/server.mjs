@@ -938,6 +938,31 @@ export async function createGateway({
   // handler, the sockets it tracks and the upgrade path below are shared.
   const server = tls ? createSecureServer({ cert: tls.cert, key: tls.key }, handler) : createServer(handler);
 
+  if (tls) {
+    // A plain HTTP request on the TLS port: the handshake fails, but the raw
+    // bytes are still readable. If they start with an HTTP method (uppercase
+    // ASCII), answer a plain 301 to the same URL over https — so an operator
+    // who types http:// lands on the secure page instead of a blank screen.
+    server.on("tlsClientError", (err, socket) => {
+      socket.once("data", (data) => {
+        const first = data[0];
+        if (first < 0x41 || first > 0x5a) {
+          socket.destroy();
+          return;
+        }
+        const text = data.toString("latin1");
+        const host = /host:\s*(\S+)/i.exec(text)?.[1]?.trim() ?? "";
+        const path = text.split(" ")[1]?.split("?")[0] ?? "/";
+        socket.end(
+          `HTTP/1.1 301 Moved Permanently\r\n` +
+          `Location: https://${host}${path}\r\n` +
+          `Connection: close\r\n` +
+          `Content-Length: 0\r\n\r\n`,
+        );
+      });
+    });
+  }
+
   server.on("upgrade", handleUpgrade);
 
   /**
