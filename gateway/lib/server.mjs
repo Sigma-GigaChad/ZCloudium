@@ -949,7 +949,14 @@ export async function createGateway({
     // Without this, an operator who types http:// gets a blank screen — the
     // TLS listener cannot parse a plain HTTP request.
     server = createNetServer({ pauseOnConnect: true }, (socket) => {
+      connections.add(socket);
+      socket.on("close", () => connections.delete(socket));
+      socket.setTimeout(30_000, () => socket.destroy());
+      socket.resume();
       socket.once("data", (data) => {
+        // Disarm the entry-server idle timeout: the HTTPS server's own
+        // timeouts own idle policy from here on.
+        socket.setTimeout(0);
         if (data[0] === 0x16) {
           // TLS ClientHello: push the bytes back and let the HTTPS server
           // run the handshake and serve the request.
@@ -976,17 +983,12 @@ export async function createGateway({
     // Shutting down the entry server also shuts down the HTTPS server.
     const entryClose = server.close.bind(server);
     server.close = (callback) => {
-      httpsServer.close(callback);
-      return entryClose(callback);
-    };
-    server.closeAllConnections = () => {
-      httpsServer.closeAllConnections?.();
+      httpsServer.close(() => entryClose(callback));
     };
   } else {
     server = createServer(handler);
+    server.on("upgrade", handleUpgrade);
   }
-
-  server.on("upgrade", handleUpgrade);
 
   /**
    * Every socket the server accepted, tracked here rather than trusted to Node.
