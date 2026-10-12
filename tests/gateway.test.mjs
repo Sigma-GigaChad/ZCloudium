@@ -368,6 +368,37 @@ test("logout clears the session", () =>
     assert.match(cleared, /Max-Age=0/);
   }));
 
+test("logout also accepts GET, which is what the runtime menu navigation issues", () =>
+  withGateway(async ({ base }) => {
+    const { session } = await completeSetup(base);
+    const response = await fetch(`${base}/_auth/logout`, {
+      method: "GET",
+      headers: { cookie: session },
+      redirect: "manual",
+    });
+    assert.equal(response.status, 303);
+    assert.match(response.headers.get("location"), /\/_auth\/login/);
+    const cleared = response.headers
+      .getSetCookie()
+      .find((entry) => entry.startsWith("zc_sess="));
+    assert.ok(cleared && /Max-Age=0/.test(cleared), "GET logout must clear the session cookie");
+  }));
+
+test("the status endpoint tells the runtime UI where logout lives, without a session", () =>
+  withGateway(async ({ base }) => {
+    // Anonymous on purpose: the entry must be discoverable before sign-in, and
+    // the fact it names (this origin authenticates) is already public.
+    const anonymous = await fetch(`${base}/_auth/status`, { redirect: "manual" });
+    assert.equal(anonymous.status, 200);
+    assert.match(anonymous.headers.get("content-type"), /application\/json/);
+    assert.deepEqual(await anonymous.json(), {
+      gateway: "zcloudium",
+      auth: true,
+      logout: "/_auth/logout",
+    });
+  }));
+
+
 test("the requested path survives the login round trip", () =>
   withGateway(async ({ base }) => {
     const response = await fetch(`${base}/settings?tab=model`, { redirect: "manual" });
@@ -921,26 +952,21 @@ test("a dead upstream answers with an html page that reloads itself", async () =
   }
 });
 
-test("the gateway injects a logout link into proxied HTML pages", () =>
+test("proxied HTML pages pass through untouched — the logout entry lives in the runtime UI", () =>
   withGateway(async ({ base }) => {
     const { session } = await completeSetup(base);
 
     const response = await fetch(`${base}/index.html`, { headers: { cookie: session } });
     const body = await response.text();
     assert.equal(response.status, 200);
-    assert.match(body, /href="\/_auth\/logout"/, "the logout anchor must be injected");
     assert.ok(
-      body.indexOf('href="/_auth/logout"') < body.indexOf("</body>"),
-      "the anchor must appear before </body>",
+      !body.includes("_auth/logout"),
+      "the gateway must not inject anything into proxied HTML",
     );
-
-    // Content-length must match the actual body length (recomputed after injection).
-    const length = parseInt(response.headers.get("content-length"), 10);
-    assert.equal(length, Buffer.byteLength(body, "utf8"), "content-length must match the body");
-
-    // Non-HTML responses must not be touched.
-    const api = await fetch(`${base}/api/server-info`, { headers: { cookie: session } });
-    assert.ok(!(await api.text()).includes("_auth/logout"), "non-HTML responses must not carry the anchor");
+    assert.ok(
+      !body.includes("</body>logout"),
+      "no trailing element may be appended either",
+    );
   }));
 
 test("compressed HTML responses pass through byte-identical, no injection", () =>
