@@ -85,21 +85,21 @@ index 0000000..b9872b2
 +}
 diff --git a/packages/server/src/hostMachine.ts b/packages/server/src/hostMachine.ts
 new file mode 100644
-index 0000000..b50c0fe
+index 0000000..7273495
 --- /dev/null
 +++ b/packages/server/src/hostMachine.ts
-@@ -0,0 +1,330 @@
-+import {
-+  createPrivateKey,
-+  createPublicKey,
-+  generateKeyPairSync,
-+  type KeyObject,
-+} from "node:crypto";
+@@ -0,0 +1,278 @@
++import type { KeyObject } from "node:crypto";
 +import { readFileSync } from "node:fs";
 +import { chmod, mkdir, readFile, stat as statFn, writeFile } from "node:fs/promises";
 +import { join } from "node:path";
 +import { Hono } from "hono";
 +import { getZCodeDataRootDir } from "@zcode/services/node";
++import {
++  generateEd25519Keypair,
++  parseUnencryptedOpenSshEd25519Pem,
++  toOpenSshPrivatePem,
++} from "./openSshEd25519.js";
 +
 +/**
 + * zcloudium: carte « machine courante » du wizard web — l'agent du conteneur
@@ -243,31 +243,37 @@ index 0000000..b50c0fe
 +  }
 +
 +  if (privateKeyExists) {
-+    // Réemploi : on s'assure que les permissions n'ont pas dérivé (montage volume
-+    // typiquement), sans toucher au contenu — une réécriture effacerait le lien
-+    // authorized_keys déjà installé côté hôte.
-+    await chmod(privateKeyPath, 0o600).catch(() => undefined);
-+    let cachedPublic: string | null = null;
-+    try {
-+      cachedPublic = (await readFile(publicKeyPath, "utf8")).trim();
-+    } catch {
-+      cachedPublic = null;
++    // Réemploi : la clé privée est la source de vérité — la ligne publique est
++    // relue depuis son blob embarqué, pas depuis le fichier .pub qui peut avoir
++    // dérivé. Une clé qui ne parse pas (générateur antérieur au format correct,
++    // fichier corrompu, clé chiffrée) est régénérée : autant échouer proprement
++    // ici que laisser ssh2 répondre « Malformed OpenSSH private key » au moment
++    // de la connexion. La régénération rend caduque la clé publique déjà
++    // installée dans authorized_keys côté hôte — le log le signale.
++    const stagedPublic = await readFile(privateKeyPath, "utf8")
++      .then((pem) => parseUnencryptedOpenSshEd25519Pem(pem))
++      .catch(() => null);
++    if (stagedPublic !== null) {
++      await chmod(privateKeyPath, 0o600).catch(() => undefined);
++      let cachedPublic: string | null = null;
++      try {
++        cachedPublic = (await readFile(publicKeyPath, "utf8")).trim();
++      } catch {
++        cachedPublic = null;
++      }
++      if (cachedPublic !== stagedPublic) {
++        await writeFile(publicKeyPath, `${stagedPublic}\n`, { mode: 0o644 });
++      }
++      return { privateKeyPath, publicKey: stagedPublic };
 +    }
-+    if (cachedPublic) {
-+      return { privateKeyPath, publicKey: cachedPublic };
-+    }
-+    // Clé publique manquante : on la régénère à partir de la privée stockée
-+    // plutôt que de forcer une nouvelle génération (ce qui casserait le lien
-+    // authorized_keys de l'hôte). createPublicKey(KeyObject) suffit pour
-+    // dériver la publique depuis un PEM privé ed25519.
-+    const privateKeyPem = await readFile(privateKeyPath);
-+    const privateKeyLoaded = createPrivateKey(privateKeyPem);
-+    const publicKey = formatOpenSshEd25519PublicKey(createPublicKey(privateKeyLoaded));
-+    await writeFile(publicKeyPath, `${publicKey}\n`, { mode: 0o644 });
-+    return { privateKeyPath, publicKey };
++    console.warn(
++      "[zcode-server:host-machine] the staged private key is not a well-formed " +
++        "unencrypted OpenSSH ed25519 key — regenerating it. The public key previously " +
++        "installed in the host's authorized_keys must be replaced with the new one.",
++    );
 +  }
 +
-+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
++  const { privateKey, publicKey } = generateEd25519Keypair();
 +  const publicOpenSsh = formatOpenSshEd25519PublicKey(publicKey);
 +  // OpenSSH private format, pas PKCS#8 : le ssh2 embarqué refuse le PKCS#8
 +  // ed25519 ("Unsupported key format", vérifié en bout-en-bout contre la cible).
@@ -285,67 +291,9 @@ index 0000000..b50c0fe
 +}
 +
 +/**
-+ * zcloudium: sérialise une clé ed25519 au format OpenSSH privé non chiffré
-+ * ("openssh-key-v1"). node:crypto n'exporte pas ce format, et le ssh2 embarqué
-+ * refuse le PKCS#8 pour ed25519 ("Unsupported key format", vérifié en bout-en-bout).
-+ * Wire format documenté : magic + cipher/kdf "none" + 1 clé + section privée
-+ * (checkint x2, type, pub, priv = seed 32 o + pub 32 o, comment, padding 1..n).
++ * zcloudium: la sérialisation/lecture du format OpenSSH privé ed25519 vit dans
++ * openSshEd25519.ts — module autonome (aucun import projet), testé directement.
 + */
-+function toOpenSshPrivatePem(
-+  privateKey: KeyObject,
-+  publicKey: KeyObject,
-+  comment: string,
-+): string {
-+  const lenPrefixed = (buf: Buffer): Buffer => {
-+    const head = Buffer.alloc(4);
-+    head.writeUInt32BE(buf.length, 0);
-+    return Buffer.concat([head, buf]);
-+  };
-+
-+  const keyType = Buffer.from("ssh-ed25519");
-+  const publicRaw = publicKey.export({ format: "der", type: "spki" }) as Buffer;
-+  const publicRaw32 = publicRaw.subarray(publicRaw.length - 32);
-+  const privateDer = privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
-+  const privateSeed = privateDer.subarray(privateDer.length - 32);
-+
-+  const check = Buffer.from("7a9f31c2", "hex");
-+  const pubBlob = Buffer.concat([lenPrefixed(keyType), lenPrefixed(publicRaw32)]);
-+  const privSection = Buffer.concat([
-+    check,
-+    check,
-+    lenPrefixed(keyType),
-+    lenPrefixed(publicRaw32),
-+    lenPrefixed(privateSeed),
-+    lenPrefixed(Buffer.from(comment, "utf8")),
-+  ]);
-+  const padLength = 8 - (privSection.length % 8);
-+  const padding = Buffer.alloc(padLength > 0 ? padLength : 0);
-+  padding.forEach((_, i) => {
-+    padding[i] = i + 1;
-+  });
-+  const paddedPriv = Buffer.concat([privSection, padding]);
-+
-+  // AUTH_MAGIC = "openssh-key-v1" + NUL terminal (sizeof du C string), et le
-+  // nombre de clés est un uint32 BRUT (pas un string length-préfixé).
-+  const head = Buffer.concat([
-+    Buffer.from("openssh-key-v1\0", "utf8"),
-+    lenPrefixed(Buffer.from("none")),
-+    lenPrefixed(Buffer.from("none")),
-+    lenPrefixed(Buffer.alloc(0)),
-+    Buffer.from([0, 0, 0, 1]),
-+    lenPrefixed(pubBlob),
-+    lenPrefixed(paddedPriv),
-+  ]);
-+
-+  const b64 = head.toString("base64");
-+  const wrapped = b64.match(/.{1,70}/g) ?? [b64];
-+  return [
-+    "-----BEGIN OPENSSH PRIVATE KEY-----",
-+    ...wrapped,
-+    "-----END OPENSSH PRIVATE KEY-----",
-+    "",
-+  ].join("\n");
-+}
 +
 +export function getHostMachinePrivateKeyPath(): string {
 +  return getHostMachinePrivateKeyPathInternal();
@@ -768,6 +716,217 @@ index 8c38f91..59bc63c 100644
          },
        };
      }),
+diff --git a/packages/server/src/openSshEd25519.ts b/packages/server/src/openSshEd25519.ts
+new file mode 100644
+index 0000000..5bb71e8
+--- /dev/null
++++ b/packages/server/src/openSshEd25519.ts
+@@ -0,0 +1,205 @@
++import { generateKeyPairSync, type KeyObject } from "node:crypto";
++
++/**
++ * zcloudium: sérialisation et lecture du format de clé privée OpenSSH
++ * « openssh-key-v1 » pour ed25519, sans dépendance.
++ *
++ * Pourquoi à la main : node:crypto n'exporte pas ce format (createPrivateKey
++ * rejette d'ailleurs tout PEM OpenSSH — « DECODER routines::unsupported »),
++ * et le ssh2 embarqué refuse le PKCS#8 ed25519 (« Unsupported key format »).
++ * Le format est celui de PROTOCOL.key : AUTH_MAGIC + ciphername/kdfname/
++ * kdfoptions + nombre de clés + blob public + section privée (checkint ×2,
++ * type, blob public, champ privé, commentaire, padding 1..n).
++ *
++ * Pour ed25519 le champ privé fait 64 octets : seed ‖ clé publique. Une
++ * section qui n'emporte que la seed (32 octets) est rejetée par ssh2
++ * (« Malformed OpenSSH private key ») comme par ssh-keygen — les deux
++ * valident priv[32:64] == pub.
++ */
++
++const AUTH_MAGIC = Buffer.from("openssh-key-v1\0", "utf8");
++const ED25519_KEY_TYPE = Buffer.from("ssh-ed25519", "utf8");
++
++/** Génère un couple ed25519 frais (seed + clé publique). */
++export function generateEd25519Keypair(): { privateKey: KeyObject; publicKey: KeyObject } {
++  return generateKeyPairSync("ed25519");
++}
++
++function lenPrefixed(buf: Buffer): Buffer {
++  const head = Buffer.alloc(4);
++  head.writeUInt32BE(buf.length, 0);
++  return Buffer.concat([head, buf]);
++}
++
++/** Raw 32 octets d'une clé publique ed25519 (queue du DER SPKI). */
++function publicRaw32Of(publicKey: KeyObject): Buffer {
++  const der = publicKey.export({ format: "der", type: "spki" }) as Buffer;
++  return der.subarray(der.length - 32);
++}
++
++/** Seed 32 octets d'une clé privée ed25519 (queue du DER PKCS#8). */
++function privateSeedOf(privateKey: KeyObject): Buffer {
++  const der = privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
++  return der.subarray(der.length - 32);
++}
++
++/**
++ * Sérialise une clé privée ed25519 en PEM OpenSSH non chiffré. La clé publique
++ * est réembarquée dans le champ privé (seed ‖ pub), comme l'exige le format.
++ */
++export function toOpenSshPrivatePem(
++  privateKey: KeyObject,
++  publicKey: KeyObject,
++  comment: string,
++): string {
++  const publicRaw32 = publicRaw32Of(publicKey);
++  const privateField = Buffer.concat([privateSeedOf(privateKey), publicRaw32]);
++
++  // Checkints identiques : la lecture utilise leur égalité pour valider le
++  // décodage. Une valeur fixe fait le travail pour une clé non chiffrée.
++  const check = Buffer.from("7a9f31c2", "hex");
++  const pubBlob = Buffer.concat([lenPrefixed(ED25519_KEY_TYPE), lenPrefixed(publicRaw32)]);
++  const privSection = Buffer.concat([
++    check,
++    check,
++    lenPrefixed(ED25519_KEY_TYPE),
++    lenPrefixed(publicRaw32),
++    lenPrefixed(privateField),
++    lenPrefixed(Buffer.from(comment, "utf8")),
++  ]);
++  let padLength = 8 - (privSection.length % 8);
++  if (padLength === 8) {
++    padLength = 0;
++  }
++  const padding = Buffer.alloc(padLength);
++  padding.forEach((_, i) => {
++    padding[i] = i + 1;
++  });
++  const paddedPriv = Buffer.concat([privSection, padding]);
++
++  // Le nombre de clés est un uint32 brut — pas une string length-préfixée.
++  const head = Buffer.concat([
++    AUTH_MAGIC,
++    lenPrefixed(Buffer.from("none")),
++    lenPrefixed(Buffer.from("none")),
++    lenPrefixed(Buffer.alloc(0)),
++    Buffer.from([0, 0, 0, 1]),
++    lenPrefixed(pubBlob),
++    lenPrefixed(paddedPriv),
++  ]);
++
++  const b64 = head.toString("base64");
++  const wrapped = b64.match(/.{1,70}/g) ?? [b64];
++  return [
++    "-----BEGIN OPENSSH PRIVATE KEY-----",
++    ...wrapped,
++    "-----END OPENSSH PRIVATE KEY-----",
++    "",
++  ].join("\n");
++}
++
++/** Décodage borné : lit un champ « string » (uint32BE + octets) à offset. */
++function readLenPrefixed(buf: Buffer, offset: number): { value: Buffer; next: number } | null {
++  if (offset + 4 > buf.length) {
++    return null;
++  }
++  const length = buf.readUInt32BE(offset);
++  if (offset + 4 + length > buf.length) {
++    return null;
++  }
++  return { value: buf.subarray(offset + 4, offset + 4 + length), next: offset + 4 + length };
++}
++
++/**
++ * Valide un PEM de clé privée OpenSSH ed25519 non chiffrée et en dérive la
++ * ligne publique (« ssh-ed25519 AAAA… commentaire ») lue dans le blob embarqué.
++ * Retourne null si la moindre structure dévie : c'est le prédicat de réemploi —
++ * une clé qui n'y répond pas doit être régénérée, pas utilisée.
++ */
++export function parseUnencryptedOpenSshEd25519Pem(pem: string): string | null {
++  const body = pem
++    .split("\n")
++    .filter((line) => !line.startsWith("-----"))
++    .join("");
++  let raw: Buffer;
++  try {
++    raw = Buffer.from(body, "base64");
++  } catch {
++    return null;
++  }
++  if (raw.length <= AUTH_MAGIC.length || !raw.subarray(0, AUTH_MAGIC.length).equals(AUTH_MAGIC)) {
++    return null;
++  }
++
++  let cursor = AUTH_MAGIC.length;
++  const ciphername = readLenPrefixed(raw, cursor);
++  if (!ciphername || ciphername.value.toString("utf8") !== "none") {
++    // Chiffrée (ou champ illisible) : on ne sait ni la lire ni l'avoir écrite.
++    return null;
++  }
++  const kdfname = readLenPrefixed(raw, ciphername.next);
++  if (!kdfname || kdfname.value.toString("utf8") !== "none") {
++    return null;
++  }
++  const kdfoptions = readLenPrefixed(raw, kdfname.next);
++  if (!kdfoptions || kdfoptions.value.length !== 0) {
++    return null;
++  }
++  cursor = kdfoptions.next;
++  if (cursor + 4 > raw.length || raw.readUInt32BE(cursor) !== 1) {
++    return null;
++  }
++  cursor += 4;
++
++  const pubBlob = readLenPrefixed(raw, cursor);
++  if (!pubBlob) {
++    return null;
++  }
++  const pubType = readLenPrefixed(pubBlob.value, 0);
++  const pubRaw = pubType ? readLenPrefixed(pubBlob.value, pubType.next) : null;
++  if (
++    !pubType ||
++    !pubRaw ||
++    !pubType.value.equals(ED25519_KEY_TYPE) ||
++    pubRaw.value.length !== 32
++  ) {
++    return null;
++  }
++
++  const privSection = readLenPrefixed(raw, pubBlob.next);
++  if (!privSection || privSection.next !== raw.length) {
++    return null;
++  }
++  const section = privSection.value;
++  if (section.length < 8 || !section.subarray(0, 4).equals(section.subarray(4, 8))) {
++    return null;
++  }
++  const privType = readLenPrefixed(section, 8);
++  const privPub = privType ? readLenPrefixed(section, privType.next) : null;
++  const privField = privPub ? readLenPrefixed(section, privPub.next) : null;
++  const commentField = privField ? readLenPrefixed(section, privField.next) : null;
++  if (
++    !privType ||
++    !privPub ||
++    !privField ||
++    !commentField ||
++    !privType.value.equals(ED25519_KEY_TYPE) ||
++    !privPub.value.equals(pubRaw.value) ||
++    // Le champ privé ed25519 est seed ‖ publique (64 octets) — la longueur 32
++    // d'une seed seule est exactement le bug historique de ce générateur.
++    privField.value.length !== 64 ||
++    !privField.value.subarray(32).equals(pubRaw.value)
++  ) {
++    return null;
++  }
++
++  // Padding : octets 1..n, et rien derrière.
++  const padding = section.subarray(commentField.next);
++  for (let i = 0; i < padding.length; i += 1) {
++    if (padding[i] !== i + 1) {
++      return null;
++    }
++  }
++
++  return `ssh-ed25519 ${pubBlob.value.toString("base64")} ${commentField.value.toString("utf8")}`;
++}
 diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
 new file mode 100644
 index 0000000..1aff54c
@@ -1150,6 +1309,145 @@ index 0000000..626bee6
 +    }
 +  }
 +}
+diff --git a/packages/server/test/openSshEd25519.test.ts b/packages/server/test/openSshEd25519.test.ts
+new file mode 100644
+index 0000000..07c2216
+--- /dev/null
++++ b/packages/server/test/openSshEd25519.test.ts
+@@ -0,0 +1,133 @@
++/**
++ * zcloudium: le format OpenSSH privé produit par openSshEd25519.ts doit être
++ * accepté par les parsers réels (ssh-keygen, ssh2 — validé hors repo contre
++ * ssh2 1.17 et OpenSSH), et le parseur de réemploi doit rejeter tout ce qui
++ * n'est pas exactement une clé ed25519 non chiffrée bien formée.
++ *
++ * Le test 2 épingle le bug historique (prod, 2026-10-12) : le sérialiseur
++ * écrivait le champ privé comme la seed seule (32 octets) au lieu de
++ * seed ‖ clé publique (64 octets). ssh2 rejetait alors la clé au moment de
++ * la connexion : « Cannot parse privateKey: Malformed OpenSSH private key ».
++ */
++import assert from "node:assert/strict";
++import test from "node:test";
++import {
++  generateEd25519Keypair,
++  parseUnencryptedOpenSshEd25519Pem,
++  toOpenSshPrivatePem,
++} from "../src/openSshEd25519.ts";
++
++const COMMENT = "zcloudium-host-machine";
++
++/** Layout de tête : magic(15) + cipher(4+4) + kdf(4+4) + kdfopts(4+0) + nkeys(4). */
++const PUB_BLOB_LEN_OFFSET = 39;
++
++function decodePemBody(pem: string): Buffer {
++  return Buffer.from(
++    pem.split("\n").filter((line) => !line.startsWith("-----")).join(""),
++    "base64",
++  );
++}
++
++function encodePemBody(raw: Buffer): string {
++  const b64 = raw.toString("base64");
++  return [
++    "-----BEGIN OPENSSH PRIVATE KEY-----",
++    ...(b64.match(/.{1,70}/g) ?? [b64]),
++    "-----END OPENSSH PRIVATE KEY-----",
++    "",
++  ].join("\n");
++}
++
++/** Offset absolu du champ privé (uint32 longueur) dans le buffer décodé. */
++function privateKeyFieldOffset(raw: Buffer): number {
++  const pubBlobLen = raw.readUInt32BE(PUB_BLOB_LEN_OFFSET);
++  const sectionStart = PUB_BLOB_LEN_OFFSET + 4 + pubBlobLen + 4;
++  // Section : checkint×2 (8) + type (4+11) + pub (4+32) puis le champ privé.
++  return sectionStart + 8 + 4 + 11 + 4 + 32;
++}
++
++test("round-trip: the serialized key parses back to its own public line", () => {
++  const { privateKey, publicKey } = generateEd25519Keypair();
++  const pem = toOpenSshPrivatePem(privateKey, publicKey, COMMENT);
++
++  const publicLine = parseUnencryptedOpenSshEd25519Pem(pem);
++  assert.ok(publicLine, "the fresh key must parse");
++  assert.match(publicLine, /^ssh-ed25519 [A-Za-z0-9+/]+ /, "public line shape");
++  assert.ok(publicLine.endsWith(` ${COMMENT}`), "public line carries the comment");
++
++  // La ligne publique encode exactement la clé publique du couple généré :
++  // uint32(11) + "ssh-ed25519" + uint32(32) + raw32, base64.
++  const der = publicKey.export({ format: "der", type: "spki" }) as Buffer;
++  const blob = Buffer.concat([
++    Buffer.from([0, 0, 0, 11]),
++    Buffer.from("ssh-ed25519", "utf8"),
++    Buffer.from([0, 0, 0, 32]),
++    der.subarray(der.length - 32),
++  ]);
++  assert.equal(publicLine, `ssh-ed25519 ${blob.toString("base64")} ${COMMENT}`);
++});
++
++test("the historical bug (private field = seed only, 32 bytes) is rejected", () => {
++  const { privateKey, publicKey } = generateEd25519Keypair();
++  const raw = decodePemBody(toOpenSshPrivatePem(privateKey, publicKey, COMMENT));
++
++  // Chirurgie : réécrit la longueur du champ privé 64 → 32 et n'en garde que
++  // la moitié seed — exactement le wire format produit par l'ancien
++  // générateur. La longueur de section est recalée d'autant.
++  const privOffset = privateKeyFieldOffset(raw);
++  assert.equal(raw.readUInt32BE(privOffset), 64, "the shipped key carries a 64-byte field");
++
++  const pubBlobLen = raw.readUInt32BE(PUB_BLOB_LEN_OFFSET);
++  const sectionLenOffset = PUB_BLOB_LEN_OFFSET + 4 + pubBlobLen;
++  const out = Buffer.concat([
++    raw.subarray(0, privOffset),
++    Buffer.from([0, 0, 0, 32]),
++    raw.subarray(privOffset + 4, privOffset + 4 + 32),
++    raw.subarray(privOffset + 4 + 64),
++  ]);
++  out.writeUInt32BE(raw.readUInt32BE(sectionLenOffset) - 32, sectionLenOffset);
++
++  assert.equal(
++    parseUnencryptedOpenSshEd25519Pem(encodePemBody(out)),
++    null,
++    "a seed-only private field is exactly the bug that shipped — it must be rejected",
++  );
++});
++
++test("an encrypted key (ciphername != none) is rejected", () => {
++  const { privateKey, publicKey } = generateEd25519Keypair();
++  const raw = decodePemBody(toOpenSshPrivatePem(privateKey, publicKey, COMMENT));
++
++  // Remplace uniquement le ciphername "none" par "aes256-ctr" : les champs
++  // suivants sont auto-délimités, le reste du buffer reste valide.
++  const cipher = Buffer.from("aes256-ctr", "utf8");
++  const out = Buffer.concat([
++    raw.subarray(0, 15),
++    Buffer.from([0, 0, 0, cipher.length]),
++    cipher,
++    raw.subarray(15 + 4 + 4),
++  ]);
++  assert.equal(
++    parseUnencryptedOpenSshEd25519Pem(encodePemBody(out)),
++    null,
++    "an encrypted private key cannot be validated — reuse must regenerate",
++  );
++});
++
++test("garbage, truncation and foreign formats are rejected without throwing", () => {
++  assert.equal(parseUnencryptedOpenSshEd25519Pem("not a key at all"), null);
++  assert.equal(parseUnencryptedOpenSshEd25519Pem(""), null);
++
++  const { privateKey, publicKey } = generateEd25519Keypair();
++  const raw = decodePemBody(toOpenSshPrivatePem(privateKey, publicKey, COMMENT));
++  assert.equal(
++    parseUnencryptedOpenSshEd25519Pem(encodePemBody(raw.subarray(0, 40))),
++    null,
++    "a truncated buffer must not parse",
++  );
++
++  // Un PEM PKCS#8 ed25519 (format natif node:crypto) n'est pas une clé OpenSSH.
++  const pkcs8 = privateKey.export({ format: "pem", type: "pkcs8" }) as string;
++  assert.equal(parseUnencryptedOpenSshEd25519Pem(pkcs8), null);
++});
 diff --git a/packages/shared/src/platform.ts b/packages/shared/src/platform.ts
 index 503608f..f8210e3 100644
 --- a/packages/shared/src/platform.ts
