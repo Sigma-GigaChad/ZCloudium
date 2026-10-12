@@ -2589,7 +2589,7 @@ index 0000000..95f89cb
 +  assert.equal(result, true, "Should return true for non-empty array");
 +});
 diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
-index 052eab8..884bead 100644
+index 052eab8..f6141c3 100644
 --- a/packages/web/src/main.tsx
 +++ b/packages/web/src/main.tsx
 @@ -6,6 +6,7 @@ import {
@@ -2608,17 +2608,20 @@ index 052eab8..884bead 100644
  import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
  
  function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
-@@ -70,6 +72,9 @@ interface WebBootstrapResult {
+@@ -70,6 +72,12 @@ interface WebBootstrapResult {
    initialTaskId?: string;
    restoreSession?: boolean;
    allowOpenWorkspace?: boolean;
 +  // zcloudium: le serveur déclare capability « machine courante » ; reporté
 +  // jusqu'à createWebPlatform pour conditionner la carte du wizard.
 +  supportsHostMachineConnect?: boolean;
++  // zcloudium: ZCODE_SERVER_NAME (server-info.name) → titre d'onglet
++  // « <instance> - ZCodium » pour distinguer les déploiements dans le navigateur.
++  instanceName?: string;
  }
  
  function isWebOAuthCallback(params: URLSearchParams): boolean {
-@@ -99,43 +104,118 @@ function renderWebAuthCallbackPage(): void {
+@@ -99,43 +107,118 @@ function renderWebAuthCallbackPage(): void {
    );
  }
  
@@ -2755,7 +2758,21 @@ index 052eab8..884bead 100644
      migrateLegacyCommonMcp: () =>
        Promise.resolve({
          servers: {},
-@@ -293,6 +373,11 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+@@ -274,10 +357,9 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+     ? `${resolveDefaultWsOrigin()}/ws/remote/${remoteId}`
+     : `${resolveDefaultWsOrigin()}/ws`;
+ 
+-  if (remoteId) {
+-    return { wsUrl };
+-  }
+-
++  // zcloudium: server-info est lu pour TOUTES les entrées (même ?remote=) —
++  // le nom d'instance alimente le titre d'onglet, et un attachement direct
++  // mérite le même titre que l'entrée standard.
+   try {
+     const response = await fetch("/api/server-info", {
+       cache: "no-store",
+@@ -293,6 +375,12 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
        ...(workspace?.workspaceIdentity
          ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
          : {}),
@@ -2764,21 +2781,29 @@ index 052eab8..884bead 100644
 +      ...(serverInfo.capabilities?.hostMachine
 +        ? { supportsHostMachineConnect: true }
 +        : {}),
++      ...(serverInfo.name ? { instanceName: serverInfo.name } : {}),
      };
    } catch {
      return { wsUrl };
-@@ -352,7 +437,9 @@ async function bootstrapWebApp() {
+@@ -352,8 +440,15 @@ async function bootstrapWebApp() {
      const services = await connectViaWebSocket(bootstrap.wsUrl, {
        onClose: () => {},
      });
 -    const platform = createWebPlatform();
+-    document.title = "ZCodium - Web + Server";
 +    const platform = createWebPlatform(services, {
 +      supportsHostMachineConnect: bootstrap.supportsHostMachineConnect,
 +    });
-     document.title = "ZCodium - Web + Server";
++    // zcloudium: « <instance> - ZCodium » quand ZCODE_SERVER_NAME est posé —
++    // deux déploiements (CAD, Stanford) ne doivent plus être deux onglets
++    // identiques ; sans nom, le titre historique reste.
++    document.title = bootstrap.instanceName
++      ? `${bootstrap.instanceName} - ZCodium`
++      : "ZCodium - Web + Server";
  
      root.render(
-@@ -371,11 +458,31 @@ async function bootstrapWebApp() {
+       <AppErrorBoundary>
+@@ -371,11 +466,31 @@ async function bootstrapWebApp() {
              allowOpenWorkspace={bootstrap.allowOpenWorkspace}
              preferDirectoryBrowser
              supportsEmbeddedBrowser={false}
