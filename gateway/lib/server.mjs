@@ -9,7 +9,6 @@
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { createServer as createSecureServer } from "node:https";
-import { createServer as createNetServer } from "node:net";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
 import {
@@ -937,58 +936,9 @@ export async function createGateway({
 
   // The only difference between the two: who terminates the connection. The
   // handler, the sockets it tracks and the upgrade path below are shared.
-  let server;
-  let httpsServer;
-  if (tls) {
-    httpsServer = createSecureServer({ cert: tls.cert, key: tls.key }, handler);
-    httpsServer.on("upgrade", handleUpgrade);
+  const server = tls ? createSecureServer({ cert: tls.cert, key: tls.key }, handler) : createServer(handler);
 
-    // The entry server owns the port and routes each connection: TLS
-    // ClientHello (0x16) goes to the HTTPS server, plain HTTP methods get a
-    // 301 redirect to the same path over https, everything else is destroyed.
-    // Without this, an operator who types http:// gets a blank screen — the
-    // TLS listener cannot parse a plain HTTP request.
-    server = createNetServer({ pauseOnConnect: true }, (socket) => {
-      connections.add(socket);
-      socket.on("close", () => connections.delete(socket));
-      socket.setTimeout(30_000, () => socket.destroy());
-      socket.resume();
-      socket.once("data", (data) => {
-        // Disarm the entry-server idle timeout: the HTTPS server's own
-        // timeouts own idle policy from here on.
-        socket.setTimeout(0);
-        if (data[0] === 0x16) {
-          // TLS ClientHello: push the bytes back and let the HTTPS server
-          // run the handshake and serve the request.
-          socket.unshift(data);
-          httpsServer.emit("connection", socket);
-        } else if (data[0] >= 0x41 && data[0] <= 0x5a) {
-          // Looks like an HTTP method (uppercase ASCII): redirect to https.
-          const text = data.toString("latin1");
-          const requestLine = text.split("\r\n")[0] ?? "";
-          const path = requestLine.split(" ")[1]?.split("?")[0] || "/";
-          const host = /host:\s*(\S+)/i.exec(text)?.[1]?.trim() || "";
-          socket.end(
-            `HTTP/1.1 301 Moved Permanently\r\n` +
-            `Location: https://${host}${path}\r\n` +
-            `Connection: close\r\n` +
-            `Content-Length: 0\r\n\r\n`,
-          );
-        } else {
-          socket.destroy();
-        }
-      });
-    });
-
-    // Shutting down the entry server also shuts down the HTTPS server.
-    const entryClose = server.close.bind(server);
-    server.close = (callback) => {
-      httpsServer.close(() => entryClose(callback));
-    };
-  } else {
-    server = createServer(handler);
-    server.on("upgrade", handleUpgrade);
-  }
+  server.on("upgrade", handleUpgrade);
 
   /**
    * Every socket the server accepted, tracked here rather than trusted to Node.
@@ -1033,13 +983,7 @@ export async function createGateway({
         }
         connections.clear();
         server.closeAllConnections?.();
-        httpsServer?.closeAllConnections?.();
-        httpsServer?.close(() => {
-          server.close(() => resolve());
-        });
-        if (!httpsServer) {
-          server.close(() => resolve());
-        }
+        server.close(() => resolve());
       }),
   };
 }
