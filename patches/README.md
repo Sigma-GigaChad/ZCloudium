@@ -1,9 +1,9 @@
 # The z-cloudium patch series
 
-One patch file, applied by `Dockerfile.from-source` onto the pinned ZCodium
-revision before the build. Everything the product adds to the runtime lives
-here, and nothing else is allowed to drift from upstream: an upstream bump
-means refreshing this file, not hunting deltas.
+A series of patch files, applied in name order by `Dockerfile.from-source`
+onto the pinned ZCodium revision before the build. Everything the product
+adds to the runtime lives here, and nothing else is allowed to drift from
+upstream: an upstream bump means refreshing these files, not hunting deltas.
 
 The build also runs `scripts/validate-remote-bridge.mts`: an in-memory,
 two-hop round trip (browser channel client → local channel server →
@@ -23,6 +23,7 @@ and every other check stayed green.
 | Wizard: SSH only | `packages/ui/src/hooks/useRemoteConnectionForm.ts`, `packages/ui/src/SSHDialog.tsx`, `packages/ui/src/Root.tsx` | Docker and WSL connect to the machine running the client — desktop only (`isDesktop` gate); the web wizard offers SSH alone |
 | Attachment staging | `packages/server/src/attachmentStage.ts` (new), `packages/web/src/main.tsx`, `packages/ui/src/lib/chatAttachments.ts`, `packages/ui/src/v4/composer/useComposerAttachments.ts` | `POST /api/stage-attachment` writes uploads into the agent's own space (dir 0700, file 0600, the desktop temp-text layout) and returns a real path; `createTempTextAttachment` works in web; binary files (zip, docx, …) are staged instead of failing at send. The 20 MiB protocol cap stands |
 | MCP settings | `packages/web/src/main.tsx` | `loadMcpFromUserDirectory`/`saveMcpToUserDirectory` delegate to the server-side `mcp-sync` channel (already exposed to web clients): the settings page lists and persists into the agent's `~/.zcode/cli/config.json`. Legacy migration stays a no-op |
+| WS liveness (0002) | `packages/server/src/wsLiveness.ts` (new), `packages/web/src/wsWatchdog.ts` (new), `packages/server/src/http.ts`, `packages/client/src/remoteServiceAccess.ts`, `packages/web/src/main.tsx` | idle tabs die silently (sleep/resume, NAT eviction) and nothing noticed: a sent message spun forever on a half-open socket. The server now pings every 30s (terminate on missed pongs, the canonical `ws` pattern) and exposes a `ws-liveness` RPC channel; the web bootstrap runs a watchdog probing it every 25s (10s timeout) and answers a dead probe or a real close with a "connection lost — reloading" overlay + auto-reload (durable sessions make the reload cheap). Deliberate tradeoff: the overlay text is not i18n'd — three large locale files for one emergency line costs more rebase surface than it is worth |
 
 ## Upstream policy
 
@@ -37,9 +38,10 @@ and every other check stayed green.
 ## Regenerating
 
 ```sh
-git clone --branch v3.14.7 https://github.com/ZCodium-project/ZCodium.git /tmp/zc-src
+git clone --branch v1.0.2 https://github.com/ZCodium-project/ZCodium.git /tmp/zc-src
 cd /tmp/zc-src
 git checkout -b zcloudium-web-remote
-# apply the current patches, rebase onto the new release, then:
-git format-patch v3.14.8..HEAD --stdout > patches/0001-zcloudium-web-essentials.patch
+# apply the current patches in order, rebase onto the new release, then:
+git format-patch v1.0.3..HEAD --stdout > /tmp/series.patch
+# then split it back into patches/0001-*.patch and patches/0002-*.patch by area
 ```

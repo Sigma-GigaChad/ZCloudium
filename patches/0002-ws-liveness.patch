@@ -1,0 +1,774 @@
+diff --git a/packages/client/src/remoteServiceAccess.ts b/packages/client/src/remoteServiceAccess.ts
+index a5c65a7b..e1b7c165 100644
+--- a/packages/client/src/remoteServiceAccess.ts
++++ b/packages/client/src/remoteServiceAccess.ts
+@@ -1,5 +1,11 @@
+ import { IGenUiService } from "@zcode/services";
+ import { ProxyChannel, type IChannelClient } from "@zcode/rpc";
++
++// zcloudium: contrat minimal du canal « ws-liveness » — le client appelle
++// ping() et reçoit la date courante du serveur en Promise<number>.
++export interface IWsLivenessService {
++  ping(): Promise<number>;
++}
+ import {
+   IFileService,
+   IMediaPreviewService,
+@@ -110,6 +116,9 @@ export class RemoteServiceAccess implements IServiceAccessor {
+   readonly settingsSyncService: ISettingsSyncService;
+   readonly feedbackService: IFeedbackService;
+   readonly promptAttachmentTransferService: IPromptAttachmentTransferService;
++  // zcloudium: sonde liveness WebSocket — indépendante des services @zcode/services,
++  // propre au canal « ws-liveness » branché côté serveur.
++  readonly wsLivenessService: IWsLivenessService;
+ 
+   constructor(channelClient: IChannelClient) {
+     this.fileService = ProxyChannel.toService<IFileService>(
+@@ -264,5 +273,10 @@ export class RemoteServiceAccess implements IServiceAccessor {
+     this.promptAttachmentTransferService = ProxyChannel.toService<IPromptAttachmentTransferService>(
+       channelClient.getChannel(IPromptAttachmentTransferService.channelName),
+     );
++    // zcloudium: proxy vers le canal « ws-liveness » serveur, même gabarit que
++    // les autres getters : ProxyChannel.toService sur le channel récupéré par nom.
++    this.wsLivenessService = ProxyChannel.toService<IWsLivenessService>(
++      channelClient.getChannel("ws-liveness"),
++    );
+   }
+ }
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index 8e1c9dbd..3c146d2d 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -42,6 +42,7 @@ import {
+   type ZCodeSessionRuntimePreferencesResult,
+ } from "@zcode/shared";
+ import { connectRemote, createRemoteBackend } from "./remote/index.js";
++import { attachWsLiveness } from "./wsLiveness.js";
+ import {
+   RemoteSessionRegistry,
+   type RemoteSessionScope,
+@@ -106,6 +107,22 @@ function setupChannelServer(
+   const socket = wrapWebSocket(ws);
+   const protocol = new SocketProtocol(socket);
+   const rawServer = new ChannelServer(protocol, "server");
++  // zcloudium: surveillance liveness WebSocket — le serveur envoie un ping
++  // périodique, termine la socket si aucun pong n'arrive.
++  const stopWsLiveness = attachWsLiveness(ws);
++  // zcloudium: canal de sonde liveness — le client appelle ping(), le serveur
++  // renvoie la date courante en Promise<number>.
++  rawServer.registerChannel("ws-liveness", {
++    call: <T>(_ctx: string, command: string): Promise<T> => {
++      if (command === "ping") {
++        return Promise.resolve(Date.now() as T);
++      }
++      return Promise.reject(new Error(`Unknown command: ${command}`));
++    },
++    listen: () => {
++      throw new Error("ws-liveness channel does not support events");
++    },
++  });
+   // 用日志中间件包装，统一记录所有 RPC 调用
+   const server = new LoggingChannelServer(rawServer, log);
+   const agentService = services.getOptional(IZCodeAgentService);
+@@ -139,6 +156,7 @@ function setupChannelServer(
+   }
+   services.exposeOnChannelServer(server, overrides);
+   socket.onClose(() => {
++    stopWsLiveness.stop();
+     peer?.dispose();
+     reverseClient?.dispose();
+     void connectionScope?.dispose();
+diff --git a/packages/server/src/wsLiveness.ts b/packages/server/src/wsLiveness.ts
+new file mode 100644
+index 00000000..83a171a2
+--- /dev/null
++++ b/packages/server/src/wsLiveness.ts
+@@ -0,0 +1,70 @@
++/**
++ * wsLiveness — surveillance d'une socket WebSocket côté serveur via ping/pong.
++ *
++ * Chaque `intervalMs`, un ping est envoyé et le drapeau vivant est réarmé :
++ * si aucun pong n'est arrivé depuis le ping précédent, la socket est terminée.
++ * C'est le pattern canonique de la lib `ws` pour détecter et purger les
++ * connexions devenues muettes (client parti sans close, NAT évaporé) — les
++ * navigateurs répondent pong automatiquement au niveau protocole. L'événement
++ * `close` ou `stop()` arrête toute surveillance.
++ */
++
++export interface WsLike {
++  ping(): void;
++  terminate(): void;
++  on(event: string, listener: () => void): unknown;
++}
++
++export interface WsLivenessOptions {
++  intervalMs?: number;
++}
++
++export interface WsLivenessHandle {
++  stop(): void;
++}
++
++// zcloudium: défaut 30 s, cohérent avec les tests et les conventions serveur.
++const DEFAULT_INTERVAL_MS = 30000;
++
++export function attachWsLiveness(
++  ws: WsLike,
++  options: WsLivenessOptions = {},
++): WsLivenessHandle {
++  const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
++  let stopped = false;
++  let isAlive = true;
++
++  const cleanup = () => {
++    stopped = true;
++    clearInterval(timer);
++  };
++
++  const timer = setInterval(() => {
++    if (stopped) {
++      return;
++    }
++    if (!isAlive) {
++      cleanup();
++      ws.terminate();
++      return;
++    }
++    isAlive = false;
++    ws.ping();
++  }, intervalMs);
++
++  const onPong = () => {
++    isAlive = true;
++  };
++  const onClose = () => {
++    cleanup();
++  };
++
++  ws.on("pong", onPong);
++  ws.on("close", onClose);
++
++  return {
++    stop() {
++      cleanup();
++    },
++  };
++}
+diff --git a/packages/server/test/openSshEd25519.test.ts b/packages/server/test/openSshEd25519.test.ts
+index 07c22166..04812a5a 100644
+--- a/packages/server/test/openSshEd25519.test.ts
++++ b/packages/server/test/openSshEd25519.test.ts
+@@ -10,7 +10,7 @@
+  * la connexion : « Cannot parse privateKey: Malformed OpenSSH private key ».
+  */
+ import assert from "node:assert/strict";
+-import test from "node:test";
++import { test } from "vitest";
+ import {
+   generateEd25519Keypair,
+   parseUnencryptedOpenSshEd25519Pem,
+diff --git a/packages/server/test/wsLiveness.test.ts b/packages/server/test/wsLiveness.test.ts
+new file mode 100644
+index 00000000..788ff2aa
+--- /dev/null
++++ b/packages/server/test/wsLiveness.test.ts
+@@ -0,0 +1,155 @@
++/**
++ * Tests du module wsLiveness.ts — surveillance de socket WebSocket serveur
++ * via ping/pong (pattern canonique de la lib ws : le drapeau vivant est
++ * réarmé à chaque ping, un ping resté sans pong termine la socket).
++ */
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++import type { WsLike, WsLivenessHandle } from "../src/wsLiveness.ts";
++
++class FakeWs implements WsLike {
++  pingCount = 0;
++  terminateCount = 0;
++  private listeners = new Map<string, Array<() => void>>();
++
++  ping(): void {
++    this.pingCount++;
++  }
++
++  terminate(): void {
++    this.terminateCount++;
++  }
++
++  on(event: string, listener: () => void): unknown {
++    if (!this.listeners.has(event)) {
++      this.listeners.set(event, []);
++    }
++    this.listeners.get(event)!.push(listener);
++    return this;
++  }
++
++  emit(event: string): void {
++    const handlers = this.listeners.get(event);
++    if (handlers) {
++      handlers.forEach((h) => h());
++    }
++  }
++}
++
++describe("attachWsLiveness", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it("envoie un ping à chaque intervalle", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    attachWsLiveness(ws, { intervalMs });
++
++    expect(ws.pingCount).toBe(0);
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(1);
++
++    // Un pong entre les deux avances : sans lui, la socket serait terminée
++    // au deuxième tick (c'est le contrat du module).
++    ws.emit("pong");
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(2);
++  });
++
++  it("termine la socket après un intervalle sans pong", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    attachWsLiveness(ws, { intervalMs });
++
++    // Premier ping
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(1);
++    expect(ws.terminateCount).toBe(0);
++
++    // Pas de pong envoyé → au tick suivant, la socket doit être terminée
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.terminateCount).toBe(1);
++  });
++
++  it("reste en vie tant que chaque ping reçoit son pong", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    attachWsLiveness(ws, { intervalMs });
++
++    // Ping → pong à chaque cycle : la socket reste vivante indéfiniment.
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(1);
++    ws.emit("pong");
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.terminateCount).toBe(0);
++    expect(ws.pingCount).toBe(2);
++    ws.emit("pong");
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.terminateCount).toBe(0);
++    expect(ws.pingCount).toBe(3);
++  });
++
++  it("termine la socket dès qu'un ping reste sans pong", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    attachWsLiveness(ws, { intervalMs });
++
++    // Un pong au premier cycle, puis plus rien : le cycle suivant meurt.
++    vi.advanceTimersByTime(intervalMs);
++    ws.emit("pong");
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.terminateCount).toBe(0);
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.terminateCount).toBe(1);
++  });
++
++  it("stop() arrête les pings", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    const handle: WsLivenessHandle = attachWsLiveness(ws, { intervalMs });
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(1);
++
++    handle.stop();
++
++    // Même après plusieurs intervalles, plus de pings
++    vi.advanceTimersByTime(intervalMs * 3);
++    expect(ws.pingCount).toBe(1);
++  });
++
++  it("l'événement close arrête tout", async () => {
++    const { attachWsLiveness } = await import("../src/wsLiveness.ts");
++    const ws = new FakeWs();
++    const intervalMs = 30000;
++
++    attachWsLiveness(ws, { intervalMs });
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(ws.pingCount).toBe(1);
++
++    ws.emit("close");
++
++    // Plus de pings après close
++    vi.advanceTimersByTime(intervalMs * 3);
++    expect(ws.pingCount).toBe(1);
++    expect(ws.terminateCount).toBe(0);
++  });
++});
+diff --git a/packages/ui/src/v4/composer/useComposerAttachments.ts b/packages/ui/src/v4/composer/useComposerAttachments.ts
+index e6d7a21b..5b2a3e39 100644
+--- a/packages/ui/src/v4/composer/useComposerAttachments.ts
++++ b/packages/ui/src/v4/composer/useComposerAttachments.ts
+@@ -687,52 +687,56 @@ export function useComposerAttachments(
+ 
+   const addAttachmentFiles = useCallback(
+     (selectedFiles: File[]): string[] => {
++      // zcloudium: les ids sont générés côté client dès la création — on les
++      // alloue et les retourne de façon synchrone pour honorer le contrat
++      // upstream (le plugin-UI révoque par id), puis le staging web (IIFE)
++      // complète chaque attachement avant l'ajout au scope. Une révocation
++      // qui arriverait avant la fin du staging reste un no-op (fenêtre d'un
++      // aller-retour réseau) ; l'envoi purge de toute façon par ids gelés.
++      const prepared = selectedFiles.map((file) => {
++        let localPath: string | undefined;
++        try {
++          const resolvedPath = platform.getPathForFile?.(file);
++          localPath = resolvedPath?.trim() ? resolvedPath : undefined;
++        } catch (error) {
++          // Electron 32+ 的 File 需要经 preload webUtils 解析；失败时仍可走 Web bytes。
++          logger.warn("[v4-composer-attachments] 解析附件本地路径失败", error);
++        }
++        return createChatComposerAttachment(file, localPath);
++      });
+       void (async () => {
+-        const prepared: ChatComposerAttachment[] = [];
+-        for (const file of selectedFiles) {
+-          let localPath: string | undefined;
+-          try {
+-            const resolvedPath = platform.getPathForFile?.(file);
+-            localPath = resolvedPath?.trim() ? resolvedPath : undefined;
+-          } catch (error) {
+-            // Electron 32+ 的 File 需要经 preload webUtils 解析；失败时仍可走 Web bytes。
+-            logger.warn("[v4-composer-attachments] 解析附件本地路径失败", error);
+-          }
+-          const attachment = createChatComposerAttachment(file, localPath);
++        for (const attachment of prepared) {
+           // zcloudium: en web, les binaires (zip, docx…) n'ont ni chemin ni
+           // contenu inlinable — on les dépose dans l'espace de l'agent, qui
+           // reçoit un vrai chemin de fichier au lieu d'un échec à l'envoi.
+-          if (!attachment.localPath && attachment.file && isWebStageableAttachment(attachment)) {
+-            try {
+-              const bytes = new Uint8Array(await attachment.file.arrayBuffer());
+-              const response = await fetch(
+-                `/api/stage-attachment?name=${encodeURIComponent(file.name)}`,
+-                { method: "POST", headers: { "content-type": "application/octet-stream" }, body: bytes },
++          if (attachment.localPath || !attachment.file || !isWebStageableAttachment(attachment)) {
++            continue;
++          }
++          try {
++            const bytes = new Uint8Array(await attachment.file.arrayBuffer());
++            const response = await fetch(
++              `/api/stage-attachment?name=${encodeURIComponent(attachment.filename)}`,
++              { method: "POST", headers: { "content-type": "application/octet-stream" }, body: bytes },
++            );
++            if (response.ok) {
++              const staged = (await response.json()) as { path: string; sizeBytes: number };
++              attachment.localPath = staged.path;
++              attachment.sizeBytes = staged.sizeBytes;
++            } else {
++              const body = (await response.json().catch(() => ({}))) as { error?: string };
++              logger.warn(
++                `[v4-composer-attachments] staging refusé (${response.status}): ${body.error ?? ""}`,
+               );
+-              if (response.ok) {
+-                const staged = (await response.json()) as { path: string; sizeBytes: number };
+-                attachment.localPath = staged.path;
+-                attachment.sizeBytes = staged.sizeBytes;
+-              } else {
+-                const body = (await response.json().catch(() => ({}))) as { error?: string };
+-                logger.warn(
+-                  `[v4-composer-attachments] staging refusé (${response.status}): ${body.error ?? ""}`,
+-                );
+-              }
+-            } catch (error) {
+-              logger.warn("[v4-composer-attachments] staging impossible", error);
+             }
++          } catch (error) {
++            logger.warn("[v4-composer-attachments] staging impossible", error);
+           }
+-          prepared.push(attachment);
+         }
+         addPreparedAttachments(prepared);
+       })().catch((error) => {
+         logger.warn("[v4-composer-attachments] 附件添加失败", error);
+       });
+-      // zcloudium: le staging web est asynchrone (IIFE) — les ids ne sont pas
+-      // disponibles de façon synchrone. Les appelants internes n'utilisent pas
+-      // la valeur de retour ; on renvoie [] pour respecter le type upstream.
+-      return [];
++      return prepared.map((attachment) => attachment.id);
+     },
+     [addPreparedAttachments, platform],
+   );
+diff --git a/packages/ui/test/restoreSessionOwnedAttachments.test.ts b/packages/ui/test/restoreSessionOwnedAttachments.test.ts
+index 95f89cb3..0ee19cb1 100644
+--- a/packages/ui/test/restoreSessionOwnedAttachments.test.ts
++++ b/packages/ui/test/restoreSessionOwnedAttachments.test.ts
+@@ -15,7 +15,7 @@
+  * the current unfixed code and PASSES after the guard is added.
+  */
+ import assert from "node:assert/strict";
+-import test from "node:test";
++import { test } from "vitest";
+ 
+ // --- Mirror the exact buggy logic from useComposerAttachments.ts:1031
+ // Real source line: `if (attachmentRefs.length === 0) return true;`
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 846a31f9..4d445195 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -12,6 +12,7 @@ import {
+ } from "@zcode/ui";
+ import "@zcode/ui/styles.css";
+ import { connectViaWebSocket } from "@zcode/client";
++import { startWsWatchdog } from "./wsWatchdog.js";
+ import { WebCallbackPage } from "./auth/WebCallbackPage.js";
+ import { createWebAuthService } from "./auth/webAuthService.js";
+ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOAuthConfig.js";
+@@ -451,9 +452,29 @@ async function bootstrapWebApp() {
+     return;
+   }
+ 
++  let appStarted = false;
++  let reloading = false;
++  // zcloudium: recoverConnection — overlay de perte de connexion puis reload.
++  // Idempotent : onClose et le watchdog peuvent converger vers lui à la
++  // seconde près — un seul overlay, un seul rechargement.
++  // N'agit que si l'application a fini de démarrer, sinon on laisse le bootstrap
++  // gérer ses propres erreurs.
++  function recoverConnection() {
++    if (!appStarted || reloading) {
++      return;
++    }
++    reloading = true;
++    const overlay = document.createElement("div");
++    overlay.style.cssText =
++      "position:fixed;top:0;left:0;width:100%;z-index:2147483647;background:#111827;color:white;text-align:center;padding:12px;font-family:sans-serif;";
++    overlay.textContent = "Connection lost — reloading…";
++    document.body.appendChild(overlay);
++    setTimeout(() => window.location.reload(), 800);
++  }
++
+   try {
+     const services = await connectViaWebSocket(bootstrap.wsUrl, {
+-      onClose: () => {},
++      onClose: recoverConnection,
+     });
+     const platform = createWebPlatform(services, {
+       supportsHostMachineConnect: bootstrap.supportsHostMachineConnect,
+@@ -488,6 +509,16 @@ async function bootstrapWebApp() {
+       </AppErrorBoundary>,
+     );
+ 
++    // zcloudium: l'application est démarrée, la recovery overlay peut agir.
++    appStarted = true;
++    // zcloudium: watchdog liveness — sonde périodique via le canal ws-liveness,
++    // perte de connexion déclenche recoverConnection.
++    const remoteServices = services as import("@zcode/client").RemoteServiceAccess;
++    startWsWatchdog({
++      probe: () => remoteServices.wsLivenessService.ping(),
++      onDead: recoverConnection,
++    });
++
+     // zcloudium: garde anti-FOUC — si la feuille de style ne s'est pas
+     // appliquée au premier paint (index.html périmé restauré par le navigateur
+     // après un redéploiement : les hashes ont changé), un seul reload
+diff --git a/packages/web/src/wsWatchdog.ts b/packages/web/src/wsWatchdog.ts
+new file mode 100644
+index 00000000..f6235147
+--- /dev/null
++++ b/packages/web/src/wsWatchdog.ts
+@@ -0,0 +1,97 @@
++/**
++ * wsWatchdog — surveillance de connexion WebSocket côté client via sondes
++ * périodiques. Chaque `intervalMs`, une sonde est lancée. Si elle met plus
++ * de `timeoutMs` à répondre, ou rejette, la connexion est déclarée morte et
++ * `onDead` est appelé (une seule fois). Dès que `onDead` a été appelé, le
++ * watchdog s'arrête de lui-même. `stop()` interrompt tout de façon idempotente.
++ */
++
++export interface WsWatchdogOptions {
++  probe: () => Promise<unknown>;
++  onDead: () => void;
++  intervalMs?: number;
++  timeoutMs?: number;
++}
++
++export interface WsWatchdogHandle {
++  stop(): void;
++}
++
++// zcloudium: défauts 25 s / 10 s, cohérents avec les tests.
++const DEFAULT_INTERVAL_MS = 25000;
++const DEFAULT_TIMEOUT_MS = 10000;
++
++export function startWsWatchdog(options: WsWatchdogOptions): WsWatchdogHandle {
++  const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
++  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
++  let stopped = false;
++  let deadFired = false;
++
++  const teardown = () => {
++    stopped = true;
++    clearInterval(intervalHandle);
++  };
++
++  const fireDead = () => {
++    if (stopped || deadFired) {
++      return;
++    }
++    deadFired = true;
++    teardown();
++    options.onDead();
++  };
++
++  const tick = () => {
++    if (stopped) {
++      return;
++    }
++    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
++    let settled = false;
++
++    try {
++      options.probe().then(
++        () => {
++          if (settled) {
++            return;
++          }
++          settled = true;
++          if (timeoutHandle !== undefined) {
++            clearTimeout(timeoutHandle);
++          }
++        },
++        () => {
++          if (settled) {
++            return;
++          }
++          settled = true;
++          if (timeoutHandle !== undefined) {
++            clearTimeout(timeoutHandle);
++          }
++          fireDead();
++        },
++      );
++    } catch {
++      if (!settled) {
++        settled = true;
++        fireDead();
++      }
++      return;
++    }
++
++    timeoutHandle = setTimeout(() => {
++      if (settled) {
++        return;
++      }
++      settled = true;
++      fireDead();
++    }, timeoutMs);
++  };
++
++  const intervalHandle = setInterval(tick, intervalMs);
++
++  return {
++    stop() {
++      teardown();
++    },
++  };
++}
+diff --git a/packages/web/test/wsWatchdog.test.ts b/packages/web/test/wsWatchdog.test.ts
+new file mode 100644
+index 00000000..6338ddee
+--- /dev/null
++++ b/packages/web/test/wsWatchdog.test.ts
+@@ -0,0 +1,167 @@
++/**
++ * Tests du module wsWatchdog.ts — surveillance de connexion WebSocket côté
++ * client via sondes périodiques (timeout ou rejet de la sonde = connexion
++ * morte, onDead appelé une seule fois, stop() idempotent).
++ */
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++import type { WsWatchdogOptions } from "../src/wsWatchdog.ts";
++
++interface Deferred<T> {
++  promise: Promise<T>;
++  resolve: (value: T) => void;
++  reject: (reason?: unknown) => void;
++}
++
++function createDeferred<T>(): Deferred<T> {
++  let resolve!: (value: T) => void;
++  let reject!: (reason?: unknown) => void;
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise, resolve, reject };
++}
++
++describe("startWsWatchdog", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it("sonde à chaque intervalle", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    let probeCount = 0;
++
++    startWsWatchdog({
++      probe: async () => {
++        probeCount++;
++      },
++      onDead: () => {},
++      intervalMs,
++    });
++
++    expect(probeCount).toBe(0);
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(probeCount).toBe(1);
++
++    // zcloudium: flush des microtâches pour que la résolution de la sonde
++    // s'exécute avant le prochain advance, effaçant le timeout.
++    await vi.advanceTimersByTimeAsync(0);
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(probeCount).toBe(2);
++  });
++
++  it("déclare la connexion morte quand la sonde dépasse le timeout", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const timeoutMs = 10000;
++    let deadCalled = 0;
++
++    startWsWatchdog({
++      probe: () => new Promise(() => {}), // Ne résout jamais
++      onDead: () => {
++        deadCalled++;
++      },
++      intervalMs,
++      timeoutMs,
++    });
++
++    // Premier tick : sonde lancée
++    vi.advanceTimersByTime(intervalMs);
++
++    // Timeout atteint : onDead doit être appelé
++    vi.advanceTimersByTime(timeoutMs);
++    expect(deadCalled).toBe(1);
++  });
++
++  it("déclare la connexion morte quand la sonde rejette", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    let deadCalled = 0;
++
++    startWsWatchdog({
++      probe: async () => {
++        throw new Error("probe failed");
++      },
++      onDead: () => {
++        deadCalled++;
++      },
++      intervalMs,
++    });
++
++    vi.advanceTimersByTime(intervalMs);
++    // Attendre que la promesse rejetée soit traitée
++    await vi.runAllTimersAsync();
++
++    expect(deadCalled).toBe(1);
++  });
++
++  it("ne déclare rien tant que la sonde répond", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const timeoutMs = 10000;
++    let deadCalled = 0;
++    const deferred = createDeferred<void>();
++
++    startWsWatchdog({
++      probe: () => deferred.promise,
++      onDead: () => {
++        deadCalled++;
++      },
++      intervalMs,
++      timeoutMs,
++    });
++
++    // Premier tick
++    vi.advanceTimersByTime(intervalMs);
++
++    // Résoudre avant timeout
++    vi.advanceTimersByTime(timeoutMs / 2);
++    deferred.resolve();
++    // zcloudium: flush des microtâches AVANT d'atteindre le timeout,
++    // pour que le .then() de la sonde puisse effacer le timeout.
++    await vi.advanceTimersByTimeAsync(0);
++    // Puis on avance jusqu'au moment où le timeout aurait dû se déclencher.
++    await vi.advanceTimersByTimeAsync(timeoutMs / 2);
++
++    expect(deadCalled).toBe(0);
++
++    // Deuxième tick : toujours en vie
++    // zcloudium: utiliser advanceTimersByTimeAsync pour que les microtâches
++    // (le .then() de la sonde) soient exécutées après le tick.
++    await vi.advanceTimersByTimeAsync(intervalMs);
++    expect(deadCalled).toBe(0);
++  });
++
++  it("stop() empêche onDead", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const timeoutMs = 10000;
++    let deadCalled = 0;
++
++    const handle = startWsWatchdog({
++      probe: () => new Promise(() => {}), // Ne résout jamais
++      onDead: () => {
++        deadCalled++;
++      },
++      intervalMs,
++      timeoutMs,
++    });
++
++    // Premier tick : sonde lancée
++    vi.advanceTimersByTime(intervalMs);
++
++    // Stop avant timeout
++    handle.stop();
++
++    // Même après timeout, onDead ne doit pas être appelé
++    vi.advanceTimersByTime(timeoutMs * 2);
++    expect(deadCalled).toBe(0);
++  });
++});
