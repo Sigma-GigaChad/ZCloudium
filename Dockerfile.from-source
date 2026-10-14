@@ -29,7 +29,7 @@ ARG NODE_VERSION=24.14.0
 FROM node:${NODE_VERSION}-bookworm AS builder
 
 ARG ZCODE_REPO=https://github.com/ZCodium-project/ZCodium.git
-ARG ZCODE_REF=v3.14.7
+ARG ZCODE_REF=v1.0.2
 ARG PNPM_VERSION=10.33.2
 
 ENV CI=1 \
@@ -73,8 +73,14 @@ RUN git init -q . \
 
 # Apply, but never silently: --check first, so a series that no longer fits the
 # revision fails with the offending hunks listed instead of a half-applied tree.
-RUN git apply --check /patches/*.patch \
- && git apply /patches/*.patch
+# Apply the series strictly in name order, each patch checked then applied
+# before the next one: a later patch may build on files an earlier one adds,
+# so a group --check over the pristine tree would fail the series.
+RUN for patch in /patches/*.patch; do \
+      git apply --check "$patch" \
+      && git apply "$patch" \
+      || exit 1; \
+    done
 
 # The vendor's own release workflow (ZCodium .github/workflows/release.yml) builds
 # the tarball with exactly three steps: install --frozen-lockfile, then
@@ -87,13 +93,30 @@ RUN pnpm install --frozen-lockfile \
 
 RUN pnpm typecheck
 
+# The series carries its own unit tests; a rebase that silently broke one of
+# them must fail the build here, not surface as a runtime regression later.
+# Each path is asserted first: vitest treats its arguments as substring
+# filters and would silently skip a mistyped one.
+RUN test -f packages/server/test/wsLiveness.test.ts \
+ && test -f packages/web/test/wsWatchdog.test.ts \
+ && test -f packages/server/test/openSshEd25519.test.ts \
+ && test -f packages/ui/test/restoreSessionOwnedAttachments.test.ts \
+ && pnpm exec vitest run packages/server/test/wsLiveness.test.ts packages/web/test/wsWatchdog.test.ts packages/server/test/openSshEd25519.test.ts packages/ui/test/restoreSessionOwnedAttachments.test.ts
+
 # --base-url only feeds the generated install.sh, which is not used here.
-# The fork's tarball is named zcodium-<version>.tar.gz and its top directory is
-# zcodium/, so the extraction strips the component exactly like the precompiled
-# path does with the official one. The two greps prove the patch series actually
+# The fork's tarball (zcodium-<version>.tar.gz, top directory zcodium/) is
+# extracted with --strip-components=1, exactly like the precompiled path does
+# with the official one. The two greps prove the patch series actually
 # reached the built artefacts (one server route, one web string), not just the
 # source tree.
-RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
+# --version + ZCODE_APP_VERSION replicate the vendor's release workflow: the
+# release pipeline passes the released version here, and build-zcode bakes it
+# into the tarball's package.json — which `zcode.mjs --version` (and the
+# smoke job's version check) reads. Without it the tarball keeps the stale
+# internal constant (1.0.0 at tag v1.0.2): the fork's tags are release labels
+# that move ahead of that constant. ZCODE_APP_VERSION additionally feeds the
+# server bundle's remote-deploy version checks.
+RUN ZCODE_APP_VERSION="${ZCODE_REF#v}" pnpm build:zcode --version "${ZCODE_REF#v}" --base-url https://invalid.local/zcode/ \
  && mkdir -p /out/zcodium \
  && tar -xzf "$(ls dist/zcode/releases/*/*.tar.gz | head -n 1)" --strip-components=1 -C /out/zcodium \
  && test -f /out/zcodium/bin/zcode.mjs \
@@ -104,7 +127,7 @@ RUN pnpm build:zcode --base-url https://invalid.local/zcode/ \
 FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 
 ARG ZCODE_REPO=https://github.com/ZCodium-project/ZCodium.git
-ARG ZCODE_REF=v3.14.7
+ARG ZCODE_REF=v1.0.2
 ARG ZCODE_COMMIT
 
 LABEL org.opencontainers.image.title="z-cloudium" \

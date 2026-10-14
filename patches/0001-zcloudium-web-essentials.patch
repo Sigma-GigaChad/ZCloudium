@@ -1,6 +1,6 @@
 diff --git a/packages/server/src/attachmentStage.ts b/packages/server/src/attachmentStage.ts
 new file mode 100644
-index 0000000..b9872b2
+index 00000000..b9872b23
 --- /dev/null
 +++ b/packages/server/src/attachmentStage.ts
 @@ -0,0 +1,79 @@
@@ -85,7 +85,7 @@ index 0000000..b9872b2
 +}
 diff --git a/packages/server/src/hostMachine.ts b/packages/server/src/hostMachine.ts
 new file mode 100644
-index 0000000..7273495
+index 00000000..72734959
 --- /dev/null
 +++ b/packages/server/src/hostMachine.ts
 @@ -0,0 +1,278 @@
@@ -368,7 +368,7 @@ index 0000000..7273495
 +  });
 +}
 diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
-index 8c38f91..59bc63c 100644
+index e968d26c..8e1c9dbd 100644
 --- a/packages/server/src/http.ts
 +++ b/packages/server/src/http.ts
 @@ -1,7 +1,7 @@
@@ -380,7 +380,7 @@ index 8c38f91..59bc63c 100644
  import { hostname } from "node:os";
  import { Hono, type Context } from "hono";
  import { serve } from "@hono/node-server";
-@@ -18,16 +18,15 @@ import {
+@@ -21,16 +21,15 @@ import { TOPIC_RESOURCE_RELAY_CHANNEL } from "@zcode/shared";
  import {
    ServiceCollection,
    IZCodeAgentService,
@@ -400,7 +400,7 @@ index 8c38f91..59bc63c 100644
    formatLogPrefix,
    formatZodError,
    remoteTargetSchema,
-@@ -37,9 +36,21 @@ import {
+@@ -40,9 +39,21 @@ import {
    type BotProvider,
    type ServerRemoteInfo,
    type ServerRemoteWorkspaceInfo,
@@ -423,7 +423,7 @@ index 8c38f91..59bc63c 100644
  
  function wrapWebSocket(ws: WebSocket): ISocket {
    const onData = new Emitter<VSBuffer>();
-@@ -124,11 +135,78 @@ function setupChannelServer(
+@@ -135,11 +146,78 @@ function setupChannelServer(
    });
  }
  
@@ -506,8 +506,8 @@ index 8c38f91..59bc63c 100644
 +  });
  }
  
- interface HttpServerOptions {
-@@ -179,6 +257,9 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
+ export interface HttpServerOptions {
+@@ -191,6 +269,9 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
      capabilities: {
        desktopContinuous: true,
        websocketRpc: true,
@@ -517,7 +517,7 @@ index 8c38f91..59bc63c 100644
      },
    };
  }
-@@ -240,6 +321,13 @@ function isTokenProtectedPath(pathname: string): boolean {
+@@ -252,6 +333,13 @@ function isTokenProtectedPath(pathname: string): boolean {
  }
  
  function isStaticFallbackAllowed(pathname: string): boolean {
@@ -531,7 +531,7 @@ index 8c38f91..59bc63c 100644
    return !isTokenProtectedPath(pathname);
  }
  
-@@ -345,19 +433,102 @@ export function createHttpServer(
+@@ -362,19 +450,102 @@ export function createHttpServer(
    app.get("/ws/host", upgradeTrustedHostWebSocket);
  
    // Web 模式下发起远程连接
@@ -640,7 +640,7 @@ index 8c38f91..59bc63c 100644
  
        return c.json({ id });
      } catch (err: unknown) {
-@@ -366,6 +537,27 @@ export function createHttpServer(
+@@ -383,6 +554,27 @@ export function createHttpServer(
      }
    });
  
@@ -668,7 +668,7 @@ index 8c38f91..59bc63c 100644
    const handleBotCallback = async (c: Context) => {
      const provider = c.req.param("provider") as BotProvider;
      if (!botProviders.includes(provider)) {
-@@ -414,6 +606,9 @@ export function createHttpServer(
+@@ -431,6 +623,9 @@ export function createHttpServer(
    app.post("/api/bots/:provider/:botId", handleBotCallback);
  
    // 远程连接的 WebSocket 端点，将远程 services 桥接给浏览器
@@ -678,7 +678,7 @@ index 8c38f91..59bc63c 100644
    app.get(
      "/ws/remote/:id",
      upgradeWebSocket((c) => {
-@@ -424,22 +619,26 @@ export function createHttpServer(
+@@ -441,22 +636,26 @@ export function createHttpServer(
              ws.close(4000, "Missing remote connection id");
              return;
            }
@@ -718,7 +718,7 @@ index 8c38f91..59bc63c 100644
      }),
 diff --git a/packages/server/src/openSshEd25519.ts b/packages/server/src/openSshEd25519.ts
 new file mode 100644
-index 0000000..5bb71e8
+index 00000000..5bb71e8e
 --- /dev/null
 +++ b/packages/server/src/openSshEd25519.ts
 @@ -0,0 +1,205 @@
@@ -929,7 +929,7 @@ index 0000000..5bb71e8
 +}
 diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
 new file mode 100644
-index 0000000..1aff54c
+index 00000000..1aff54c7
 --- /dev/null
 +++ b/packages/server/src/remoteBridge.ts
 @@ -0,0 +1,122 @@
@@ -1057,10 +1057,10 @@ index 0000000..1aff54c
 +}
 diff --git a/packages/server/src/remoteSessionRegistry.ts b/packages/server/src/remoteSessionRegistry.ts
 new file mode 100644
-index 0000000..626bee6
+index 00000000..4ee0d0fd
 --- /dev/null
 +++ b/packages/server/src/remoteSessionRegistry.ts
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,250 @@
 +import { randomUUID } from "node:crypto";
 +import type { WebSocket } from "ws";
 +import type { RemoteTarget } from "@zcode/shared";
@@ -1121,6 +1121,8 @@ index 0000000..626bee6
 +    case "docker":
 +      // Desktop never reuses docker connections; neither do we.
 +      return `docker:${randomUUID()}`;
++    case "server":
++      return `server:${target.url}`;
 +  }
 +}
 +
@@ -1311,7 +1313,7 @@ index 0000000..626bee6
 +}
 diff --git a/packages/server/test/openSshEd25519.test.ts b/packages/server/test/openSshEd25519.test.ts
 new file mode 100644
-index 0000000..07c2216
+index 00000000..07c22166
 --- /dev/null
 +++ b/packages/server/test/openSshEd25519.test.ts
 @@ -0,0 +1,133 @@
@@ -1449,12 +1451,12 @@ index 0000000..07c2216
 +  assert.equal(parseUnencryptedOpenSshEd25519Pem(pkcs8), null);
 +});
 diff --git a/packages/shared/src/platform.ts b/packages/shared/src/platform.ts
-index 503608f..f8210e3 100644
+index cac403e0..97f94c68 100644
 --- a/packages/shared/src/platform.ts
 +++ b/packages/shared/src/platform.ts
-@@ -524,6 +524,13 @@ export interface IPlatformService {
-   /** 当前平台的文件选择框是否能返回 agent 可访问的本地绝对路径 */
-   canSelectFilePath?: boolean;
+@@ -655,6 +655,13 @@ export interface IPlatformService {
+    */
+   pluginSandbox?: PluginSandboxPlatformPort;
  
 +  /**
 +   * zcloudium: le wizard web peut proposer la carte « machine courante » (SSH vers
@@ -1467,7 +1469,7 @@ index 503608f..f8210e3 100644
    selectDirectory(): Promise<string | null>;
  
 diff --git a/packages/shared/src/remoteTarget.ts b/packages/shared/src/remoteTarget.ts
-index 090289c..0fc48f4 100644
+index 39505325..6efc764a 100644
 --- a/packages/shared/src/remoteTarget.ts
 +++ b/packages/shared/src/remoteTarget.ts
 @@ -12,6 +12,12 @@ export interface SSHConnectOptions {
@@ -1484,7 +1486,7 @@ index 090289c..0fc48f4 100644
  
  export interface WSLConnectOptions {
 diff --git a/packages/shared/src/server-remote.ts b/packages/shared/src/server-remote.ts
-index e81c2c6..9d1d89b 100644
+index e81c2c6e..9d1d89b0 100644
 --- a/packages/shared/src/server-remote.ts
 +++ b/packages/shared/src/server-remote.ts
 @@ -19,6 +19,9 @@ export const serverRemoteInfoSchema = z.object({
@@ -1498,10 +1500,10 @@ index e81c2c6..9d1d89b 100644
  });
  
 diff --git a/packages/shared/src/test-ids.ts b/packages/shared/src/test-ids.ts
-index 5b4dba3..121d27d 100644
+index 3b2130e3..ebfb2d07 100644
 --- a/packages/shared/src/test-ids.ts
 +++ b/packages/shared/src/test-ids.ts
-@@ -157,6 +157,10 @@ export const TID_REMOTE_KIND_SSH = "remote-kind-ssh";
+@@ -167,6 +167,10 @@ export const TID_REMOTE_KIND_SERVER = "remote-kind-server";
  export const TID_REMOTE_KIND_WSL = "remote-kind-wsl";
  /** 远程连接方式切换到 Docker */
  export const TID_REMOTE_KIND_DOCKER = "remote-kind-docker";
@@ -1513,10 +1515,10 @@ index 5b4dba3..121d27d 100644
  export const TID_SSH_HOST_INPUT = "ssh-host-input";
  /** SSH 端口号输入框 */
 diff --git a/packages/shared/src/validation.ts b/packages/shared/src/validation.ts
-index 85b5a64..45cc6db 100644
+index cb6d8f32..a1ce53c4 100644
 --- a/packages/shared/src/validation.ts
 +++ b/packages/shared/src/validation.ts
-@@ -73,6 +73,9 @@ export const sshConnectOptionsSchema = z.object({
+@@ -404,6 +404,9 @@ export const sshConnectOptionsSchema = z.object({
        selectedPackageIds: z.array(z.string().refine(isKnownRemoteResourcePackageId)).optional(),
      })
      .optional(),
@@ -1527,32 +1529,26 @@ index 85b5a64..45cc6db 100644
  
  export const wslConnectOptionsSchema = z.object({
 diff --git a/packages/ui/src/RemoteConnectionDialogContent.tsx b/packages/ui/src/RemoteConnectionDialogContent.tsx
-index 6a1b22f..510ebcb 100644
+index daa36dc3..e5cfcaf2 100644
 --- a/packages/ui/src/RemoteConnectionDialogContent.tsx
 +++ b/packages/ui/src/RemoteConnectionDialogContent.tsx
-@@ -8,7 +8,12 @@ import type {
-   SSHConfigAliasOption,
-   WSLDistro,
+@@ -10,6 +10,7 @@ import type {
  } from "@zcode/shared";
--import { TID_REMOTE_KIND_DOCKER, TID_REMOTE_KIND_SSH, TID_REMOTE_KIND_WSL } from "@zcode/shared";
-+import {
-+  TID_REMOTE_KIND_DOCKER,
-+  TID_REMOTE_KIND_HOST,
-+  TID_REMOTE_KIND_SSH,
-+  TID_REMOTE_KIND_WSL,
-+} from "@zcode/shared";
- import type {
-   IMcpSyncService,
-   IPluginSyncService,
-@@ -19,6 +24,7 @@ import type {
  import {
+   TID_REMOTE_KIND_DOCKER,
++  TID_REMOTE_KIND_HOST,
+   TID_REMOTE_KIND_SERVER,
+   TID_REMOTE_KIND_SSH,
+   TID_REMOTE_KIND_WSL,
+@@ -25,6 +26,7 @@ import {
    AlertTriangleIcon,
    ChevronRightIcon,
+   CloudIcon,
 +  HardDriveIcon,
    LoaderIcon,
    MonitorCogIcon,
    ServerIcon,
-@@ -26,7 +32,8 @@ import {
+@@ -32,7 +34,8 @@ import {
  } from "lucide-react";
  import { DirectoryBrowser } from "@/DirectoryBrowser.js";
  import { RemoteConnectionFields } from "@/RemoteConnectionFields.js";
@@ -1562,7 +1558,7 @@ index 6a1b22f..510ebcb 100644
  import { Button } from "@/components/ui/button.js";
  import { cn } from "@/components/lib/utils.js";
  import { useZCodeIntl } from "@/i18n/IntlProvider.js";
-@@ -37,7 +44,7 @@ import {
+@@ -43,7 +46,7 @@ import {
  } from "@/settings/RemoteSyncActions.js";
  export { RemoteConnectionConnectingStep } from "@/remote-connection/RemoteConnectionConnectingStep.js";
  
@@ -1571,7 +1567,7 @@ index 6a1b22f..510ebcb 100644
    switch (kind) {
      case "ssh":
        return ServerIcon;
-@@ -45,6 +52,24 @@ function getKindIcon(kind: RemoteTarget["kind"]) {
+@@ -53,6 +56,26 @@ function getKindIcon(kind: RemoteTarget["kind"]) {
        return MonitorCogIcon;
      case "wsl":
        return TerminalIcon;
@@ -1587,6 +1583,8 @@ index 6a1b22f..510ebcb 100644
 +  switch (kind) {
 +    case "ssh":
 +      return TID_REMOTE_KIND_SSH;
++    case "server":
++      return TID_REMOTE_KIND_SERVER;
 +    case "wsl":
 +      return TID_REMOTE_KIND_WSL;
 +    case "docker":
@@ -1596,7 +1594,7 @@ index 6a1b22f..510ebcb 100644
    }
  }
  
-@@ -55,9 +80,9 @@ export function RemoteConnectionKindStep({
+@@ -63,9 +86,9 @@ export function RemoteConnectionKindStep({
    onCancel,
    onNext,
  }: {
@@ -1609,22 +1607,29 @@ index 6a1b22f..510ebcb 100644
    onCancel: () => void;
    onNext: () => void;
  }) {
-@@ -75,13 +100,7 @@ export function RemoteConnectionKindStep({
+@@ -83,19 +106,12 @@ export function RemoteConnectionKindStep({
                key={value}
                type="button"
                onClick={() => onKindChange(value)}
++              // zcloudium: double-clic = sélection + avance d'une étape (ajout upstream v1.0.2).
+               onDoubleClick={() => {
+                 onKindChange(value);
+                 onNext();
+               }}
 -              data-testid={
 -                value === "ssh"
 -                  ? TID_REMOTE_KIND_SSH
--                  : value === "wsl"
--                    ? TID_REMOTE_KIND_WSL
--                    : TID_REMOTE_KIND_DOCKER
+-                  : value === "server"
+-                    ? TID_REMOTE_KIND_SERVER
+-                    : value === "wsl"
+-                      ? TID_REMOTE_KIND_WSL
+-                      : TID_REMOTE_KIND_DOCKER
 -              }
 +              data-testid={getKindTestId(value)}
                className={cn(
                  "flex min-h-32 flex-col items-start gap-4 rounded-2xl border p-4 text-start transition-colors",
                  selected
-@@ -159,6 +178,7 @@ export function RemoteConnectionSettingsStep({
+@@ -177,6 +193,7 @@ export function RemoteConnectionSettingsStep({
    remoteWorkspaceSessions = [],
    validationMessage,
    loading,
@@ -1632,7 +1637,7 @@ index 6a1b22f..510ebcb 100644
    onBack,
    onHostChange,
    onPortChange,
-@@ -177,7 +197,7 @@ export function RemoteConnectionSettingsStep({
+@@ -199,7 +216,7 @@ export function RemoteConnectionSettingsStep({
    onClearSelectedSshConfigAlias,
    onConnect,
  }: {
@@ -1641,7 +1646,7 @@ index 6a1b22f..510ebcb 100644
    host: string;
    port: string;
    username: string;
-@@ -202,6 +222,9 @@ export function RemoteConnectionSettingsStep({
+@@ -228,6 +245,9 @@ export function RemoteConnectionSettingsStep({
    remoteWorkspaceSessions?: RemoteWorkspaceSessionEntry[];
    validationMessage: string;
    loading: boolean;
@@ -1651,7 +1656,7 @@ index 6a1b22f..510ebcb 100644
    onBack: () => void;
    onHostChange: (value: string) => void;
    onPortChange: (value: string) => void;
-@@ -222,6 +245,12 @@ export function RemoteConnectionSettingsStep({
+@@ -252,6 +272,12 @@ export function RemoteConnectionSettingsStep({
  }) {
    const { intl } = useZCodeIntl();
  
@@ -1664,7 +1669,7 @@ index 6a1b22f..510ebcb 100644
    return (
      <div className="flex min-h-0 flex-1 flex-col gap-6 h-full">
        <div
-@@ -238,7 +267,7 @@ export function RemoteConnectionSettingsStep({
+@@ -268,7 +294,7 @@ export function RemoteConnectionSettingsStep({
          ) : null}
  
          <RemoteConnectionFields
@@ -1673,8 +1678,8 @@ index 6a1b22f..510ebcb 100644
            host={host}
            port={port}
            username={username}
-@@ -276,6 +305,26 @@ export function RemoteConnectionSettingsStep({
-           setManualDockerContainer={onManualDockerContainerChange}
+@@ -314,6 +340,26 @@ export function RemoteConnectionSettingsStep({
+           setServerWorkspacePath={onServerWorkspacePathChange}
            refreshDockerContainers={onDockerContainersRefresh}
          />
 +
@@ -1701,18 +1706,18 @@ index 6a1b22f..510ebcb 100644
  
        <div className="flex items-center justify-end gap-3">
 diff --git a/packages/ui/src/Root.tsx b/packages/ui/src/Root.tsx
-index 659b751..aafc8aa 100644
+index bcad2500..fd2fc19b 100644
 --- a/packages/ui/src/Root.tsx
 +++ b/packages/ui/src/Root.tsx
-@@ -148,6 +148,7 @@ function RootInner({
-   preferDirectoryBrowser,
+@@ -152,6 +152,7 @@ function RootInner({
    supportsEmbeddedBrowser: explicitSupportsEmbeddedBrowser,
    allowRemoteWorkspace = true,
+   webRemoteControlWorkspaceSwitcher,
 +  autoReconnectRemoteWorkspaces = false,
    initialWorkspaceLoadingFallback,
  }: RootProps) {
    useEffect(() => {
-@@ -529,6 +530,11 @@ function RootInner({
+@@ -540,6 +541,11 @@ function RootInner({
      platform,
      supportsSettings,
      allowRemoteWorkspace,
@@ -1724,7 +1729,7 @@ index 659b751..aafc8aa 100644
      // conversation backing workspace 只属于本地桌面主恢复链路；远程窗口和手机
      // shared-host attachment 不能因此创建独立本地 runtime 或改变 replayable 边界。
      ensureConversationWorkspaceOnRestore: isDesktop && restoreSession && !initialWorkspaceIdentity,
-@@ -851,6 +857,7 @@ function RootInner({
+@@ -858,6 +864,7 @@ function RootInner({
        onSelectProject={handleSelectRemoteProject}
        onCancelSession={handleCancelRemoteProject}
        localWorkspacePath={localWorkspacePathForRemoteConnection}
@@ -1733,7 +1738,7 @@ index 659b751..aafc8aa 100644
        remoteWorkspaceSessions={remoteWorkspaceSessions}
        open={remoteConnectionDialogOpen}
 diff --git a/packages/ui/src/SSHDialog.tsx b/packages/ui/src/SSHDialog.tsx
-index f252336..f575cf1 100644
+index 68a41ec6..8cd377f6 100644
 --- a/packages/ui/src/SSHDialog.tsx
 +++ b/packages/ui/src/SSHDialog.tsx
 @@ -55,6 +55,7 @@ interface RemoteConnectionDialogProps {
@@ -1752,7 +1757,7 @@ index f252336..f575cf1 100644
    isWindowsDesktop = false,
    remoteWorkspaceSessions = [],
    onFlowActiveChange,
-@@ -119,6 +121,7 @@ export function RemoteConnectionDialog({
+@@ -123,6 +125,7 @@ export function RemoteConnectionDialog({
      wslDistros,
      dockerContainers,
      availableKinds,
@@ -1760,7 +1765,7 @@ index f252336..f575cf1 100644
      setKind,
      setHost,
      setPort,
-@@ -139,6 +142,7 @@ export function RemoteConnectionDialog({
+@@ -147,6 +150,7 @@ export function RemoteConnectionDialog({
      currentRuntimeOptionsError,
    } = useRemoteConnectionForm({
      open,
@@ -1768,7 +1773,7 @@ index f252336..f575cf1 100644
      isWindowsDesktop,
      preferredKind,
      preferredWslDistro,
-@@ -527,6 +531,7 @@ export function RemoteConnectionDialog({
+@@ -543,6 +547,7 @@ export function RemoteConnectionDialog({
                      remoteWorkspaceSessions={remoteWorkspaceSessions}
                      validationMessage={validationMessage}
                      loading={loading}
@@ -1776,7 +1781,7 @@ index f252336..f575cf1 100644
                      onBack={() => {
                        resetFeedback();
                        setCurrentStep("kind");
-@@ -554,7 +559,10 @@ export function RemoteConnectionDialog({
+@@ -574,7 +579,10 @@ export function RemoteConnectionDialog({
  
                  {currentStep === "connecting" ? (
                    <RemoteConnectionConnectingStep
@@ -1789,32 +1794,18 @@ index f252336..f575cf1 100644
                      errorMessage={error}
                      loading={loading}
 diff --git a/packages/ui/src/WorkspaceSidebarFooter.tsx b/packages/ui/src/WorkspaceSidebarFooter.tsx
-index 011172a..6578607 100644
+index d58e15e6..86db66b2 100644
 --- a/packages/ui/src/WorkspaceSidebarFooter.tsx
 +++ b/packages/ui/src/WorkspaceSidebarFooter.tsx
-@@ -1,7 +1,12 @@
- /* oxlint-disable eslint(max-lines) -- footer 聚合账户、主题、模式和快捷键菜单。 */
- import type { Locale, UserInfo } from "@zcode/shared";
- import { memo, useCallback, useEffect, useState } from "react";
--import { DesktopCommandIds, TID_LOGIN_TRIGGER, TID_TASK_SETTINGS_BUTTON } from "@zcode/shared";
-+import {
-+  DesktopCommandIds,
+@@ -3,6 +3,7 @@ import type { Locale, UserInfo } from "@zcode/shared";
+ import { memo, useCallback, useEffect, useState, type ReactNode } from "react";
+ import {
+   DesktopCommandIds,
 +  TID_GATEWAY_LOGOUT_ITEM,
-+  TID_LOGIN_TRIGGER,
-+  TID_TASK_SETTINGS_BUTTON,
-+} from "@zcode/shared";
- import { ControlHintTooltip } from "@/ControlHintTooltip.js";
- import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar.js";
- import { ZCodeAboutLogo } from "@/components/ui/ZCodeAboutLogo.js";
-@@ -23,6 +28,7 @@ import {
-   PencilRuler,
-   Globe,
-   Loader2,
-+  LogOut,
-   Maximize,
-   Palette,
-   Settings,
-@@ -34,6 +40,7 @@ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+   TID_LOGIN_TRIGGER,
+   TID_LOGOUT_BUTTON,
+   TID_TASK_SETTINGS_BUTTON,
+@@ -46,6 +47,7 @@ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
  import { useShortcutCommandLabel } from "@/shortcuts/useShortcutBindings.js";
  import { useZCodeStore } from "@/store/StoreProvider.js";
  import { normalizeInterfaceMode } from "@/lib/interfaceMode.js";
@@ -1822,7 +1813,7 @@ index 011172a..6578607 100644
  import type { Theme } from "@/useTheme.js";
  import { WorkspaceWebRemoteControlTrigger } from "@/WorkspaceWebRemoteControlTrigger.js";
  import {
-@@ -112,6 +119,9 @@ export const WorkspaceSidebarFooter = memo(function WorkspaceSidebarFooterCompon
+@@ -129,6 +131,9 @@ export const WorkspaceSidebarFooter = memo(function WorkspaceSidebarFooterCompon
    const zoomOutShortcutLabel = useShortcutCommandLabel("zoomOut");
    const resetZoomShortcutLabel = useShortcutCommandLabel("resetZoom");
    const isRestoringOAuthSession = useZCodeStore((state) => state.isRestoringOAuthSession);
@@ -1832,9 +1823,9 @@ index 011172a..6578607 100644
    const profileBadge = getSidebarProfileBadge(user);
    const avatarFallbackText = getAvatarFallbackText(user);
    const avatarKey = user?.avatarUrl ?? user?.id ?? "guest";
-@@ -328,6 +338,20 @@ export const WorkspaceSidebarFooter = memo(function WorkspaceSidebarFooterCompon
-                 </DropdownMenuSubContent>
-               </DropdownMenuSub>
+@@ -439,6 +444,20 @@ export const WorkspaceSidebarFooter = memo(function WorkspaceSidebarFooterCompon
+                 </Badge>
+               </DropdownMenuItem>
              ) : null}
 +            {/* zcloudium: 网关登出。onLogout 传递的是运行时 OAuth 账户的登出，
 +                与网关会话无关；这里结束的是网关本身的会话（清 cookie → 登录页），
@@ -1850,14 +1841,14 @@ index 011172a..6578607 100644
 +                {intl.formatMessage({ id: "settings.gatewayLogout" })}
 +              </DropdownMenuItem>
 +            ) : null}
-             {/* 审计版移除官方账户与升级入口：语言/主题/界面模式/缩放保留为本地偏好。*/}
-           </DropdownMenuContent>
-         </DropdownMenu>
+             {onLogout ? <DropdownMenuSeparator /> : null}
+             {onLogout ? (
+               <DropdownMenuItem onSelect={onLogout} data-testid={TID_LOGOUT_BUTTON}>
 diff --git a/packages/ui/src/hooks/useRemoteConnectionForm.ts b/packages/ui/src/hooks/useRemoteConnectionForm.ts
-index 865316a..ab35f1f 100644
+index 8cd02074..65153750 100644
 --- a/packages/ui/src/hooks/useRemoteConnectionForm.ts
 +++ b/packages/ui/src/hooks/useRemoteConnectionForm.ts
-@@ -13,10 +13,33 @@ import {
+@@ -13,12 +13,33 @@ import {
    resolveDockerContainerSelectionAfterRefresh,
  } from "@/lib/remoteConnectionDockerOptions.js";
  
@@ -1872,7 +1863,6 @@ index 865316a..ab35f1f 100644
 +export type RemoteKind = RemoteTarget["kind"] | "host";
  export type SSHAuthMethod = "password" | "privateKey";
  
--function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
 +/**
 + * zcloudium: métadonnées renvoyées par GET /api/host-machine et exposées au
 + * wizard. publicKey est la seule valeur affichée (la clé privée reste côté
@@ -1885,15 +1875,15 @@ index 865316a..ab35f1f 100644
 +  publicKey: string;
 +}
 +
-+function buildAvailableKinds(options: {
+ export function buildAvailableKinds(options: {
 +  isDesktop: boolean;
-+  isWindowsDesktop: boolean;
+   isWindowsDesktop: boolean;
+   isLocalDevelopmentRuntime: boolean;
 +  supportsHostMachineConnect: boolean;
-+}): RemoteKind[] {
+ }): RemoteKind[] {
    const kinds: RemoteKind[] = ["ssh"];
-   // 远程连接入口里 WSL 和 SSH 同属主机类连接。
-   // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
-@@ -26,22 +49,35 @@ function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind
+   // Bugfix: Server remote 目前只是本地开发能力。之前无条件放入可选列表，
+@@ -34,22 +55,35 @@ export function buildAvailableKinds(options: {
    // Docker入口之前完全依赖预探测结果决定是否展示。
    // 当探测能力暂时不可用、或用户还没切到 Docker 时，入口会直接消失，
    // 用户甚至不知道这里支持 Docker 连接。改为始终展示入口，切换后再懒加载探测结果。
@@ -1930,7 +1920,7 @@ index 865316a..ab35f1f 100644
    const [kind, setKind] = useState<RemoteKind>("ssh");
    const [host, setHostState] = useState("");
    const [port, setPortState] = useState("22");
-@@ -71,12 +107,17 @@ export function useRemoteConnectionForm({
+@@ -83,6 +117,11 @@ export function useRemoteConnectionForm({
    const [dockerOptionsLoading, setDockerOptionsLoading] = useState(false);
    const [dockerOptionsLoaded, setDockerOptionsLoaded] = useState(false);
    const [dockerOptionsError, setDockerOptionsError] = useState("");
@@ -1942,15 +1932,24 @@ index 865316a..ab35f1f 100644
    const applyingSshAliasRef = useRef(false);
    const dockerOptionsActiveLoadIdRef = useRef(0);
    const dockerOptionsInFlightLoadIdRef = useRef<number | null>(null);
+@@ -90,8 +129,14 @@ export function useRemoteConnectionForm({
+     platform.isLocalDevelopmentRuntime === true || import.meta.env.DEV === true;
+ 
    const availableKinds = useMemo(
--    () => buildAvailableKinds({ isWindowsDesktop }),
--    [isWindowsDesktop],
-+    () => buildAvailableKinds({ isDesktop, isWindowsDesktop, supportsHostMachineConnect }),
-+    [isDesktop, isWindowsDesktop, supportsHostMachineConnect],
+-    () => buildAvailableKinds({ isWindowsDesktop, isLocalDevelopmentRuntime }),
+-    [isLocalDevelopmentRuntime, isWindowsDesktop],
++    () =>
++      buildAvailableKinds({
++        isDesktop,
++        isWindowsDesktop,
++        isLocalDevelopmentRuntime,
++        supportsHostMachineConnect,
++      }),
++    [isDesktop, isLocalDevelopmentRuntime, isWindowsDesktop, supportsHostMachineConnect],
    );
  
    useEffect(() => {
-@@ -109,6 +150,11 @@ export function useRemoteConnectionForm({
+@@ -124,6 +169,11 @@ export function useRemoteConnectionForm({
      setDockerOptionsLoading(false);
      setDockerOptionsError("");
      setDockerContainers([]);
@@ -1962,7 +1961,7 @@ index 865316a..ab35f1f 100644
      if (preferredKind && availableKinds.includes(preferredKind)) {
        setKind(preferredKind);
      }
-@@ -266,6 +312,70 @@ export function useRemoteConnectionForm({
+@@ -281,6 +331,70 @@ export function useRemoteConnectionForm({
      refreshDockerContainers({ clearContainersOnError: true });
    }, [dockerOptionsLoaded, kind, open, refreshDockerContainers]);
  
@@ -2033,7 +2032,7 @@ index 865316a..ab35f1f 100644
    const setHost = (value: string) => {
      if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== host) {
        setSelectedSshConfigAlias(null);
-@@ -306,7 +416,7 @@ export function useRemoteConnectionForm({
+@@ -321,7 +435,7 @@ export function useRemoteConnectionForm({
        const nextUsername = aliasOption.username?.trim() ?? "";
        const nextPrivateKeyPath = aliasOption.privateKeyPath?.trim() ?? "";
  
@@ -2042,7 +2041,7 @@ index 865316a..ab35f1f 100644
        // 这里改为全量覆盖：所有 SSH 字段都按当前 alias 重建，缺失值统一置空，避免状态串用。
        setHostState(nextHost);
        setPortState(nextPort);
-@@ -346,6 +456,10 @@ export function useRemoteConnectionForm({
+@@ -365,6 +479,10 @@ export function useRemoteConnectionForm({
      wslDistros,
      dockerContainers,
      availableKinds,
@@ -2054,15 +2053,16 @@ index 865316a..ab35f1f 100644
      setHost,
      setPort,
 diff --git a/packages/ui/src/i18n/locales/en-US.ts b/packages/ui/src/i18n/locales/en-US.ts
-index 3843d0d..5c326db 100644
+index 4072eeae..c466aaa2 100644
 --- a/packages/ui/src/i18n/locales/en-US.ts
 +++ b/packages/ui/src/i18n/locales/en-US.ts
-@@ -1783,9 +1783,13 @@ const enUS: Record<string, string> = {
-   "remote.kind.ssh": "SSH",
+@@ -2082,10 +2082,14 @@ const enUS: Record<string, string> = {
+   "remote.kind.server": "Server",
    "remote.kind.wsl": "WSL",
    "remote.kind.docker": "Docker",
 +  "remote.kind.host": "Current machine",
    "remote.kind.ssh.wizardDescription": "Remote host",
+   "remote.kind.server.wizardDescription": "Running ZCodium service",
    "remote.kind.wsl.wizardDescription": "Windows Subsystem for Linux",
    "remote.kind.docker.wizardDescription": "Local container",
 +  "remote.kind.host.wizardDescription": "The machine running this app",
@@ -2071,7 +2071,7 @@ index 3843d0d..5c326db 100644
    "remote.connect": "Connect",
    "remote.connecting": "Connecting...",
    "remote.minimize": "Minimize remote connection window",
-@@ -2062,6 +2066,7 @@ const enUS: Record<string, string> = {
+@@ -2380,6 +2384,7 @@ const enUS: Record<string, string> = {
    "settings.interfaceMode.coding": "Coding mode",
    "settings.interfaceMode.description":
      "Office mode focuses on summaries and results. Coding mode shows commands, output, and code changes.",
@@ -2080,15 +2080,16 @@ index 3843d0d..5c326db 100644
    "chat.contextOptimization.started": "Optimizing conversation",
    "chat.contextOptimization.skipped": "No conversation optimization needed",
 diff --git a/packages/ui/src/i18n/locales/zh-CN.ts b/packages/ui/src/i18n/locales/zh-CN.ts
-index 5bb9764..670c74e 100644
+index d172c825..8e961cc6 100644
 --- a/packages/ui/src/i18n/locales/zh-CN.ts
 +++ b/packages/ui/src/i18n/locales/zh-CN.ts
-@@ -1657,9 +1657,13 @@ const zhCN: Record<string, string> = {
-   "remote.kind.ssh": "SSH",
+@@ -1944,10 +1944,14 @@ const zhCN: Record<string, string> = {
+   "remote.kind.server": "Server",
    "remote.kind.wsl": "WSL",
    "remote.kind.docker": "Docker",
 +  "remote.kind.host": "当前机器",
    "remote.kind.ssh.wizardDescription": "远程主机",
+   "remote.kind.server.wizardDescription": "已运行的 ZCodium 服务",
    "remote.kind.wsl.wizardDescription": "Windows Linux 子系统",
    "remote.kind.docker.wizardDescription": "本地容器",
 +  "remote.kind.host.wizardDescription": "运行本应用的机器",
@@ -2097,7 +2098,7 @@ index 5bb9764..670c74e 100644
    "remote.connect": "连接",
    "remote.connecting": "正在连接...",
    "remote.minimize": "收起远程连接窗口",
-@@ -1931,6 +1935,7 @@ const zhCN: Record<string, string> = {
+@@ -2236,6 +2240,7 @@ const zhCN: Record<string, string> = {
    "settings.interfaceMode.coding": "编程模式",
    "settings.interfaceMode.description":
      "办公模式侧重操作摘要与结果；编程模式显示命令、输出和代码变更详情。",
@@ -2106,10 +2107,10 @@ index 5bb9764..670c74e 100644
    "chat.contextOptimization.started": "正在优化对话",
    "chat.contextOptimization.skipped": "无需优化对话",
 diff --git a/packages/ui/src/lib/chatAttachments.ts b/packages/ui/src/lib/chatAttachments.ts
-index c1612a7..ccaa6a1 100644
+index 632b0559..7d5dff6d 100644
 --- a/packages/ui/src/lib/chatAttachments.ts
 +++ b/packages/ui/src/lib/chatAttachments.ts
-@@ -58,6 +58,29 @@ export interface ChatComposerAttachment {
+@@ -61,6 +61,29 @@ export interface ChatComposerAttachment {
  
  const PDF_MIME_TYPE = "application/pdf";
  
@@ -2141,7 +2142,7 @@ index c1612a7..ccaa6a1 100644
    return normalized === PDF_MIME_TYPE ? PDF_MIME_TYPE : mimeType;
 diff --git a/packages/ui/src/lib/gatewayAuth.ts b/packages/ui/src/lib/gatewayAuth.ts
 new file mode 100644
-index 0000000..f8b7e33
+index 00000000..f8b7e33b
 --- /dev/null
 +++ b/packages/ui/src/lib/gatewayAuth.ts
 @@ -0,0 +1,68 @@
@@ -2214,7 +2215,7 @@ index 0000000..f8b7e33
 +  return logoutUrl;
 +}
 diff --git a/packages/ui/src/lib/remoteConnectionWizard.ts b/packages/ui/src/lib/remoteConnectionWizard.ts
-index d1d54e2..e42b163 100644
+index b2517e16..f0c40c58 100644
 --- a/packages/ui/src/lib/remoteConnectionWizard.ts
 +++ b/packages/ui/src/lib/remoteConnectionWizard.ts
 @@ -1,6 +1,6 @@
@@ -2234,7 +2235,7 @@ index d1d54e2..e42b163 100644
    host: string;
    port: string;
    username: string;
-@@ -27,7 +27,7 @@ interface RemoteConnectionFormSnapshot {
+@@ -31,7 +31,7 @@ interface RemoteConnectionFormSnapshot {
  export function getRemoteWizardStepCopy(
    intl: WizardIntlLike,
    step: RemoteWizardStep,
@@ -2243,7 +2244,7 @@ index d1d54e2..e42b163 100644
  ) {
    switch (step) {
      case "kind":
-@@ -41,6 +41,8 @@ export function getRemoteWizardStepCopy(
+@@ -45,6 +45,8 @@ export function getRemoteWizardStepCopy(
          description: intl.formatMessage(
            { id: "remote.settingsStepDescription" },
            {
@@ -2252,7 +2253,7 @@ index d1d54e2..e42b163 100644
              method: intl.formatMessage({ id: `remote.kind.${kind}` }),
            },
          ),
-@@ -141,6 +143,30 @@ export function buildRemoteTarget(
+@@ -175,6 +177,30 @@ export function buildRemoteTarget(
          },
        };
      }
@@ -2284,13 +2285,14 @@ index d1d54e2..e42b163 100644
  }
  
 diff --git a/packages/ui/src/root/types.ts b/packages/ui/src/root/types.ts
-index 99baa5c..be5988c 100644
+index eeffdea5..cae07eb6 100644
 --- a/packages/ui/src/root/types.ts
 +++ b/packages/ui/src/root/types.ts
-@@ -34,6 +34,13 @@ export interface RootProps {
-   supportsEmbeddedBrowser?: boolean;
-   /** 是否启用远程工作区能力，Web 普通模式先只支持本地 server 工作区 */
-   allowRemoteWorkspace?: boolean;
+@@ -79,7 +79,14 @@ export interface RootProps {
+   initialWebRemoteControlWorkspaceList?: WebRemoteControlWorkspaceListResult;
+   /** Web 远控手机端 relay terminal transport 状态，用于已进入页面后的轻量恢复提示 */
+   webRemoteControlTerminalTransportState?: WebRemoteControlTerminalTransportState;
+-  /** 手机 Web 远控初始 workspace 注入前继续展示的入口 loading，桌面端不使用 */
 +  /**
 +   * Web uniquement : ré-attache automatiquement les tabs distantes persistées
 +   * au chargement (fire-and-forget par clé). Par défaut false : desktop a son
@@ -2298,11 +2300,12 @@ index 99baa5c..be5988c 100644
 +   * opt-in relancerait des SSH à chaque refresh sans action utilisateur.
 +   */
 +  autoReconnectRemoteWorkspaces?: boolean;
-   /** 非桌面入口初始 workspace 注入前继续展示的 loading，桌面端不使用 */
++  /** 手机 WEB 远控初始 workspace 注入前继续展示的入口 loading，桌面端不使用 */
    initialWorkspaceLoadingFallback?: ReactNode;
-   /** Assistant code-comment 卡片灰度；默认关闭，关闭时保留原始 directive。 */
+   /** Web 远程控制入口能力开关；默认只在 development 启用 */
+   webRemoteControlFeatureEnabled?: boolean;
 diff --git a/packages/ui/src/root/useRemoteWorkspaceHistory.ts b/packages/ui/src/root/useRemoteWorkspaceHistory.ts
-index 4f5ce21..fc8d8fe 100644
+index 6f34f311..200652f2 100644
 --- a/packages/ui/src/root/useRemoteWorkspaceHistory.ts
 +++ b/packages/ui/src/root/useRemoteWorkspaceHistory.ts
 @@ -621,6 +621,7 @@ export function useRemoteWorkspaceHistory({
@@ -2425,10 +2428,10 @@ index 4f5ce21..fc8d8fe 100644
          // 所以下次启动又会恢复同一个断连项。这里把显式移除视为删除远程历史，
          // 同时清理该历史独占的 SSH 凭据，避免留下不可达的 credential key。
 diff --git a/packages/ui/src/v4/ConversationComposer.tsx b/packages/ui/src/v4/ConversationComposer.tsx
-index 0d37652..7916cd0 100644
+index a8412692..c2cdc1cc 100644
 --- a/packages/ui/src/v4/ConversationComposer.tsx
 +++ b/packages/ui/src/v4/ConversationComposer.tsx
-@@ -285,7 +285,7 @@ export interface ComposerRestoreRequest {
+@@ -290,7 +290,7 @@ export interface ComposerRestoreRequest {
    workspaceKey: string;
    inputKind: "sendText" | "sendGoalCommand";
    text: string;
@@ -2437,7 +2440,7 @@ index 0d37652..7916cd0 100644
    config?: Pick<V4ComposerDraft, "mode" | "planEnabled" | "modelSelection">;
  }
  
-@@ -309,7 +309,7 @@ function applyComposerRestoreRequestToComposer({
+@@ -314,7 +314,7 @@ function applyComposerRestoreRequestToComposer({
    inputApi: Pick<LexicalChatInputHandle, "setText"> | null;
    request: ComposerRestoreRequest | null | undefined;
    requestFocus: () => void;
@@ -2447,7 +2450,7 @@ index 0d37652..7916cd0 100644
    scheduleDraftPersist: () => void;
    updateText: (text: string) => void;
 diff --git a/packages/ui/src/v4/composer/useComposerAttachments.ts b/packages/ui/src/v4/composer/useComposerAttachments.ts
-index 1e0377c..41fd75a 100644
+index c3de9ee4..e6d7a21b 100644
 --- a/packages/ui/src/v4/composer/useComposerAttachments.ts
 +++ b/packages/ui/src/v4/composer/useComposerAttachments.ts
 @@ -14,6 +14,7 @@ import {
@@ -2458,7 +2461,7 @@ index 1e0377c..41fd75a 100644
    revokeChatComposerAttachment,
    serializeChatComposerAttachment,
    shouldCreateClipboardTextAttachment,
-@@ -93,7 +94,8 @@ interface ComposerAttachmentsApi {
+@@ -95,7 +96,8 @@ export interface ComposerAttachmentsApi {
    /** 发送成功只清冻结的附件 id；不传表示用户主动清空整个附件区。 */
    clearAttachments: (attachmentIds?: readonly string[]) => void;
    /** 把已由 session 接管的 queue refs 原样恢复为 ready chips；不触发 upload/adopt。 */
@@ -2468,11 +2471,11 @@ index 1e0377c..41fd75a 100644
    /** 只返回已 ready ref；任一附件未就绪时返回 null 作 submit 二次门禁。 */
    prepareForSend: () => Promise<AttachmentRef[] | null>;
    /** sendText accepted 后才移交远端暂存内容，发送失败时仍由草稿持有。 */
-@@ -679,8 +681,9 @@ export function useComposerAttachments(
+@@ -685,8 +687,9 @@ export function useComposerAttachments(
  
    const addAttachmentFiles = useCallback(
-     (selectedFiles: File[]) => {
--      addPreparedAttachments(
+     (selectedFiles: File[]): string[] => {
+-      return addPreparedAttachments(
 -        selectedFiles.map((file) => {
 +      void (async () => {
 +        const prepared: ChatComposerAttachment[] = [];
@@ -2480,7 +2483,7 @@ index 1e0377c..41fd75a 100644
            let localPath: string | undefined;
            try {
              const resolvedPath = platform.getPathForFile?.(file);
-@@ -689,9 +692,37 @@ export function useComposerAttachments(
+@@ -695,9 +698,41 @@ export function useComposerAttachments(
              // Electron 32+ 的 File 需要经 preload webUtils 解析；失败时仍可走 Web bytes。
              logger.warn("[v4-composer-attachments] 解析附件本地路径失败", error);
            }
@@ -2518,10 +2521,14 @@ index 1e0377c..41fd75a 100644
 +      })().catch((error) => {
 +        logger.warn("[v4-composer-attachments] 附件添加失败", error);
 +      });
++      // zcloudium: le staging web est asynchrone (IIFE) — les ids ne sont pas
++      // disponibles de façon synchrone. Les appelants internes n'utilisent pas
++      // la valeur de retour ; on renvoie [] pour respecter le type upstream.
++      return [];
      },
      [addPreparedAttachments, platform],
    );
-@@ -997,8 +1028,8 @@ export function useComposerAttachments(
+@@ -1003,8 +1038,8 @@ export function useComposerAttachments(
    );
  
    const restoreSessionOwnedAttachments = useCallback(
@@ -2532,9 +2539,68 @@ index 1e0377c..41fd75a 100644
        if (readComposerAttachmentScope(scopeKey).length > 0) return false;
        const restored: ComposerAttachmentUploadItem[] = attachmentRefs.map((attachmentRef) => {
          const id = nanoid();
+diff --git a/packages/ui/test/remoteConnectionDialogContentLayout.test.ts b/packages/ui/test/remoteConnectionDialogContentLayout.test.ts
+index c0112b26..3d92bd29 100644
+--- a/packages/ui/test/remoteConnectionDialogContentLayout.test.ts
++++ b/packages/ui/test/remoteConnectionDialogContentLayout.test.ts
+@@ -98,8 +98,10 @@ describe("RemoteConnectionDialogContent layout", () => {
+   it("shows Server between SSH and Windows-only kinds in local development", () => {
+     expect(
+       buildAvailableKinds({
++        isDesktop: true,
+         isWindowsDesktop: true,
+         isLocalDevelopmentRuntime: true,
++        supportsHostMachineConnect: false,
+       }),
+     ).toEqual(["ssh", "server", "wsl", "docker"]);
+   });
+@@ -107,18 +109,43 @@ describe("RemoteConnectionDialogContent layout", () => {
+   it("hides Server from production-mode packaged runtimes", () => {
+     expect(
+       buildAvailableKinds({
++        isDesktop: true,
+         isWindowsDesktop: true,
+         isLocalDevelopmentRuntime: false,
++        supportsHostMachineConnect: false,
+       }),
+     ).toEqual(["ssh", "wsl", "docker"]);
+     expect(
+       buildAvailableKinds({
++        isDesktop: true,
+         isWindowsDesktop: false,
+         isLocalDevelopmentRuntime: false,
++        supportsHostMachineConnect: false,
+       }),
+     ).toEqual(["ssh", "docker"]);
+   });
+ 
++  // zcloudium: le web n'a pas de « machine locale » — pas de Docker/WSL, et la
++  // carte « machine courante » (kind host) n'arrive que via le flag serveur.
++  it("keeps the web wizard SSH-only, plus the host card when the server flags it", () => {
++    expect(
++      buildAvailableKinds({
++        isDesktop: false,
++        isWindowsDesktop: false,
++        isLocalDevelopmentRuntime: false,
++        supportsHostMachineConnect: false,
++      }),
++    ).toEqual(["ssh"]);
++    expect(
++      buildAvailableKinds({
++        isDesktop: false,
++        isWindowsDesktop: false,
++        isLocalDevelopmentRuntime: false,
++        supportsHostMachineConnect: true,
++      }),
++    ).toEqual(["ssh", "host"]);
++  });
++
+   it("renders the kind chooser as compact tiles", () => {
+     const html = renderToStaticMarkup(
+       createElement(RemoteConnectionKindStep, {
 diff --git a/packages/ui/test/restoreSessionOwnedAttachments.test.ts b/packages/ui/test/restoreSessionOwnedAttachments.test.ts
 new file mode 100644
-index 0000000..95f89cb
+index 00000000..95f89cb3
 --- /dev/null
 +++ b/packages/ui/test/restoreSessionOwnedAttachments.test.ts
 @@ -0,0 +1,50 @@
@@ -2589,7 +2655,7 @@ index 0000000..95f89cb
 +  assert.equal(result, true, "Should return true for non-empty array");
 +});
 diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
-index 052eab8..f6141c3 100644
+index 58834757..846a31f9 100644
 --- a/packages/web/src/main.tsx
 +++ b/packages/web/src/main.tsx
 @@ -6,6 +6,7 @@ import {
@@ -2600,15 +2666,15 @@ index 052eab8..f6141c3 100644
    setStreamClientId,
    type Theme,
  } from "@zcode/ui";
-@@ -17,6 +18,7 @@ import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOA
- import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
- import { resolveWebCommunityUrl, resolveWebHelpConfig } from "./communityUrl.js";
- import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
+@@ -22,6 +23,7 @@ import type {
+   ServerRemoteInfo,
+   WebRemoteControlStatus,
+ } from "@zcode/shared";
 +import { stripRemoteTargetSecrets } from "@zcode/shared";
  import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
  
  function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
-@@ -70,6 +72,12 @@ interface WebBootstrapResult {
+@@ -75,6 +77,12 @@ interface WebBootstrapResult {
    initialTaskId?: string;
    restoreSession?: boolean;
    allowOpenWorkspace?: boolean;
@@ -2621,7 +2687,7 @@ index 052eab8..f6141c3 100644
  }
  
  function isWebOAuthCallback(params: URLSearchParams): boolean {
-@@ -99,43 +107,118 @@ function renderWebAuthCallbackPage(): void {
+@@ -104,30 +112,96 @@ function renderWebAuthCallbackPage(): void {
    );
  }
  
@@ -2728,6 +2794,11 @@ index 052eab8..f6141c3 100644
 +      }
      },
      cancelPendingRemoteConnection: (_requestId?: string) => Promise.resolve(),
+     // Web 端不作为 Web 远程控制的发起端，保留空实现以兼容统一接口。
+@@ -140,17 +214,26 @@ function createWebPlatform(): IPlatformService {
+       Promise.resolve<WebRemoteControlStatus>({
+         status: "idle",
+       }),
 -    disposeRemoteSession: () => Promise.resolve(),
 +    async disposeRemoteSession(sessionId: string) {
 +      await fetch(`/api/dispose-remote/${encodeURIComponent(sessionId)}`, {
@@ -2758,7 +2829,7 @@ index 052eab8..f6141c3 100644
      migrateLegacyCommonMcp: () =>
        Promise.resolve({
          servers: {},
-@@ -274,10 +357,9 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+@@ -289,10 +372,9 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
      ? `${resolveDefaultWsOrigin()}/ws/remote/${remoteId}`
      : `${resolveDefaultWsOrigin()}/ws`;
  
@@ -2772,7 +2843,7 @@ index 052eab8..f6141c3 100644
    try {
      const response = await fetch("/api/server-info", {
        cache: "no-store",
-@@ -293,6 +375,12 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+@@ -308,6 +390,12 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
        ...(workspace?.workspaceIdentity
          ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
          : {}),
@@ -2785,7 +2856,7 @@ index 052eab8..f6141c3 100644
      };
    } catch {
      return { wsUrl };
-@@ -352,8 +440,15 @@ async function bootstrapWebApp() {
+@@ -367,8 +455,15 @@ async function bootstrapWebApp() {
      const services = await connectViaWebSocket(bootstrap.wsUrl, {
        onClose: () => {},
      });
@@ -2803,7 +2874,7 @@ index 052eab8..f6141c3 100644
  
      root.render(
        <AppErrorBoundary>
-@@ -371,11 +466,31 @@ async function bootstrapWebApp() {
+@@ -386,11 +481,31 @@ async function bootstrapWebApp() {
              allowOpenWorkspace={bootstrap.allowOpenWorkspace}
              preferDirectoryBrowser
              supportsEmbeddedBrowser={false}

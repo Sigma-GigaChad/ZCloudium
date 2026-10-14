@@ -164,7 +164,7 @@ volume itself).
   and the smoke job starts the published image before letting it ship — it
   checks the runtime version against the tag, that the patch series reached
   the artefacts, and that an unmounted container is refused.
-- Freeze a version with `image: ghcr.io/sigma-gigachad/z-cloudium:3.14.7`
+- Freeze a version with `image: ghcr.io/sigma-gigachad/z-cloudium:1.0.2`
   (tags: `latest`, `<version>`, `sha-<commit>`).
 - `./check-upstream.sh` compares the pin against the latest release (exit 0 or
   1); CI runs it weekly and opens an issue on a new release; `--bump` applies
