@@ -184,7 +184,7 @@ volume itself).
 
 ## What has been verified
 
-Everything above is enforced or tested, not just written: 114 unit tests
+Everything above is enforced or tested, not just written: 133 unit tests
 (`node --test --test-force-exit`) cover the gateway and the entrypoint
 including the volume pre-check; 20 Playwright specs run against the real image
 on every push to `main` (wizard, sessions, WebSocket, redirects, throttle);

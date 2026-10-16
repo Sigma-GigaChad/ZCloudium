@@ -101,7 +101,13 @@ RUN test -f packages/server/test/wsLiveness.test.ts \
  && test -f packages/web/test/wsWatchdog.test.ts \
  && test -f packages/server/test/openSshEd25519.test.ts \
  && test -f packages/ui/test/restoreSessionOwnedAttachments.test.ts \
- && pnpm exec vitest run packages/server/test/wsLiveness.test.ts packages/web/test/wsWatchdog.test.ts packages/server/test/openSshEd25519.test.ts packages/ui/test/restoreSessionOwnedAttachments.test.ts
+ && test -f packages/server/test/staticAssets.test.ts \
+ && test -f packages/server/test/staticAssetsHttp.test.ts \
+ && test -f packages/rpc/test/rpcLogGate.test.ts \
+ && test -f packages/web/test/bootSocket.test.ts \
+ && test -f packages/web/test/taskNotifications.test.ts \
+ && test -f packages/server/test/remoteAttachmentTransfer.test.ts \
+ && pnpm exec vitest run packages/server/test/wsLiveness.test.ts packages/web/test/wsWatchdog.test.ts packages/server/test/openSshEd25519.test.ts packages/ui/test/restoreSessionOwnedAttachments.test.ts packages/server/test/staticAssets.test.ts packages/server/test/staticAssetsHttp.test.ts packages/rpc/test/rpcLogGate.test.ts packages/web/test/bootSocket.test.ts packages/web/test/taskNotifications.test.ts packages/server/test/remoteAttachmentTransfer.test.ts
 
 # --base-url only feeds the generated install.sh, which is not used here.
 # The fork's tarball (zcodium-<version>.tar.gz, top directory zcodium/) is
