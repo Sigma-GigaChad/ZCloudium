@@ -1,0 +1,1201 @@
+diff --git a/packages/ui/src/index.ts b/packages/ui/src/index.ts
+index 08236538..976b0275 100644
+--- a/packages/ui/src/index.ts
++++ b/packages/ui/src/index.ts
+@@ -97,4 +97,7 @@ export {
+ } from "./lib/uiFontSize.js";
+ export { generateMobileDeviceFingerprint, setStreamClientId } from "./lib/streamClientId.js";
+ export { GlobalDatabaseStartupLoading } from "./root/GlobalDatabaseStartupLoading.js";
++// zcloudium #47: the web entry keeps the boot surface until the first
++// workspace tab paints; that surface is this shared startup shell.
++export { RootStartupLoading } from "./root/RootStartupLoading.js";
+ export { DataRootDecisionApp } from "./data-root-decision/DataRootDecisionApp.js";
+diff --git a/packages/web/src/bootSocket.ts b/packages/web/src/bootSocket.ts
+new file mode 100644
+index 00000000..89c9f225
+--- /dev/null
++++ b/packages/web/src/bootSocket.ts
+@@ -0,0 +1,53 @@
++/**
++ * Web boot sequencing (zcloudium #47).
++ *
++ * The WebSocket URL only depends on the query string and the page origin, so
++ * it resolves synchronously — without waiting for `/api/server-info`. The boot
++ * therefore opens the socket and fetches server-info in parallel instead of
++ * chaining one after the other (one round trip less on every cold load).
++ */
++
++export interface WebSocketLocationLike {
++  protocol: string;
++  host: string;
++}
++
++/** `ws://` or `wss://` origin derived from the page location. */
++export function resolveBootWebSocketOrigin(location: WebSocketLocationLike): string {
++  return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
++}
++
++/** Main channel URL; `?remote=` attaches straight to a remote session. */
++export function resolveBootWebSocketUrl(
++  location: WebSocketLocationLike,
++  remoteId: string | null,
++): string {
++  const base = `${resolveBootWebSocketOrigin(location)}/ws`;
++  return remoteId ? `${base}/remote/${remoteId}` : base;
++}
++
++export interface ParallelWebBootOptions<Bootstrap, Services> {
++  /** Starts the `/api/server-info` fetch. */
++  loadBootstrap: () => Promise<Bootstrap>;
++  /** Opens the socket; invoked immediately, without awaiting loadBootstrap. */
++  openSocket: () => Promise<Services>;
++}
++
++export interface ParallelWebBootResult<Bootstrap, Services> {
++  bootstrap: Bootstrap;
++  services: Services;
++}
++
++/**
++ * Starts both boot tasks without waiting for one another and returns their
++ * results together. Both are started before the first `await`: the socket
++ * opens while the server-info fetch is still in flight.
++ */
++export async function bootWebSocketInParallel<Bootstrap, Services>(
++  options: ParallelWebBootOptions<Bootstrap, Services>,
++): Promise<ParallelWebBootResult<Bootstrap, Services>> {
++  const bootstrapPromise = options.loadBootstrap();
++  const servicesPromise = options.openSocket();
++  const [bootstrap, services] = await Promise.all([bootstrapPromise, servicesPromise]);
++  return { bootstrap, services };
++}
+diff --git a/packages/web/src/main.tsx b/packages/web/src/main.tsx
+index 4d445195..a683f48e 100644
+--- a/packages/web/src/main.tsx
++++ b/packages/web/src/main.tsx
+@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
+ import {
+   AppErrorBoundary,
+   Root,
++  RootStartupLoading,
+   ZCodeIntlProvider,
+   generateMobileDeviceFingerprint,
+   playTaskNotificationSound,
+@@ -12,6 +13,13 @@ import {
+ } from "@zcode/ui";
+ import "@zcode/ui/styles.css";
+ import { connectViaWebSocket } from "@zcode/client";
++import { bootWebSocketInParallel, resolveBootWebSocketUrl } from "./bootSocket.js";
++import {
++  createTaskNotifications,
++  requestNotificationPermissionOnFirstGesture,
++  resolveBrowserNotificationApi,
++  resolveNavigatorAppBadge,
++} from "./taskNotifications.js";
+ import { startWsWatchdog } from "./wsWatchdog.js";
+ import { WebCallbackPage } from "./auth/WebCallbackPage.js";
+ import { createWebAuthService } from "./auth/webAuthService.js";
+@@ -72,7 +80,6 @@ const webAuthService = createWebAuthService();
+ }
+ 
+ interface WebBootstrapResult {
+-  wsUrl: string;
+   initialWorkspaceAbsPath?: string;
+   initialWorkspaceIdentity?: string;
+   initialTaskId?: string;
+@@ -120,6 +127,21 @@ function createWebPlatform(
+   services: WebServices,
+   options: { supportsHostMachineConnect?: boolean } = {},
+ ): IPlatformService {
++  // zcloudium #47: web task notifications — permission is a one-shot request on
++  // the first user gesture (installed in bootstrapWebApp), a notification click
++  // focuses the window and routes to its task, and unread counts feed the
++  // browser app badge. The desktop host keeps its native implementation.
++  const taskNotifications = createTaskNotifications({
++    notification: resolveBrowserNotificationApi(),
++    isForeground: () => document.hasFocus(),
++    focusWindow: () => {
++      window.focus();
++    },
++    playSound: () => {
++      void playTaskNotificationSound();
++    },
++    badge: resolveNavigatorAppBadge(),
++  });
+   return {
+     canSelectFilePath: false,
+     // zcloudium: carte « machine courante » du wizard web — uniquement quand
+@@ -274,31 +296,13 @@ function createWebPlatform(
+     onShareImport: () => () => {},
+     notifyRendererReady: () => {},
+     showTaskNotification: (payload) => {
+-      if (document.hasFocus()) {
+-        return;
+-      }
+-
+-      if (
+-        typeof window.Notification === "undefined" ||
+-        window.Notification.permission !== "granted"
+-      ) {
+-        return;
+-      }
+-
+-      try {
+-        new window.Notification(payload.title, {
+-          body: payload.body,
+-          silent: true,
+-        });
+-        void playTaskNotificationSound();
+-      } catch {
+-        // 浏览器通知不可用时静默忽略，避免打断主流程
+-      }
++      taskNotifications.showNotification(payload);
+     },
+     // Web 端不需要跨窗口 tab 管理
+     syncWindowTabs: () => {},
+-    // Web 端没有宿主层 Dock / 任务栏徽标，保持空实现以兼容统一平台接口
+-    syncWindowUnreadCount: () => {},
++    // zcloudium #47: browser equivalent of the dock/taskbar badge — the unread
++    // task count goes through navigator.setAppBadge when the browser has it.
++    syncWindowUnreadCount: (count) => taskNotifications.syncUnreadCount(count),
+     syncActiveTaskSession: () => {},
+     onFocusTab: () => () => {},
+     onNewTab: () => () => {},
+@@ -307,7 +311,9 @@ function createWebPlatform(
+     onNewTask: () => () => {},
+     onOpenWorkspace: () => () => {},
+     onWindowFullscreenChanged: () => () => {},
+-    onTaskNotificationClick: () => () => {},
++    // zcloudium #47: the web entry routes notification clicks back to the
++    // task; the UI subscribes here and the bridge keeps the handler.
++    onTaskNotificationClick: (handler) => taskNotifications.onTaskNotificationClick(handler),
+     exportLogs: () => Promise.resolve({ success: false, error: "Not supported in web mode" }),
+     captureWindowScreenshot: () => Promise.resolve(null),
+     importChromeBrowserData: (_options) =>
+@@ -367,12 +373,6 @@ function resolveDefaultWsOrigin(): string {
+ }
+ 
+ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+-  const params = new URLSearchParams(window.location.search);
+-  const remoteId = params.get("remote");
+-  const wsUrl = remoteId
+-    ? `${resolveDefaultWsOrigin()}/ws/remote/${remoteId}`
+-    : `${resolveDefaultWsOrigin()}/ws`;
+-
+   // zcloudium: server-info est lu pour TOUTES les entrées (même ?remote=) —
+   // le nom d'instance alimente le titre d'onglet, et un attachement direct
+   // mérite le même titre que l'entrée standard.
+@@ -381,12 +381,11 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+       cache: "no-store",
+     });
+     if (!response.ok) {
+-      return { wsUrl };
++      return {};
+     }
+     const serverInfo = (await response.json()) as Partial<ServerRemoteInfo>;
+     const workspace = Array.isArray(serverInfo.workspaces) ? serverInfo.workspaces[0] : undefined;
+     return {
+-      wsUrl,
+       ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
+       ...(workspace?.workspaceIdentity
+         ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
+@@ -399,10 +398,16 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
+       ...(serverInfo.name ? { instanceName: serverInfo.name } : {}),
+     };
+   } catch {
+-    return { wsUrl };
++    return {};
+   }
+ }
+ 
++// zcloudium #47: label of the boot surface kept until the first workspace
++// tab paints — the web entry has no intl provider at this point.
++function resolveWebLoadingLabel(): string {
++  return /^zh\b/i.test(navigator.language) ? "加载中…" : "Loading…";
++}
++
+ function WebBootstrapErrorScreen({ message }: { message: string }) {
+   return (
+     <div className="h-dvh min-h-dvh w-screen bg-background text-foreground">
+@@ -444,13 +449,18 @@ async function bootstrapWebApp() {
+     return;
+   }
+ 
+-  let bootstrap: WebBootstrapResult;
+-  try {
+-    bootstrap = await resolveWebBootstrap();
+-  } catch (error) {
+-    renderWebBootstrapError(error);
+-    return;
+-  }
++  // zcloudium #47: the socket URL only depends on the query string, so it
++  // resolves synchronously — the socket opens in parallel with server-info
++  // below instead of waiting for it (one round trip less on cold loads).
++  const wsUrl = resolveBootWebSocketUrl(window.location, params.get("remote"));
++
++  // zcloudium #47: notification permission is requested once, on the first
++  // user gesture — browsers reject automatic prompts, and the request stays
++  // silent when the permission was already granted or denied.
++  requestNotificationPermissionOnFirstGesture({
++    api: resolveBrowserNotificationApi(),
++    target: window,
++  });
+ 
+   let appStarted = false;
+   let reloading = false;
+@@ -472,10 +482,20 @@ async function bootstrapWebApp() {
+     setTimeout(() => window.location.reload(), 800);
+   }
+ 
++  let bootstrap: WebBootstrapResult;
++  let services: WebServices;
++  try {
++    // zcloudium #47: server-info and the WebSocket boot in parallel.
++    ({ bootstrap, services } = await bootWebSocketInParallel({
++      loadBootstrap: () => resolveWebBootstrap(),
++      openSocket: () => connectViaWebSocket(wsUrl, { onClose: recoverConnection }),
++    }));
++  } catch (error) {
++    renderWebBootstrapError(error);
++    return;
++  }
++
+   try {
+-    const services = await connectViaWebSocket(bootstrap.wsUrl, {
+-      onClose: recoverConnection,
+-    });
+     const platform = createWebPlatform(services, {
+       supportsHostMachineConnect: bootstrap.supportsHostMachineConnect,
+     });
+@@ -500,6 +520,12 @@ async function bootstrapWebApp() {
+             initialTaskId={bootstrap.initialTaskId}
+             restoreSession={bootstrap.restoreSession}
+             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
++            // zcloudium #47: keep the branded boot surface until the initial
++            // workspace tab paints, instead of an empty themed shell during
++            // the workspace RPC waterfall.
++            initialWorkspaceLoadingFallback={
++              <RootStartupLoading label={resolveWebLoadingLabel()} />
++            }
+             preferDirectoryBrowser
+             supportsEmbeddedBrowser={false}
+             allowRemoteWorkspace
+diff --git a/packages/web/src/taskNotifications.ts b/packages/web/src/taskNotifications.ts
+new file mode 100644
+index 00000000..619a539d
+--- /dev/null
++++ b/packages/web/src/taskNotifications.ts
+@@ -0,0 +1,183 @@
++/**
++ * Web task notifications (zcloudium #47).
++ *
++ * The desktop host owns its native notifications; the web entry bridges the
++ * same `IPlatformService` contract onto the browser Notification API:
++ * - permission is requested once, on the first user gesture, and only while
++ *   the permission is still `default` (browsers reject automatic prompts);
++ * - clicking a shown notification focuses the window and routes to the task;
++ * - unread counts feed `navigator.setAppBadge` when the browser exposes it.
++ */
++import type { TaskNotificationPayload } from "@zcode/shared";
++
++export interface TaskNotificationInstance {
++  onclick: (() => void) | null;
++}
++
++export interface TaskNotificationApi {
++  getPermission: () => NotificationPermission;
++  requestPermission: () => Promise<NotificationPermission>;
++  create: (title: string, options?: NotificationOptions) => TaskNotificationInstance;
++}
++
++export interface AppBadgeApi {
++  set: (count: number) => void;
++  clear: () => void;
++}
++
++export interface NavigatorBadgeLike {
++  setAppBadge?: (contents?: number) => Promise<unknown>;
++  clearAppBadge?: () => Promise<unknown>;
++}
++
++export interface TaskNotificationsEnvironment {
++  /** Notification API; undefined when the browser does not expose it. */
++  notification?: TaskNotificationApi;
++  /** true when the tab is in the foreground — no notification is shown. */
++  isForeground: () => boolean;
++  /** Brings the tab back to the front when a notification is clicked. */
++  focusWindow: () => void;
++  /** Optional chime played alongside a shown notification. */
++  playSound?: () => void;
++  /** Unread-count badge; undefined when the browser exposes no badge API. */
++  badge?: AppBadgeApi;
++}
++
++export interface TaskNotifications {
++  showNotification: (payload: TaskNotificationPayload) => void;
++  onTaskNotificationClick: (handler: (taskId: string) => void) => () => void;
++  syncUnreadCount: (count: number) => void;
++}
++
++const PERMISSION_GESTURE_EVENTS = ["pointerdown", "keydown"] as const;
++
++/** Browser `Notification` global adapted to {@link TaskNotificationApi}. */
++export function resolveBrowserNotificationApi(): TaskNotificationApi | undefined {
++  if (typeof window === "undefined" || typeof window.Notification === "undefined") {
++    return undefined;
++  }
++  return {
++    getPermission: () => window.Notification.permission,
++    requestPermission: () => window.Notification.requestPermission(),
++    create: (title, options) =>
++      new window.Notification(title, options) as unknown as TaskNotificationInstance,
++  };
++}
++
++/**
++ * Requests notification permission exactly once, on the first user gesture,
++ * and only if the permission is still `default` at that moment. Returns a
++ * disposer that detaches the gesture listeners.
++ */
++export function requestNotificationPermissionOnFirstGesture(options: {
++  api?: TaskNotificationApi;
++  target: EventTarget;
++  events?: readonly string[];
++}): () => void {
++  const events = options.events ?? PERMISSION_GESTURE_EVENTS;
++  if (!options.api) {
++    return () => {};
++  }
++  // Hoisted functions below break the narrowing of `options.api`, so pin the
++  // checked reference once here.
++  const api = options.api;
++  let done = false;
++
++  function dispose(): void {
++    if (done) {
++      return;
++    }
++    done = true;
++    for (const event of events) {
++      options.target.removeEventListener(event, onGesture);
++    }
++  }
++
++  function onGesture(): void {
++    if (done) {
++      return;
++    }
++    // One-shot: even a gesture that decides nothing (permission already
++    // granted/denied) consumes the only request attempt.
++    dispose();
++    // Re-read at gesture time: the permission may have changed since boot.
++    if (api.getPermission() !== "default") {
++      return;
++    }
++    void api.requestPermission().catch(() => {});
++  }
++
++  for (const event of events) {
++    options.target.addEventListener(event, onGesture);
++  }
++  return dispose;
++}
++
++/** Web implementation of the platform task-notification contract. */
++export function createTaskNotifications(env: TaskNotificationsEnvironment): TaskNotifications {
++  let clickHandler: ((taskId: string) => void) | null = null;
++
++  return {
++    showNotification(payload) {
++      // A foreground tab already shows the in-app state; no duplicated banner.
++      if (env.isForeground()) {
++        return;
++      }
++      const api = env.notification;
++      if (!api || api.getPermission() !== "granted") {
++        return;
++      }
++      try {
++        const notification = api.create(payload.title, {
++          body: payload.body,
++          silent: true,
++        });
++        notification.onclick = () => {
++          env.focusWindow();
++          clickHandler?.(payload.taskId);
++        };
++        env.playSound?.();
++      } catch {
++        // The browser can still refuse the constructor; stay silent.
++      }
++    },
++    onTaskNotificationClick(handler) {
++      clickHandler = handler;
++      return () => {
++        if (clickHandler === handler) {
++          clickHandler = null;
++        }
++      };
++    },
++    syncUnreadCount(count) {
++      if (!env.badge) {
++        return;
++      }
++      if (count > 0) {
++        env.badge.set(count);
++      } else {
++        env.badge.clear();
++      }
++    },
++  };
++}
++
++/** `navigator.setAppBadge`/`clearAppBadge` adapted to {@link AppBadgeApi}. */
++export function resolveNavigatorAppBadge(
++  nav: NavigatorBadgeLike | undefined = typeof navigator === "undefined" ? undefined : navigator,
++): AppBadgeApi | undefined {
++  if (!nav || typeof nav.setAppBadge !== "function") {
++    return undefined;
++  }
++  const setAppBadge = nav.setAppBadge.bind(nav);
++  const clearAppBadge =
++    typeof nav.clearAppBadge === "function" ? nav.clearAppBadge.bind(nav) : undefined;
++  return {
++    set(count) {
++      void setAppBadge(count).catch(() => {});
++    },
++    clear() {
++      void clearAppBadge?.().catch(() => {});
++    },
++  };
++}
+diff --git a/packages/web/src/wsWatchdog.ts b/packages/web/src/wsWatchdog.ts
+index f6235147..9bf98f64 100644
+--- a/packages/web/src/wsWatchdog.ts
++++ b/packages/web/src/wsWatchdog.ts
+@@ -4,6 +4,11 @@
+  * de `timeoutMs` à répondre, ou rejette, la connexion est déclarée morte et
+  * `onDead` est appelé (une seule fois). Dès que `onDead` a été appelé, le
+  * watchdog s'arrête de lui-même. `stop()` interrompt tout de façon idempotente.
++ *
++ * zcloudium #47: the first probe runs immediately (a cold load has no reason
++ * to wait a full interval) and extra probes fire when the tab becomes visible
++ * again (`visibilitychange`) or the network comes back (`online`), so a
++ * sleeping tab notices a dead socket as soon as the user returns.
+  */
+ 
+ export interface WsWatchdogOptions {
+@@ -11,6 +16,12 @@ export interface WsWatchdogOptions {
+   onDead: () => void;
+   intervalMs?: number;
+   timeoutMs?: number;
++  /** `visibilitychange` target; defaults to `document`, null disables. */
++  visibilityTarget?: EventTarget | null;
++  /** `online` target; defaults to `window`, null disables. */
++  onlineTarget?: EventTarget | null;
++  /** Probe on `visibilitychange` only while the tab is visible. */
++  isVisible?: () => boolean;
+ }
+ 
+ export interface WsWatchdogHandle {
+@@ -24,12 +35,33 @@ const DEFAULT_TIMEOUT_MS = 10000;
+ export function startWsWatchdog(options: WsWatchdogOptions): WsWatchdogHandle {
+   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
+   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
++  const visibilityTarget =
++    options.visibilityTarget !== undefined
++      ? options.visibilityTarget
++      : typeof document === "undefined"
++        ? null
++        : document;
++  const onlineTarget =
++    options.onlineTarget !== undefined
++      ? options.onlineTarget
++      : typeof window === "undefined"
++        ? null
++        : window;
++  const isVisible =
++    options.isVisible ??
++    (() => typeof document === "undefined" || document.visibilityState === "visible");
+   let stopped = false;
+   let deadFired = false;
++  let intervalHandle: ReturnType<typeof setInterval> | undefined;
+ 
+   const teardown = () => {
+     stopped = true;
+-    clearInterval(intervalHandle);
++    if (intervalHandle !== undefined) {
++      clearInterval(intervalHandle);
++      intervalHandle = undefined;
++    }
++    visibilityTarget?.removeEventListener("visibilitychange", onVisibilityChange);
++    onlineTarget?.removeEventListener("online", onOnline);
+   };
+ 
+   const fireDead = () => {
+@@ -87,7 +119,27 @@ export function startWsWatchdog(options: WsWatchdogOptions): WsWatchdogHandle {
+     }, timeoutMs);
+   };
+ 
+-  const intervalHandle = setInterval(tick, intervalMs);
++  // zcloudium #47: wake-up probes — a tab that slept through its socket death
++  // re-probes the moment it is visible again or regains network.
++  function onVisibilityChange(): void {
++    if (isVisible()) {
++      tick();
++    }
++  }
++
++  function onOnline(): void {
++    tick();
++  }
++
++  visibilityTarget?.addEventListener("visibilitychange", onVisibilityChange);
++  onlineTarget?.addEventListener("online", onOnline);
++
++  // zcloudium #47: immediate first probe, then the regular interval. If that
++  // first probe already declared the connection dead, no interval is created.
++  tick();
++  if (!stopped) {
++    intervalHandle = setInterval(tick, intervalMs);
++  }
+ 
+   return {
+     stop() {
+diff --git a/packages/web/test/bootSocket.test.ts b/packages/web/test/bootSocket.test.ts
+new file mode 100644
+index 00000000..e708af36
+--- /dev/null
++++ b/packages/web/test/bootSocket.test.ts
+@@ -0,0 +1,131 @@
++/**
++ * Web boot sequencing (zcloudium #47): the WebSocket URL is resolved from the
++ * query string alone, and the socket opens in parallel with the
++ * `/api/server-info` fetch instead of being chained after it.
++ */
++import { describe, expect, it } from "vitest";
++import { bootWebSocketInParallel, resolveBootWebSocketUrl } from "../src/bootSocket.ts";
++
++interface Deferred<T> {
++  promise: Promise<T>;
++  resolve: (value: T) => void;
++  reject: (reason?: unknown) => void;
++}
++
++function createDeferred<T>(): Deferred<T> {
++  let resolve!: (value: T) => void;
++  let reject!: (reason?: unknown) => void;
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise, resolve, reject };
++}
++
++function flushMicrotasks(): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, 0));
++}
++
++describe("resolveBootWebSocketUrl", () => {
++  it("resolves /ws on ws:// for http locations", () => {
++    expect(resolveBootWebSocketUrl({ protocol: "http:", host: "example.test:3030" }, null)).toBe(
++      "ws://example.test:3030/ws",
++    );
++  });
++
++  it("upgrades to wss:// for https locations", () => {
++    expect(resolveBootWebSocketUrl({ protocol: "https:", host: "example.test" }, null)).toBe(
++      "wss://example.test/ws",
++    );
++  });
++
++  it("routes a ?remote= attachment to /ws/remote/<id>", () => {
++    expect(
++      resolveBootWebSocketUrl({ protocol: "https:", host: "example.test" }, "ticket-123"),
++    ).toBe("wss://example.test/ws/remote/ticket-123");
++  });
++});
++
++describe("bootWebSocketInParallel", () => {
++  it("opens the socket before the server-info fetch resolves", async () => {
++    const started: string[] = [];
++    const bootstrap = createDeferred<string>();
++    const socket = createDeferred<number>();
++
++    const bootPromise = bootWebSocketInParallel({
++      loadBootstrap: () => {
++        started.push("bootstrap");
++        return bootstrap.promise;
++      },
++      openSocket: () => {
++        started.push("socket");
++        return socket.promise;
++      },
++    });
++
++    // The socket is already open while server-info is still in flight; with the
++    // sequential boot `socket` would not appear here yet.
++    expect(started).toEqual(["bootstrap", "socket"]);
++
++    let settled = false;
++    void bootPromise.then(() => {
++      settled = true;
++    });
++    socket.resolve(7);
++    await flushMicrotasks();
++    expect(settled).toBe(false);
++
++    bootstrap.resolve("info");
++    await expect(bootPromise).resolves.toEqual({ bootstrap: "info", services: 7 });
++  });
++
++  it("resolves with both results whatever the settlement order", async () => {
++    const bootstrap = createDeferred<{ instanceName: string }>();
++    const socket = createDeferred<{ onClose: () => void }>();
++    const services = { onClose: () => {} };
++
++    const bootPromise = bootWebSocketInParallel({
++      loadBootstrap: () => bootstrap.promise,
++      openSocket: () => socket.promise,
++    });
++
++    bootstrap.resolve({ instanceName: "instance-a" });
++    socket.resolve(services);
++
++    await expect(bootPromise).resolves.toEqual({
++      bootstrap: { instanceName: "instance-a" },
++      services,
++    });
++  });
++
++  it("rejects as soon as the socket fails, without waiting for the fetch", async () => {
++    const bootstrap = createDeferred<string>();
++    const socket = createDeferred<number>();
++
++    const bootPromise = bootWebSocketInParallel({
++      loadBootstrap: () => bootstrap.promise,
++      openSocket: () => socket.promise,
++    });
++
++    socket.reject(new Error("socket failed"));
++
++    await expect(bootPromise).rejects.toThrow("socket failed");
++    // The abandoned bootstrap promise must not turn into an unhandled rejection.
++    bootstrap.resolve("late");
++  });
++
++  it("rejects as soon as the fetch fails, without waiting for the socket", async () => {
++    const bootstrap = createDeferred<string>();
++    const socket = createDeferred<number>();
++
++    const bootPromise = bootWebSocketInParallel({
++      loadBootstrap: () => bootstrap.promise,
++      openSocket: () => socket.promise,
++    });
++
++    bootstrap.reject(new Error("server-info failed"));
++
++    await expect(bootPromise).rejects.toThrow("server-info failed");
++    socket.resolve(1);
++  });
++});
+diff --git a/packages/web/test/taskNotifications.test.ts b/packages/web/test/taskNotifications.test.ts
+new file mode 100644
+index 00000000..de33eaa0
+--- /dev/null
++++ b/packages/web/test/taskNotifications.test.ts
+@@ -0,0 +1,253 @@
++/**
++ * Task notifications (zcloudium #47): permission is requested once, on the
++ * first user gesture, and only while the permission is still `default`;
++ * clicking a notification focuses the window and routes to the task.
++ */
++import { describe, expect, it, vi } from "vitest";
++import type { TaskNotificationPayload } from "@zcode/shared";
++import {
++  createTaskNotifications,
++  requestNotificationPermissionOnFirstGesture,
++  resolveNavigatorAppBadge,
++  type TaskNotificationApi,
++  type TaskNotificationInstance,
++} from "../src/taskNotifications.ts";
++
++interface FakeNotificationInstance extends TaskNotificationInstance {
++  title: string;
++  options?: NotificationOptions;
++}
++
++function createFakeNotificationApi(initialPermission: NotificationPermission = "granted") {
++  let permission = initialPermission;
++  const instances: FakeNotificationInstance[] = [];
++  const requestPermission = vi.fn(async () => permission);
++  const api: TaskNotificationApi = {
++    getPermission: () => permission,
++    requestPermission,
++    create: (title, options) => {
++      const instance: FakeNotificationInstance = { title, options, onclick: null };
++      instances.push(instance);
++      return instance;
++    },
++  };
++  return {
++    api,
++    instances,
++    requestPermission,
++    setPermission: (next: NotificationPermission) => {
++      permission = next;
++    },
++  };
++}
++
++function taskPayload(overrides: Partial<TaskNotificationPayload> = {}): TaskNotificationPayload {
++  return {
++    taskId: "task-1",
++    status: "completed",
++    title: "Task completed",
++    body: "All checks passed",
++    ...overrides,
++  };
++}
++
++describe("requestNotificationPermissionOnFirstGesture", () => {
++  it("requests permission once, on the first gesture, while permission is default", () => {
++    const target = new EventTarget();
++    const fake = createFakeNotificationApi("default");
++
++    requestNotificationPermissionOnFirstGesture({ api: fake.api, target });
++
++    // Nothing is requested before a real gesture: browsers reject automatic prompts.
++    expect(fake.requestPermission).not.toHaveBeenCalled();
++
++    target.dispatchEvent(new Event("pointerdown"));
++    expect(fake.requestPermission).toHaveBeenCalledTimes(1);
++
++    // One-shot: later gestures do not prompt again.
++    target.dispatchEvent(new Event("keydown"));
++    expect(fake.requestPermission).toHaveBeenCalledTimes(1);
++  });
++
++  it("never requests permission when the browser already decided", () => {
++    for (const permission of ["granted", "denied"] as const) {
++      const target = new EventTarget();
++      const fake = createFakeNotificationApi(permission);
++
++      requestNotificationPermissionOnFirstGesture({ api: fake.api, target });
++      target.dispatchEvent(new Event("pointerdown"));
++
++      expect(fake.requestPermission).not.toHaveBeenCalled();
++    }
++  });
++
++  it("re-checks the permission at gesture time", () => {
++    const target = new EventTarget();
++    const fake = createFakeNotificationApi("default");
++
++    requestNotificationPermissionOnFirstGesture({ api: fake.api, target });
++    fake.setPermission("granted");
++    target.dispatchEvent(new Event("pointerdown"));
++
++    expect(fake.requestPermission).not.toHaveBeenCalled();
++  });
++
++  it("stops listening after dispose", () => {
++    const target = new EventTarget();
++    const fake = createFakeNotificationApi("default");
++
++    const dispose = requestNotificationPermissionOnFirstGesture({ api: fake.api, target });
++    dispose();
++    target.dispatchEvent(new Event("pointerdown"));
++
++    expect(fake.requestPermission).not.toHaveBeenCalled();
++  });
++
++  it("does nothing when the browser exposes no Notification API", () => {
++    const target = new EventTarget();
++
++    expect(() => {
++      requestNotificationPermissionOnFirstGesture({ api: undefined, target });
++      target.dispatchEvent(new Event("pointerdown"));
++    }).not.toThrow();
++  });
++});
++
++describe("createTaskNotifications", () => {
++  it("focuses the window and routes to the task on notification click", () => {
++    const fake = createFakeNotificationApi();
++    const focusWindow = vi.fn();
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => false,
++      focusWindow,
++    });
++    const routeToTask = vi.fn();
++    notifications.onTaskNotificationClick(routeToTask);
++
++    notifications.showNotification(taskPayload({ taskId: "task-42" }));
++
++    expect(fake.instances).toHaveLength(1);
++    expect(fake.instances[0]?.title).toBe("Task completed");
++    expect(fake.instances[0]?.options).toMatchObject({
++      body: "All checks passed",
++      silent: true,
++    });
++
++    // The browser delivers the click through the native notification's onclick.
++    fake.instances[0]?.onclick?.();
++
++    expect(focusWindow).toHaveBeenCalledTimes(1);
++    expect(routeToTask).toHaveBeenCalledWith("task-42");
++  });
++
++  it("still focuses the window when no click handler is registered", () => {
++    const fake = createFakeNotificationApi();
++    const focusWindow = vi.fn();
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => false,
++      focusWindow,
++    });
++
++    notifications.showNotification(taskPayload());
++
++    expect(() => fake.instances[0]?.onclick?.()).not.toThrow();
++    expect(focusWindow).toHaveBeenCalledTimes(1);
++  });
++
++  it("stops routing after the click subscription is disposed", () => {
++    const fake = createFakeNotificationApi();
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => false,
++      focusWindow: vi.fn(),
++    });
++    const routeToTask = vi.fn();
++    const dispose = notifications.onTaskNotificationClick(routeToTask);
++
++    notifications.showNotification(taskPayload({ taskId: "task-9" }));
++    dispose();
++    fake.instances[0]?.onclick?.();
++
++    expect(routeToTask).not.toHaveBeenCalled();
++  });
++
++  it("skips notifications while the tab is focused", () => {
++    const fake = createFakeNotificationApi();
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => true,
++      focusWindow: vi.fn(),
++    });
++
++    notifications.showNotification(taskPayload());
++
++    expect(fake.instances).toHaveLength(0);
++  });
++
++  it("skips notifications when permission is not granted", () => {
++    const fake = createFakeNotificationApi("default");
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => false,
++      focusWindow: vi.fn(),
++    });
++
++    notifications.showNotification(taskPayload());
++
++    expect(fake.instances).toHaveLength(0);
++  });
++
++  it("plays the notification sound with the shown notification", () => {
++    const fake = createFakeNotificationApi();
++    const playSound = vi.fn();
++    const notifications = createTaskNotifications({
++      notification: fake.api,
++      isForeground: () => false,
++      focusWindow: vi.fn(),
++      playSound,
++    });
++
++    notifications.showNotification(taskPayload());
++
++    expect(playSound).toHaveBeenCalledTimes(1);
++  });
++
++  it("forwards unread counts to the app badge", () => {
++    const set = vi.fn();
++    const clear = vi.fn();
++    const notifications = createTaskNotifications({
++      isForeground: () => false,
++      focusWindow: vi.fn(),
++      badge: { set, clear },
++    });
++
++    notifications.syncUnreadCount(3);
++    expect(set).toHaveBeenCalledWith(3);
++    expect(clear).not.toHaveBeenCalled();
++
++    notifications.syncUnreadCount(0);
++    expect(clear).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe("resolveNavigatorAppBadge", () => {
++  it("is unavailable when the browser exposes no badge API", () => {
++    expect(resolveNavigatorAppBadge({})).toBeUndefined();
++  });
++
++  it("delegates set and clear to navigator.setAppBadge/clearAppBadge", async () => {
++    const setAppBadge = vi.fn(async () => {});
++    const clearAppBadge = vi.fn(async () => {});
++
++    const badge = resolveNavigatorAppBadge({ setAppBadge, clearAppBadge });
++
++    expect(badge).toBeDefined();
++    badge?.set(3);
++    badge?.clear();
++    await Promise.resolve();
++    expect(setAppBadge).toHaveBeenCalledWith(3);
++    expect(clearAppBadge).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/packages/web/test/wsWatchdog.test.ts b/packages/web/test/wsWatchdog.test.ts
+index 6338ddee..11caefcf 100644
+--- a/packages/web/test/wsWatchdog.test.ts
++++ b/packages/web/test/wsWatchdog.test.ts
+@@ -2,9 +2,10 @@
+  * Tests du module wsWatchdog.ts — surveillance de connexion WebSocket côté
+  * client via sondes périodiques (timeout ou rejet de la sonde = connexion
+  * morte, onDead appelé une seule fois, stop() idempotent).
++ * zcloudium #47: la première sonde part immédiatement et une sonde est
++ * relancée quand l'onglet redevient visible ou que le réseau revient.
+  */
+ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+-import type { WsWatchdogOptions } from "../src/wsWatchdog.ts";
+ 
+ interface Deferred<T> {
+   promise: Promise<T>;
+@@ -31,7 +32,7 @@ describe("startWsWatchdog", () => {
+     vi.useRealTimers();
+   });
+ 
+-  it("sonde à chaque intervalle", async () => {
++  it("sonde immédiatement au démarrage puis à chaque intervalle", async () => {
+     const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
+     const intervalMs = 25000;
+     let probeCount = 0;
+@@ -44,9 +45,7 @@ describe("startWsWatchdog", () => {
+       intervalMs,
+     });
+ 
+-    expect(probeCount).toBe(0);
+-
+-    vi.advanceTimersByTime(intervalMs);
++    // zcloudium #47: first probe is immediate — no blind spot on a cold load.
+     expect(probeCount).toBe(1);
+ 
+     // zcloudium: flush des microtâches pour que la résolution de la sonde
+@@ -55,6 +54,11 @@ describe("startWsWatchdog", () => {
+ 
+     vi.advanceTimersByTime(intervalMs);
+     expect(probeCount).toBe(2);
++
++    await vi.advanceTimersByTimeAsync(0);
++
++    vi.advanceTimersByTime(intervalMs);
++    expect(probeCount).toBe(3);
+   });
+ 
+   it("déclare la connexion morte quand la sonde dépasse le timeout", async () => {
+@@ -72,14 +76,29 @@ describe("startWsWatchdog", () => {
+       timeoutMs,
+     });
+ 
+-    // Premier tick : sonde lancée
+-    vi.advanceTimersByTime(intervalMs);
+-
+-    // Timeout atteint : onDead doit être appelé
++    // La sonde est lancée immédiatement ; seul son timeout de 10 s compte.
+     vi.advanceTimersByTime(timeoutMs);
+     expect(deadCalled).toBe(1);
+   });
+ 
++  it("conserve le timeout de 10 s par défaut", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    let deadCalled = 0;
++
++    startWsWatchdog({
++      probe: () => new Promise(() => {}), // Ne résout jamais
++      onDead: () => {
++        deadCalled++;
++      },
++    });
++
++    vi.advanceTimersByTime(9999);
++    expect(deadCalled).toBe(0);
++
++    vi.advanceTimersByTime(1);
++    expect(deadCalled).toBe(1);
++  });
++
+   it("déclare la connexion morte quand la sonde rejette", async () => {
+     const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
+     const intervalMs = 25000;
+@@ -95,10 +114,8 @@ describe("startWsWatchdog", () => {
+       intervalMs,
+     });
+ 
+-    vi.advanceTimersByTime(intervalMs);
+-    // Attendre que la promesse rejetée soit traitée
+-    await vi.runAllTimersAsync();
+-
++    // La sonde immédiate rejette sur une microtâche, sans attendre le timeout.
++    await vi.advanceTimersByTimeAsync(0);
+     expect(deadCalled).toBe(1);
+   });
+ 
+@@ -118,16 +135,12 @@ describe("startWsWatchdog", () => {
+       timeoutMs,
+     });
+ 
+-    // Premier tick
+-    vi.advanceTimersByTime(intervalMs);
+-
+-    // Résoudre avant timeout
+-    vi.advanceTimersByTime(timeoutMs / 2);
++    // Première sonde immédiate, résolue avant son timeout.
++    await vi.advanceTimersByTimeAsync(timeoutMs / 2);
+     deferred.resolve();
+     // zcloudium: flush des microtâches AVANT d'atteindre le timeout,
+     // pour que le .then() de la sonde puisse effacer le timeout.
+     await vi.advanceTimersByTimeAsync(0);
+-    // Puis on avance jusqu'au moment où le timeout aurait dû se déclencher.
+     await vi.advanceTimersByTimeAsync(timeoutMs / 2);
+ 
+     expect(deadCalled).toBe(0);
+@@ -139,6 +152,80 @@ describe("startWsWatchdog", () => {
+     expect(deadCalled).toBe(0);
+   });
+ 
++  it("sonde dès que l'onglet redevient visible", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const visibilityTarget = new EventTarget();
++    let probeCount = 0;
++
++    startWsWatchdog({
++      probe: async () => {
++        probeCount++;
++      },
++      onDead: () => {},
++      intervalMs,
++      visibilityTarget,
++      isVisible: () => true,
++    });
++
++    expect(probeCount).toBe(1);
++    await vi.advanceTimersByTimeAsync(0);
++
++    visibilityTarget.dispatchEvent(new Event("visibilitychange"));
++    // La sonde de réveil part immédiatement, sans attendre l'intervalle.
++    expect(probeCount).toBe(2);
++  });
++
++  it("ne sonde pas sur visibilitychange quand l'onglet est masqué", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const visibilityTarget = new EventTarget();
++    let visible = false;
++    let probeCount = 0;
++
++    startWsWatchdog({
++      probe: async () => {
++        probeCount++;
++      },
++      onDead: () => {},
++      intervalMs,
++      visibilityTarget,
++      isVisible: () => visible,
++    });
++
++    expect(probeCount).toBe(1);
++    await vi.advanceTimersByTimeAsync(0);
++
++    visibilityTarget.dispatchEvent(new Event("visibilitychange"));
++    expect(probeCount).toBe(1);
++
++    visible = true;
++    visibilityTarget.dispatchEvent(new Event("visibilitychange"));
++    expect(probeCount).toBe(2);
++  });
++
++  it("sonde au retour en ligne", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const onlineTarget = new EventTarget();
++    let probeCount = 0;
++
++    startWsWatchdog({
++      probe: async () => {
++        probeCount++;
++      },
++      onDead: () => {},
++      intervalMs,
++      onlineTarget,
++    });
++
++    expect(probeCount).toBe(1);
++    await vi.advanceTimersByTimeAsync(0);
++
++    onlineTarget.dispatchEvent(new Event("online"));
++    expect(probeCount).toBe(2);
++  });
++
+   it("stop() empêche onDead", async () => {
+     const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
+     const intervalMs = 25000;
+@@ -154,14 +241,41 @@ describe("startWsWatchdog", () => {
+       timeoutMs,
+     });
+ 
+-    // Premier tick : sonde lancée
+-    vi.advanceTimersByTime(intervalMs);
+-
+-    // Stop avant timeout
++    // Stop avant le timeout de la première sonde.
+     handle.stop();
+ 
+     // Même après timeout, onDead ne doit pas être appelé
+     vi.advanceTimersByTime(timeoutMs * 2);
+     expect(deadCalled).toBe(0);
+   });
++
++  it("stop() retire les réveils", async () => {
++    const { startWsWatchdog } = await import("../src/wsWatchdog.ts");
++    const intervalMs = 25000;
++    const visibilityTarget = new EventTarget();
++    const onlineTarget = new EventTarget();
++    let probeCount = 0;
++
++    const handle = startWsWatchdog({
++      probe: async () => {
++        probeCount++;
++      },
++      onDead: () => {},
++      intervalMs,
++      visibilityTarget,
++      isVisible: () => true,
++      onlineTarget,
++    });
++
++    handle.stop();
++    await vi.advanceTimersByTimeAsync(0);
++    const countAfterStop = probeCount;
++
++    visibilityTarget.dispatchEvent(new Event("visibilitychange"));
++    onlineTarget.dispatchEvent(new Event("online"));
++    vi.advanceTimersByTime(intervalMs * 2);
++    await vi.advanceTimersByTimeAsync(0);
++
++    expect(probeCount).toBe(countAfterStop);
++  });
+ });
