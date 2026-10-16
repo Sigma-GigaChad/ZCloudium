@@ -108,6 +108,12 @@ jobs:
             packages/web/test/wsWatchdog.test.ts
             packages/server/test/openSshEd25519.test.ts
             packages/ui/test/restoreSessionOwnedAttachments.test.ts
+            packages/server/test/staticAssets.test.ts
+            packages/server/test/staticAssetsHttp.test.ts
+            packages/rpc/test/rpcLogGate.test.ts
+            packages/web/test/bootSocket.test.ts
+            packages/web/test/taskNotifications.test.ts
+            packages/server/test/remoteAttachmentTransfer.test.ts
           )
           for path in "${paths[@]}"; do test -f "$path"; done
           pnpm exec vitest run "${paths[@]}"
