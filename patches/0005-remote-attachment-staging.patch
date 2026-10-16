@@ -1,0 +1,977 @@
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index 3c146d2d..8c29739c 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -531,13 +531,17 @@ export function createHttpServer(
+         scope,
+         async (onDidRemoteClose) => {
+           const backend = await createRemoteBackend(body);
+-          return connectRemote(backend, {
++          const connection = await connectRemote(backend, {
+             remoteCdnBaseUrl,
+             remoteCacheDir,
+             // le registry expose `(code: number) => void`, connectRemote attend
+             // `{ code: number }` : on fait le pont sans modifier le registry.
+             onDidRemoteClose: (event) => onDidRemoteClose(event.code),
+           });
++          // zcloudium: le backend (canal SSH) reste dans la session durable —
++          // le staging serveur des pièces jointes streame sur ce même canal au
++          // lieu d'ouvrir une seconde connexion.
++          return { connection, backend };
+         },
+       );
+ 
+@@ -669,7 +673,11 @@ export function createHttpServer(
+ 
+           // zcloudium: 桥接远端 host 暴露的全部 channels（见 remoteBridge.ts），
+           // 浏览器拿到的 accessor 与桌面端一致，web 模式才能打开远程 workspace。
+-          const remoteServices = remoteServiceCollection(session.connection);
++          // 附件暂存由服务端实现接管：字节和 SSH 通道都在本进程，远端 runtime
++          // 自带的本地 stub 只会回 staged:false，导致 composer 拒绝发送。
++          const remoteServices = remoteServiceCollection(session.connection, {
++            promptAttachmentTransferService: session.promptAttachmentTransferService,
++          });
+ 
+           setupChannelServer(rawSocket, remoteServices, "web-remote-replayable");
+           // aucun dispose sur fermeture WS — attach/detach uniquement, la
+diff --git a/packages/server/src/remoteAttachmentTransfer.ts b/packages/server/src/remoteAttachmentTransfer.ts
+new file mode 100644
+index 00000000..a95ec7a3
+--- /dev/null
++++ b/packages/server/src/remoteAttachmentTransfer.ts
+@@ -0,0 +1,434 @@
++import { randomUUID } from "node:crypto";
++import { stat } from "node:fs/promises";
++import { join, resolve, sep } from "node:path";
++import { Emitter } from "@zcode/rpc";
++import type {
++  IPromptAttachmentTransferService,
++  PromptAttachmentStageParams,
++  PromptAttachmentStageResult,
++  PromptAttachmentTransferProgress,
++} from "@zcode/services";
++import { getZCodeDataRootDir } from "@zcode/services/node";
++import { STAGE_MAX_BYTES } from "./attachmentStage.js";
++import type { IRemoteBackend, RemoteUploadProgress } from "./remote/backend.js";
++import { quotePosixPathArg } from "./remote/posixShell.js";
++
++/**
++ * Server-side staging of prompt attachments for a remote web workspace.
++ *
++ * The web composer uploads the bytes to THIS machine first
++ * (POST /api/stage-attachment returns a real server path), then asks
++ * IPromptAttachmentTransferService.stage to hand the remote agent a path it can
++ * read. Over /ws/remote/:id that call must be served here — the remote
++ * runtime's own local stub returns staged:false, and the remote agent cannot
++ * read a path that only exists on the server. This service streams the staged
++ * bytes over the session's SSH/WSL/Docker backend, reusing the desktop host's
++ * remote layout (`~/.zcode/tmp/prompt-attachments`, dirs 0700, files 0600) so
++ * both hosts materialize the same paths, and fails explicitly when the session
++ * (backend) is gone instead of silently reporting "not staged".
++ */
++
++const REMOTE_PROMPT_ATTACHMENT_ROOT = "~/.zcode/tmp/prompt-attachments";
++const REMOTE_PROMPT_ATTACHMENT_RELATIVE_ROOT = ".zcode/tmp/prompt-attachments";
++
++/**
++ * Registry-only lifecycle hook. Symbol-keyed because
++ * `ProxyChannel.fromService` dispatches string method names: a `dispose()`
++ * method would be callable by any browser attached to the session, while the
++ * transport owner (the session registry) must be the only caller.
++ */
++export const REMOTE_ATTACHMENT_TRANSFER_DISPOSE = Symbol("remoteAttachmentTransferDispose");
++
++export interface RemotePromptAttachmentTransferService extends IPromptAttachmentTransferService {
++  /**
++   * Called by the session registry when the SSH connection dies: abort
++   * in-flight uploads and fail closed on late stage calls.
++   */
++  [REMOTE_ATTACHMENT_TRANSFER_DISPOSE](): void;
++}
++
++interface TransferRecord {
++  controller: AbortController;
++  ref?: string;
++  bytes: number;
++  adopted: boolean;
++}
++
++const SESSION_GONE_ERROR = "远端附件暂存会话已断开";
++
++function isAbortError(error: unknown): boolean {
++  return error instanceof Error && error.name === "AbortError";
++}
++
++/** Same text as the staging route's cap rejection, against the same constant. */
++function formatStageLimitError(): string {
++  return `Attachment exceeds the ${Math.floor(STAGE_MAX_BYTES / 1024 / 1024)} MiB web limit`;
++}
++
++/** The staged bytes must live under the server's own staging root. */
++function stagedAttachmentRootDir(): string {
++  return resolve(join(getZCodeDataRootDir(), "tmp", "paste-attachments"));
++}
++
++function isInsideStagedRoot(localPath: string): boolean {
++  const root = stagedAttachmentRootDir();
++  const resolved = resolve(localPath);
++  return resolved === root || resolved.startsWith(`${root}${sep}`);
++}
++
++export function createRemotePromptAttachmentTransferService(
++  backend: Pick<IRemoteBackend, "exec" | "upload">,
++  options: { onJanitorError?: (error: unknown) => void } = {},
++): RemotePromptAttachmentTransferService {
++  const records = new Map<string, TransferRecord>();
++  const emitters = new Map<string, Emitter<PromptAttachmentTransferProgress>>();
++  let disposed = false;
++
++  // Desktop parity: a host rebuild reclaims staging leftovers nobody adopted.
++  void cleanupStaleRemotePromptAttachments(backend).catch((error) => {
++    options.onJanitorError?.(error);
++  });
++
++  const getEmitter = (operationId: string) => {
++    const existing = emitters.get(operationId);
++    if (existing) return existing;
++    const emitter = new Emitter<PromptAttachmentTransferProgress>({
++      onDidRemoveLastListener: () => {
++        emitters.delete(operationId);
++        emitter.dispose();
++      },
++    });
++    emitters.set(operationId, emitter);
++    return emitter;
++  };
++
++  const releaseRecord = async (operationId: string, includeAdopted: boolean) => {
++    const record = records.get(operationId);
++    if (!record) return;
++    record.controller.abort();
++    if (record.ref && (includeAdopted || !record.adopted)) {
++      await cleanupRemotePromptAttachment(backend, record.ref).catch(() => {});
++    }
++    records.delete(operationId);
++  };
++
++  return {
++    async stage(params: PromptAttachmentStageParams): Promise<PromptAttachmentStageResult> {
++      if (disposed) {
++        throw new Error(SESSION_GONE_ERROR);
++      }
++      await releaseRecord(params.operationId, false);
++      const declaredBytes = Math.max(0, params.sizeBytes ?? 0);
++      if (declaredBytes > STAGE_MAX_BYTES) {
++        throw new Error(formatStageLimitError());
++      }
++      if (!isInsideStagedRoot(params.localPath)) {
++        throw new Error("Attachment source is not a server-staged file");
++      }
++      // The staged file on disk is the source of truth: a lying sizeBytes must
++      // not push an oversized upload past the cap the route enforces.
++      const fileStat = await stat(params.localPath).catch(() => undefined);
++      const actualBytes = fileStat?.size ?? 0;
++      if (actualBytes > STAGE_MAX_BYTES) {
++        throw new Error(formatStageLimitError());
++      }
++      const bytes = Math.max(declaredBytes, actualBytes);
++
++      const controller = new AbortController();
++      const record: TransferRecord = { controller, bytes, adopted: false };
++      records.set(params.operationId, record);
++      const emitter = getEmitter(params.operationId);
++      let lastPercent = -1;
++      let lastEmittedAt = 0;
++      let lastUploadedBytes = 0;
++      const workspaceKey = params.workspaceIdentity?.trim() || params.workspacePath;
++      // Same trace composition as the desktop host's eager staging: the remote
++      // directory stays namespaced by workspace/session/operation.
++      const traceId = `${workspaceKey}\u0000${params.remoteSessionId ?? ""}\u0000${params.operationId}`;
++      try {
++        const ref = await uploadRemotePromptAttachment({
++          backend,
++          localPath: params.localPath,
++          fileName: params.fileName,
++          traceId,
++          signal: controller.signal,
++          onProgress(progress) {
++            const totalBytes = Math.max(progress.totalBytes, record.bytes);
++            record.bytes = totalBytes;
++            lastUploadedBytes = Math.max(lastUploadedBytes, progress.uploadedBytes);
++            const percent =
++              totalBytes > 0 ? Math.floor((lastUploadedBytes / totalBytes) * 100) : 0;
++            const now = Date.now();
++            if (percent <= lastPercent && now - lastEmittedAt < 100) return;
++            lastPercent = Math.max(lastPercent, percent);
++            lastEmittedAt = now;
++            emitter.fire({
++              operationId: params.operationId,
++              phase: "uploading",
++              uploadedBytes: lastUploadedBytes,
++              totalBytes,
++            });
++          },
++        });
++        if (records.get(params.operationId) !== record || controller.signal.aborted) {
++          throw Object.assign(new Error("Remote upload canceled"), { name: "AbortError" });
++        }
++        record.ref = ref;
++        emitter.fire({
++          operationId: params.operationId,
++          phase: "committing",
++          uploadedBytes: record.bytes,
++          totalBytes: record.bytes,
++        });
++        emitter.fire({
++          operationId: params.operationId,
++          phase: "complete",
++          uploadedBytes: record.bytes,
++          totalBytes: record.bytes,
++        });
++        return {
++          operationId: params.operationId,
++          ref,
++          bytes: record.bytes,
++          staged: true,
++        };
++      } catch (error) {
++        if (isAbortError(error) || controller.signal.aborted) {
++          emitter.fire({
++            operationId: params.operationId,
++            phase: "canceled",
++            uploadedBytes: 0,
++            totalBytes: record.bytes,
++          });
++        }
++        if (records.get(params.operationId) === record) {
++          records.delete(params.operationId);
++        }
++        throw error;
++      }
++    },
++    async adopt(operationId) {
++      const record = records.get(operationId);
++      if (record?.ref) {
++        record.adopted = true;
++        records.delete(operationId);
++      }
++    },
++    async cancel(operationId) {
++      await releaseRecord(operationId, false);
++    },
++    async cleanup(operationId) {
++      await releaseRecord(operationId, false);
++    },
++    onDynamicProgress: (operationId) => getEmitter(operationId).event,
++    [REMOTE_ATTACHMENT_TRANSFER_DISPOSE]() {
++      if (disposed) return;
++      disposed = true;
++      for (const record of records.values()) {
++        record.controller.abort();
++      }
++      records.clear();
++      for (const emitter of emitters.values()) {
++        emitter.dispose();
++      }
++      emitters.clear();
++    },
++  };
++}
++
++interface UploadRemotePromptAttachmentParams {
++  backend: Pick<IRemoteBackend, "exec" | "upload">;
++  localPath: string;
++  fileName: string;
++  traceId: string;
++  signal: AbortSignal;
++  onProgress?: (progress: RemoteUploadProgress) => void;
++}
++
++/**
++ * Upload one staged attachment to the remote prompt-attachment root.
++ * Mirrors the desktop materializer's single-file path: private dirs, upload,
++ * lock the file down, and reclaim a half-written file on failure.
++ */
++async function uploadRemotePromptAttachment(
++  params: UploadRemotePromptAttachmentParams,
++): Promise<string> {
++  const remoteRoot = await resolveRemotePromptAttachmentRoot(params.backend);
++  const remotePath = buildRemotePromptAttachmentPath({
++    filename: params.fileName,
++    index: 0,
++    root: remoteRoot,
++    traceId: params.traceId,
++  });
++  try {
++    await ensureRemotePromptAttachmentDirectory(params.backend, remotePath, remoteRoot);
++    await params.backend.upload(params.localPath, remotePath, {
++      signal: params.signal,
++      onProgress: params.onProgress,
++    });
++    await lockDownRemotePromptAttachmentFile(params.backend, remotePath);
++  } catch (error) {
++    await cleanupRemotePromptAttachment(params.backend, remotePath).catch(() => {});
++    throw new Error(`远端附件上传失败：${params.fileName}`, { cause: error });
++  }
++  return remotePath;
++}
++
++async function cleanupRemotePromptAttachment(
++  backend: Pick<IRemoteBackend, "exec">,
++  remotePath: string,
++): Promise<void> {
++  const root = await resolveRemotePromptAttachmentRoot(backend);
++  if (!isRemotePromptAttachmentPath(remotePath, root)) return;
++  const remoteDir = remoteDirname(remotePath);
++  await waitForRemoteCommand(
++    backend,
++    `rm -f ${quotePosixPathArg(remotePath)} && rmdir ${quotePosixPathArg(remoteDir)} 2>/dev/null || true`,
++  );
++}
++
++async function cleanupStaleRemotePromptAttachments(
++  backend: Pick<IRemoteBackend, "exec">,
++  olderThanMinutes = 24 * 60,
++): Promise<void> {
++  const root = await resolveRemotePromptAttachmentRoot(backend);
++  await waitForRemoteCommand(
++    backend,
++    `if [ -d ${quotePosixPathArg(root)} ]; then find ${quotePosixPathArg(root)} -type f -mmin +${Math.max(1, Math.floor(olderThanMinutes))} -delete; find ${quotePosixPathArg(root)} -mindepth 1 -depth -type d -empty -delete; fi`,
++  );
++}
++
++function buildRemotePromptAttachmentPath(params: {
++  filename: string;
++  index: number;
++  nonce?: string;
++  root?: string;
++  traceId: string;
++}): string {
++  const traceSegment = sanitizePathSegment(String(params.traceId)).slice(0, 80) || "trace";
++  const nonceSegment = sanitizePathSegment(params.nonce ?? randomUUID()).slice(0, 64);
++  const filename = sanitizePathSegment(basenameFromPathLike(params.filename)) || "attachment";
++  const indexSegment = String(params.index + 1).padStart(2, "0");
++  const root = params.root ?? REMOTE_PROMPT_ATTACHMENT_ROOT;
++  return `${root}/${traceSegment}/${nonceSegment}/${indexSegment}-${filename.slice(0, 160)}`;
++}
++
++async function ensureRemotePromptAttachmentDirectory(
++  backend: Pick<IRemoteBackend, "exec">,
++  remotePath: string,
++  root: string,
++): Promise<void> {
++  const remoteDir = remoteDirname(remotePath);
++  const privateDirs = collectRemotePromptAttachmentPrivateDirs(remoteDir, root);
++  // Staged attachments may contain clipboard or file content: never land in a
++  // shared /tmp; create user-private dirs before the first byte.
++  const command = [
++    `mkdir -p ${quotePosixPathArg(remoteDir)}`,
++    `command chmod 700 ${privateDirs.map((dir) => quotePosixPathArg(dir)).join(" ")}`,
++  ].join(" && ");
++  await waitForRemoteCommand(backend, command);
++}
++
++async function lockDownRemotePromptAttachmentFile(
++  backend: Pick<IRemoteBackend, "exec">,
++  remotePath: string,
++): Promise<void> {
++  await waitForRemoteCommand(backend, `command chmod 600 ${quotePosixPathArg(remotePath)}`);
++}
++
++async function resolveRemotePromptAttachmentRoot(
++  backend: Pick<IRemoteBackend, "exec">,
++): Promise<string> {
++  const homeDir = await readRemoteCommandStdout(backend, 'printf %s "$HOME"');
++  const normalizedHome = homeDir.trim().replace(/\/+$/u, "");
++  if (!normalizedHome.startsWith("/")) {
++    throw new Error("remote HOME is not an absolute path");
++  }
++  return `${normalizedHome}/${REMOTE_PROMPT_ATTACHMENT_RELATIVE_ROOT}`;
++}
++
++async function readRemoteCommandStdout(
++  backend: Pick<IRemoteBackend, "exec">,
++  command: string,
++): Promise<string> {
++  const stream = await backend.exec(command);
++  let stdoutText = "";
++  let stderrText = "";
++  stream.stdout.on("data", (chunk: Buffer | string) => {
++    stdoutText += chunk.toString();
++  });
++  stream.stderr.on("data", (chunk: Buffer | string) => {
++    stderrText += chunk.toString();
++  });
++  await new Promise<void>((resolvePromise, reject) => {
++    stream.onClose((code) => {
++      if (code === 0) {
++        resolvePromise();
++        return;
++      }
++      reject(
++        new Error(
++          `remote command failed with exit code ${code}: ${command}${
++            stderrText ? `: ${stderrText}` : ""
++          }`,
++        ),
++      );
++    });
++  });
++  return stdoutText;
++}
++
++async function waitForRemoteCommand(
++  backend: Pick<IRemoteBackend, "exec">,
++  command: string,
++): Promise<void> {
++  const stream = await backend.exec(command);
++  await new Promise<void>((resolvePromise, reject) => {
++    stream.onClose((code) => {
++      if (code === 0) {
++        resolvePromise();
++        return;
++      }
++      reject(new Error(`remote command failed with exit code ${code}: ${command}`));
++    });
++  });
++}
++
++function isRemotePromptAttachmentPath(path: string, remoteRoot: string): boolean {
++  return isPathInRoot(path, REMOTE_PROMPT_ATTACHMENT_ROOT) || isPathInRoot(path, remoteRoot);
++}
++
++function isPathInRoot(path: string, root: string): boolean {
++  return path === root || path.startsWith(`${root}/`);
++}
++
++function remoteDirname(remotePath: string): string {
++  const slashIndex = remotePath.lastIndexOf("/");
++  return slashIndex > 0 ? remotePath.slice(0, slashIndex) : REMOTE_PROMPT_ATTACHMENT_ROOT;
++}
++
++function collectRemotePromptAttachmentPrivateDirs(remoteDir: string, root: string): string[] {
++  const relativeDir = remoteDir.startsWith(`${root}/`) ? remoteDir.slice(root.length + 1) : "";
++  const segments = relativeDir.split("/").filter(Boolean);
++  const dirs = [root];
++  let current = root;
++  for (const segment of segments) {
++    current = `${current}/${segment}`;
++    dirs.push(current);
++  }
++  return dirs;
++}
++
++function basenameFromPathLike(pathLike: string): string {
++  const segments = pathLike.split(/[\\/]/u).filter(Boolean);
++  return segments.at(-1) ?? pathLike;
++}
++
++function sanitizePathSegment(value: string): string {
++  const sanitized = value
++    .replaceAll("\0", "-")
++    .replace(/[^A-Za-z0-9._-]+/gu, "-")
++    .replace(/^-+/u, "")
++    .replace(/-+$/u, "");
++  return sanitized || "attachment";
++}
+diff --git a/packages/server/src/remoteBridge.ts b/packages/server/src/remoteBridge.ts
+index 1aff54c7..5094209f 100644
+--- a/packages/server/src/remoteBridge.ts
++++ b/packages/server/src/remoteBridge.ts
+@@ -44,6 +44,18 @@ import {
+ } from "@zcode/services";
+ import type { RemoteConnection } from "./remote/index.js";
+ 
++export interface RemoteServiceCollectionOptions {
++  /**
++   * zcloudium: staging for the browser composer's attachments runs HERE, in
++   * the server, not on the target runtime. The staged bytes live on this
++   * machine's filesystem and the SSH/WSL/Docker channel lives in this process,
++   * so the remote runtime's own local stub would answer `staged:false` and
++   * block the send. When provided, this service replaces the proxy for
++   * `IPromptAttachmentTransferService`; every other channel stays a proxy.
++   */
++  promptAttachmentTransferService?: IPromptAttachmentTransferService;
++}
++
+ /**
+  * Bridge the full remote service set onto a local WebSocket.
+  *
+@@ -60,7 +72,10 @@ import type { RemoteConnection } from "./remote/index.js";
+  * credentials and is a trusted-host-only capability (see the override in
+  * setupChannelServer).
+  */
+-export function remoteServiceCollection(connection: RemoteConnection): ServiceCollection {
++export function remoteServiceCollection(
++  connection: RemoteConnection,
++  options: RemoteServiceCollectionOptions = {},
++): ServiceCollection {
+   const descriptors: ServiceDescriptor<unknown>[] = [
+     IFileService,
+     IMediaPreviewService,
+@@ -105,6 +120,20 @@ export function remoteServiceCollection(connection: RemoteConnection): ServiceCo
+ 
+   const collection = new ServiceCollection();
+   for (const descriptor of descriptors) {
++    // zcloudium: the attachment transfer service is a server capability, not a
++    // remote one — the bytes to stage and the SSH channel are both here. A
++    // proxied call would reach the target runtime's local stub (staged:false)
++    // and the composer would refuse to send.
++    if (
++      descriptor.channelName === IPromptAttachmentTransferService.channelName &&
++      options.promptAttachmentTransferService
++    ) {
++      collection.register(
++        descriptor as ServiceDescriptor<IPromptAttachmentTransferService>,
++        options.promptAttachmentTransferService,
++      );
++      continue;
++    }
+     // Register service-shaped proxies, the same shape exposeOnChannelServer
+     // expects (it wraps every value in ProxyChannel.fromService, which
+     // dispatches by method name on the object): a raw {call, listen} channel
+diff --git a/packages/server/src/remoteSessionRegistry.ts b/packages/server/src/remoteSessionRegistry.ts
+index 4ee0d0fd..d6c1cb6f 100644
+--- a/packages/server/src/remoteSessionRegistry.ts
++++ b/packages/server/src/remoteSessionRegistry.ts
+@@ -3,6 +3,12 @@ import type { WebSocket } from "ws";
+ import type { RemoteTarget } from "@zcode/shared";
+ import { buildSshRemoteHostKey } from "@zcode/shared";
+ import type { RemoteConnection } from "./remote/index.js";
++import type { IRemoteBackend } from "./remote/backend.js";
++import {
++  createRemotePromptAttachmentTransferService,
++  REMOTE_ATTACHMENT_TRANSFER_DISPOSE,
++  type RemotePromptAttachmentTransferService,
++} from "./remoteAttachmentTransfer.js";
+ 
+ /**
+  * Durable server-side remote sessions — the web counterpart of the desktop
+@@ -29,8 +35,15 @@ export interface RemoteSessionScope {
+   workspaceIdentity?: string;
+ }
+ 
++/** What a successful connect hands the registry: the RPC connection plus the transport the server-side attachment staging streams over. */
++export interface RemoteConnectionSetup {
++  connection: RemoteConnection;
++  backend: IRemoteBackend;
++}
++
+ interface ConnectionEntry {
+   connection: RemoteConnection;
++  promptAttachmentTransferService: RemotePromptAttachmentTransferService;
+   fingerprint: string;
+   sessionIds: Set<string>;
+ }
+@@ -38,6 +51,7 @@ interface ConnectionEntry {
+ interface SessionEntry {
+   id: string;
+   connection: RemoteConnection;
++  promptAttachmentTransferService: RemotePromptAttachmentTransferService;
+   fingerprint: string;
+   scopeKey: string;
+   workspacePath?: string;
+@@ -73,7 +87,7 @@ export class RemoteSessionRegistry {
+   private readonly sessions = new Map<string, SessionEntry>();
+   private readonly inflight = new Map<string, Promise<{ id: string; reused: boolean }>>();
+   /** Connection creation per target: same-target connects with different workspace scopes race here. */
+-  private readonly connecting = new Map<string, Promise<RemoteConnection>>();
++  private readonly connecting = new Map<string, Promise<RemoteConnectionSetup>>();
+ 
+   /** A session that is already live for this exact scope: instant re-attach. */
+   findLiveSessionId(scopeKey: string): string | undefined {
+@@ -97,7 +111,7 @@ export class RemoteSessionRegistry {
+   async connect(
+     target: RemoteTarget,
+     scope: RemoteSessionScope,
+-    connect: (onDidRemoteClose: (code: number) => void) => Promise<RemoteConnection>,
++    connect: (onDidRemoteClose: (code: number) => void) => Promise<RemoteConnectionSetup>,
+   ): Promise<{ id: string; reused: boolean }> {
+     const fingerprint = connectionFingerprint(target);
+     const scopeKey = scopeKeyFor(target, scope);
+@@ -128,20 +142,30 @@ export class RemoteSessionRegistry {
+       let pending = this.connecting.get(fingerprint);
+       const isCreator = !pending;
+       if (!pending) {
+-        let connection: RemoteConnection | undefined;
++        let setup: RemoteConnectionSetup | undefined;
+         const onDidRemoteClose = () => {
+-          if (connection) {
+-            this.handleRemoteClose(connection);
++          if (setup) {
++            this.handleRemoteClose(setup.connection);
+           }
+         };
+         pending = connect(onDidRemoteClose).then((value) => {
+-          connection = value;
++          setup = value;
+           this.connections.set(fingerprint, {
+-            connection,
++            connection: value.connection,
++            // zcloudium: one staging service per SSH channel (desktop parity):
++            // it owns the janitor, in-flight uploads and progress emitters, so
++            // it must outlive browser attachments and die with the channel.
++            promptAttachmentTransferService: createRemotePromptAttachmentTransferService(
++              value.backend,
++              {
++                onJanitorError: (error) =>
++                  console.warn("[remote-session] prompt attachment janitor failed:", error),
++              },
++            ),
+             fingerprint,
+             sessionIds: new Set(),
+           });
+-          return connection;
++          return value;
+         });
+         // Detached cleanup: absorbs the rejection so a failed connect
+         // (unreachable host, auth, deploy) never becomes an unhandledRejection
+@@ -150,7 +174,7 @@ export class RemoteSessionRegistry {
+         void pending.finally(() => this.connecting.delete(fingerprint)).catch(() => undefined);
+         this.connecting.set(fingerprint, pending);
+       }
+-      const connection = await pending;
++      await pending;
+       const entry = this.connections.get(fingerprint);
+       if (!entry) {
+         // The remote died during the registration tick; its close already
+@@ -199,6 +223,7 @@ export class RemoteSessionRegistry {
+     const session: SessionEntry = {
+       id,
+       connection: entry.connection,
++      promptAttachmentTransferService: entry.promptAttachmentTransferService,
+       fingerprint: entry.fingerprint,
+       scopeKey,
+       workspacePath: scope.workspacePath,
+@@ -226,6 +251,9 @@ export class RemoteSessionRegistry {
+     // sessions and its dispose with it instead of stranding them.
+     for (const [key, entry] of [...this.connections]) {
+       if (entry.connection === connection) {
++        // The transport is gone: abort in-flight staging and make late stage
++        // calls fail explicitly instead of half-succeeding on a dead channel.
++        entry.promptAttachmentTransferService[REMOTE_ATTACHMENT_TRANSFER_DISPOSE]();
+         this.connections.delete(key);
+       }
+     }
+diff --git a/packages/server/test/remoteAttachmentTransfer.test.ts b/packages/server/test/remoteAttachmentTransfer.test.ts
+new file mode 100644
+index 00000000..596d443a
+--- /dev/null
++++ b/packages/server/test/remoteAttachmentTransfer.test.ts
+@@ -0,0 +1,316 @@
++/**
++ * Tests for the server-side staging of prompt attachments in a web remote
++ * workspace.
++ *
++ * The browser composer stages the bytes on THIS machine (POST
++ * /api/stage-attachment returns a real server path), then asks
++ * IPromptAttachmentTransferService.stage to make them readable by the remote
++ * agent. Over /ws/remote/:id that call must be served by a server-side
++ * service streaming the staged bytes over the session's SSH backend — the
++ * remote runtime's local stub returns staged:false and blocks the send.
++ */
++import { PassThrough } from "node:stream";
++import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type { Event, IDisposable } from "@zcode/rpc";
++import { IFileService, IPromptAttachmentTransferService } from "@zcode/services";
++import type { PromptAttachmentStageParams } from "@zcode/services";
++import type { RemoteUploadOptions } from "@zcode/server/remote";
++import { setDataBaseDir } from "@zcode/services/node";
++import {
++  STAGE_MAX_BYTES,
++  stageAttachmentBytes,
++  stagedAttachmentDir,
++} from "../src/attachmentStage.js";
++import { remoteServiceCollection } from "../src/remoteBridge.js";
++import { RemoteSessionRegistry } from "../src/remoteSessionRegistry.js";
++import type { RemoteConnection } from "../src/remote/connect.js";
++import { createRemotePromptAttachmentTransferService, REMOTE_ATTACHMENT_TRANSFER_DISPOSE } from "../src/remoteAttachmentTransfer.js";
++
++function createClosedStream(stdoutText = "") {
++  const stdin = new PassThrough();
++  const stdout = new PassThrough();
++  const stderr = new PassThrough();
++  const onClose: Event<number> = (listener: (code: number) => void): IDisposable => {
++    queueMicrotask(() => {
++      if (stdoutText) stdout.write(stdoutText);
++      stdout.end();
++      listener(0);
++    });
++    return { dispose() {} };
++  };
++  return { stdin, stdout, stderr, onClose };
++}
++
++interface FakeBackendOptions {
++  failExec?: boolean;
++  failUpload?: boolean;
++}
++
++function createFakeBackend(options: FakeBackendOptions = {}) {
++  const commands: string[] = [];
++  const uploads: Array<{ localPath: string; remotePath: string; options?: RemoteUploadOptions }> =
++    [];
++  const exec = vi.fn(async (command: string) => {
++    if (options.failExec) {
++      throw new Error("SSH backend 已释放，无法重新建立连接");
++    }
++    commands.push(command);
++    return createClosedStream(command === 'printf %s "$HOME"' ? "/home/tester" : "");
++  });
++  const upload = vi.fn(
++    async (localPath: string, remotePath: string, uploadOptions?: RemoteUploadOptions) => {
++      if (options.failUpload) {
++        throw new Error("SSH backend 已释放，无法重新建立连接");
++      }
++      uploadOptions?.onProgress?.({ uploadedBytes: 20, totalBytes: 100 });
++      uploadOptions?.onProgress?.({ uploadedBytes: 100, totalBytes: 100 });
++      uploads.push({ localPath, remotePath, options: uploadOptions });
++    },
++  );
++  return { exec, upload, commands, uploads };
++}
++
++function stageParams(
++  localPath: string,
++  sizeBytes?: number,
++  operationId = "attachment-1",
++): PromptAttachmentStageParams {
++  return {
++    operationId,
++    sessionId: "session-1",
++    workspacePath: "/workspace",
++    workspaceIdentity: "remote:ssh:example",
++    remoteSessionId: "remote-session-1",
++    localPath,
++    fileName: "report.zip",
++    mime: "application/zip",
++    ...(sizeBytes === undefined ? {} : { sizeBytes }),
++  };
++}
++
++let dataBaseDir: string;
++
++beforeEach(async () => {
++  // The service confines sources to the server staging root; isolate the data
++  // root so the test never touches the real ~/.zcodium.
++  dataBaseDir = await mkdtemp(join(tmpdir(), "zcode-remote-attachment-test-"));
++  setDataBaseDir(dataBaseDir);
++});
++
++afterEach(async () => {
++  setDataBaseDir(null);
++  await rm(dataBaseDir, { recursive: true, force: true });
++});
++
++describe("server remote prompt attachment transfer service", () => {
++  it("streams the staged bytes over the backend and returns staged:true with the remote path", async () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++    const phases: string[] = [];
++    const uploadedBytes: number[] = [];
++    const subscription = service.onDynamicProgress("attachment-1")((event) => {
++      phases.push(event.phase);
++      uploadedBytes.push(event.uploadedBytes);
++    });
++
++    const result = await service.stage(stageParams(staged.path, staged.sizeBytes));
++    subscription.dispose();
++
++    expect(result.staged).toBe(true);
++    expect(result.bytes).toBe(100);
++    // Desktop parity: the whole `${workspace}\0${remoteSessionId}\0${operationId}`
++    // trace is sanitized into one segment, as remotePromptAttachments.ts does.
++    expect(result.ref).toMatch(
++      /^\/home\/tester\/\.zcode\/tmp\/prompt-attachments\/remote-ssh-example-remote-session-1-attachment-1\/[0-9a-f-]+\/01-report\.zip$/,
++    );
++    expect(backend.uploads).toHaveLength(1);
++    expect(backend.uploads[0]?.localPath).toBe(staged.path);
++    expect(backend.uploads[0]?.remotePath).toBe(result.ref);
++    expect(phases).toEqual(["uploading", "uploading", "committing", "complete"]);
++    expect(uploadedBytes).toEqual([20, 100, 100, 100]);
++    // Private staging layout mirrored from the desktop materializer: 0700 dirs, 0600 file.
++    expect(
++      backend.commands.some(
++        (command) => command.includes(`chmod 700`) && command.includes("/home/tester/.zcode"),
++      ),
++    ).toBe(true);
++    expect(
++      backend.commands.some((command) => command.includes(`chmod 600 '${result.ref}'`)),
++    ).toBe(true);
++  });
++
++  it("adopt keeps the staged file; cleanup before adopt removes it", async () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++
++    await service.stage(stageParams(staged.path, staged.sizeBytes, "attachment-adopt"));
++    await service.adopt("attachment-adopt");
++    await service.cleanup("attachment-adopt");
++    const afterAdopt = backend.commands.filter((command) => command.startsWith("rm -f "));
++    expect(afterAdopt).toEqual([]);
++
++    await service.stage(stageParams(staged.path, staged.sizeBytes, "attachment-cleanup"));
++    await service.cleanup("attachment-cleanup");
++    const afterCleanup = backend.commands.filter((command) => command.startsWith("rm -f "));
++    expect(afterCleanup).toHaveLength(1);
++    expect(afterCleanup[0]).toContain("prompt-attachments");
++  });
++
++  it("cancel aborts an in-flight upload and reports canceled", async () => {
++    const backend = createFakeBackend();
++    backend.upload.mockImplementation(
++      async (_localPath: string, _remotePath: string, uploadOptions?: RemoteUploadOptions) =>
++        new Promise<void>((_resolve, reject) => {
++          uploadOptions?.signal?.addEventListener("abort", () => {
++            const error = new Error("canceled");
++            error.name = "AbortError";
++            reject(error);
++          });
++        }),
++    );
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++    const phases: string[] = [];
++    service.onDynamicProgress("attachment-cancel")((event) => phases.push(event.phase));
++
++    const staging = service.stage(stageParams(staged.path, staged.sizeBytes, "attachment-cancel"));
++    await vi.waitFor(() => expect(backend.upload).toHaveBeenCalledTimes(1));
++    await service.cancel("attachment-cancel");
++
++    await expect(staging).rejects.toThrow("远端附件上传失败：report.zip");
++    expect(phases).toContain("canceled");
++    expect(backend.upload.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
++  });
++
++  it("rejects a source outside the server staging root without calling the backend", async () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const outsidePath = join(dataBaseDir, "outside.txt");
++    await writeFile(outsidePath, "not staged");
++
++    await expect(
++      service.stage(stageParams(outsidePath, 9)),
++    ).rejects.toThrow(/not a server-staged file/);
++    expect(backend.upload).not.toHaveBeenCalled();
++  });
++
++  it("enforces the same 20 MiB cap as the staging route", async () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(4));
++    const routeError = await stageAttachmentBytes(
++      "big.bin",
++      new Uint8Array(STAGE_MAX_BYTES + 1),
++    ).catch((error: unknown) => error as Error);
++    expect(routeError.message).toContain("20 MiB");
++
++    // Declared size over the cap: rejected before any stat/upload.
++    await expect(
++      service.stage(stageParams(staged.path, STAGE_MAX_BYTES + 1)),
++    ).rejects.toThrow(routeError.message);
++    expect(backend.upload).not.toHaveBeenCalled();
++
++    // Actual file over the cap (client understated sizeBytes): rejected too.
++    const oversizedPath = join(stagedAttachmentDir(), "oversized.bin");
++    await writeFile(oversizedPath, Buffer.alloc(STAGE_MAX_BYTES + 1));
++    await expect(service.stage(stageParams(oversizedPath, 1))).rejects.toThrow(routeError.message);
++    expect(backend.upload).not.toHaveBeenCalled();
++    expect((await stat(oversizedPath)).size).toBeGreaterThan(STAGE_MAX_BYTES);
++  });
++
++  it("fails explicitly when the SSH session is gone instead of returning unstaged", async () => {
++    const backend = createFakeBackend({ failUpload: true });
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++
++    const error = await service
++      .stage(stageParams(staged.path, staged.sizeBytes))
++      .catch((cause: unknown) => cause as Error & { cause?: unknown });
++
++    expect(error).toBeInstanceOf(Error);
++    expect(error.message).toBe("远端附件上传失败：report.zip");
++    expect(error.cause).toBeInstanceOf(Error);
++    expect((error.cause as Error).message).toContain("SSH backend 已释放");
++  });
++
++  it("fails explicitly for a disposed session", async () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++
++    // The registry-only hook is symbol-keyed: no string method reaches the RPC surface.
++    expect((service as unknown as Record<string, unknown>).dispose).toBeUndefined();
++    service[REMOTE_ATTACHMENT_TRANSFER_DISPOSE]();
++
++    await expect(service.stage(stageParams(staged.path, staged.sizeBytes))).rejects.toThrow(
++      "远端附件暂存会话已断开",
++    );
++    expect(backend.upload).not.toHaveBeenCalled();
++  });
++});
++
++describe("remote bridge attachment wiring", () => {
++  it("serves the server-side transfer service for the descriptor when provided", () => {
++    const backend = createFakeBackend();
++    const service = createRemotePromptAttachmentTransferService(backend);
++    const connection = {
++      client: {
++        getChannel: () => ({ call: async () => undefined, listen: () => undefined }),
++      },
++    } as unknown as RemoteConnection;
++
++    const collection = remoteServiceCollection(connection, {
++      promptAttachmentTransferService: service,
++    });
++    expect(collection.get(IPromptAttachmentTransferService)).toBe(service);
++    // Every other channel keeps its proxy.
++    expect(collection.get(IFileService)).toBeDefined();
++    expect(collection.get(IFileService)).not.toBe(service);
++
++    // Without the option (e.g. the local /ws path), the descriptor stays a proxy.
++    const proxyOnly = remoteServiceCollection(connection);
++    expect(proxyOnly.get(IPromptAttachmentTransferService)).not.toBe(service);
++  });
++
++  it("binds the staging service to the session and disposes it on remote close", async () => {
++    const registry = new RemoteSessionRegistry();
++    const backend = createFakeBackend();
++    const dispose = vi.fn();
++    const connection = {
++      services: {},
++      client: {},
++      dispose,
++      disposeAndWait: async () => undefined,
++    } as unknown as RemoteConnection;
++    let closeListener: ((code: number) => void) | undefined;
++
++    const { id } = await registry.connect(
++      { kind: "server", url: "https://example.test" },
++      {},
++      async (onDidRemoteClose) => {
++        closeListener = onDidRemoteClose;
++        return { connection, backend };
++      },
++    );
++    const session = registry.getSession(id);
++    expect(session?.promptAttachmentTransferService).toBeDefined();
++    const staged = await stageAttachmentBytes("report.zip", new Uint8Array(100));
++    const result = await session!.promptAttachmentTransferService.stage(
++      stageParams(staged.path, staged.sizeBytes),
++    );
++    expect(result.staged).toBe(true);
++
++    closeListener?.(1);
++
++    expect(dispose).toHaveBeenCalledTimes(1);
++    // The dead channel fails closed: an explicit error, never staged:false.
++    await expect(
++      session!.promptAttachmentTransferService.stage(stageParams(staged.path, staged.sizeBytes)),
++    ).rejects.toThrow("远端附件暂存会话已断开");
++  });
++});
