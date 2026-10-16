@@ -29,8 +29,11 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "24.14.0"
+      # No path argument: default discovery (what the README documents) is the
+      # only form that runs on the product's Node 24 — it loads a directory
+      # argument as a module instead of scanning it.
       - name: Run the gateway and entrypoint suite
-        run: node --test --test-force-exit tests/
+        run: node --test --test-force-exit
 
   series:
     name: patch series applies on the pin
@@ -65,6 +68,10 @@ jobs:
             https://github.com/ZCodium-project/ZCodium.git zc-src
           cd zc-src
           git submodule update --init --recursive || true
+          # Same mount as Dockerfile.from-source: the bridge contract script
+          # lives in this repo and is injected into the source tree.
+          cp "$GITHUB_WORKSPACE/scripts/validate-remote-bridge.mts" \
+            packages/server/validate-remote-bridge.mts
           for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
             git apply --check "$patch"
             git apply "$patch"
