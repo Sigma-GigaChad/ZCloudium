@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:net";
 import { DEFAULT_SESSION_TTL_MS } from "../gateway/lib/session.mjs";
 import {
   DEFAULT_DATA_DIR,
@@ -18,6 +19,8 @@ import {
   PUBLISHED_HOST,
   PUBLISHED_PORT,
   RUNTIME_ENTRY,
+  RUNTIME_READY_INTERVAL_MS,
+  RUNTIME_READY_TIMEOUT_MS,
   UPSTREAM_HOST,
   UPSTREAM_PORT,
   exitCodeFor,
@@ -27,6 +30,7 @@ import {
   parseTrustProxy,
   runtimeArgs,
   start,
+  waitForRuntime,
 } from "../gateway/start.mjs";
 
 /** The argument list the runtime received before the gateway existed, verbatim. */
@@ -247,6 +251,17 @@ function fakeProcess() {
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 /**
+ * A mount table where /data and /workspace are named volumes: what a
+ * correctly launched container sees. Individual tests override it to
+ * exercise the persistence pre-check (anonymous volume, bare filesystem).
+ */
+const GOOD_MOUNTS = [
+  "808 802 0:792 / / rw,relatime - overlay overlay rw",
+  "820 808 0:94 /var/lib/docker/volumes/zc-data/_data /data rw,relatime - ext4 /dev/sda1 rw",
+  "821 808 0:95 /var/lib/docker/volumes/zc-ws/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
+].join("\n");
+
+/**
  * Wires start() with stubs and returns everything the assertions need.
  */
 async function runStart(
@@ -255,17 +270,14 @@ async function runStart(
     gateway = null,
     argv = ["node", "/opt/cloudium/gateway/start.mjs"],
     certificate = async () => ({ cert: "fake certificate", key: "fake key" }),
-    /**
-     * A mount table where /data and /workspace are named volumes: what a
-     * correctly launched container sees. Individual tests override it to
-     * exercise the persistence pre-check (anonymous volume, bare filesystem).
-     */
-    mountInfoText = [
-      "808 802 0:792 / / rw,relatime - overlay overlay rw",
-      "820 808 0:94 /var/lib/docker/volumes/zc-data/_data /data rw,relatime - ext4 /dev/sda1 rw",
-      "821 808 0:95 /var/lib/docker/volumes/zc-ws/_data /workspace rw,relatime - ext4 /dev/sda1 rw",
-    ].join("\n"),
+    mountInfoText = GOOD_MOUNTS,
     dirState = undefined,
+    /**
+     * The real readiness wait would probe 127.0.0.1:3131, and the unit suite
+     * must not depend on a socket: the stub reports a ready runtime, while the
+     * dedicated tests drive the real waitForRuntime with an injected probe.
+     */
+    waitForRuntimeFn = async () => ({ ready: true, waitedMs: 0 }),
   } = {},
 ) {
   const child = fakeChild();
@@ -273,6 +285,7 @@ async function runStart(
   const signals = fakeProcess();
   const exits = [];
   const gatewayCalls = [];
+  const waitCalls = [];
   const logs = [];
 
   const result = await start({
@@ -285,6 +298,10 @@ async function runStart(
     spawnRuntime: (file, args, options) => {
       spawns.push({ file, args, options });
       return child;
+    },
+    waitForRuntimeFn: (options) => {
+      waitCalls.push(options);
+      return waitForRuntimeFn(options);
     },
     createGatewayFn: async (options) => {
       gatewayCalls.push(options);
@@ -309,13 +326,14 @@ async function runStart(
     signals,
     exits,
     gatewayCalls,
+    waitCalls,
     logs,
   };
 }
 
 test("with the gateway on, the runtime is spawned on loopback and the gateway starts in front", async () => {
   const closed = [];
-  const { result, child, spawns, signals, exits, gatewayCalls, logs } = await runStart(
+  const { result, child, spawns, signals, exits, gatewayCalls, waitCalls, logs } = await runStart(
     { HOME: "/data" },
     { gateway: { port: PUBLISHED_PORT, close: async () => closed.push(true) } },
   );
@@ -324,6 +342,9 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
   assert.equal(spawns[0].file, process.execPath);
   assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...LOOPBACK_ARGS]);
   assert.equal(spawns[0].options.stdio, "inherit");
+  assert.equal(waitCalls.length, 1, "the runtime is waited for before the gateway is created");
+  assert.equal(waitCalls[0].host, UPSTREAM_HOST);
+  assert.equal(waitCalls[0].port, UPSTREAM_PORT);
   assert.deepEqual(
     gatewayCalls.map(({ logger, ...options }) => options),
     [
@@ -366,10 +387,11 @@ test("with the gateway on, the runtime is spawned on loopback and the gateway st
 });
 
 test("with ZCLOUDIUM_AUTH=off the runtime runs directly and no gateway is started", async () => {
-  const { result, child, spawns, signals, exits, gatewayCalls } = await runStart({ ZCLOUDIUM_AUTH: "off" });
+  const { result, child, spawns, signals, exits, gatewayCalls, waitCalls } = await runStart({ ZCLOUDIUM_AUTH: "off" });
 
   assert.deepEqual(spawns[0].args, [RUNTIME_ENTRY, ...DIRECT_ARGS]);
   assert.equal(gatewayCalls.length, 0, "the gateway must not start when auth is off");
+  assert.equal(waitCalls.length, 0, "nothing waits on a runtime the gateway is not in front of");
   assert.equal(result.gateway, null);
   assert.deepEqual(signals.events().sort(), ["SIGINT", "SIGTERM"]);
 
@@ -527,4 +549,125 @@ test("an unreadable mount table skips the check instead of guessing", async () =
     started.logs.some((line) => /volume check cannot read the mount table/.test(line)),
     `the skip must be stated, got: ${JSON.stringify(started.logs)}`,
   );
+});
+
+/**
+ * The runtime takes a moment to accept connections after it is spawned, and the
+ * gateway used to be put in front immediately: the first request after
+ * `compose up` could race the runtime's listen() and get the 502 page. start()
+ * waits for the loopback address first, and the gateway is only created once
+ * the runtime answers.
+ */
+test("the gateway is created only after the runtime accepts connections", async () => {
+  const steps = [];
+  let accept = null;
+  const accepted = new Promise((resolve) => {
+    accept = resolve;
+  });
+  const waitCalls = [];
+  const child = fakeChild();
+
+  const started = start({
+    env: { HOME: "/data", ZCLOUDIUM_TLS: "off" },
+    argv: ["node", "start.mjs"],
+    logger: () => {},
+    signals: fakeProcess(),
+    mountInfoText: GOOD_MOUNTS,
+    spawnRuntime: () => child,
+    waitForRuntimeFn: (options) => {
+      waitCalls.push(options);
+      steps.push("wait");
+      return accepted.then(() => ({ ready: true, waitedMs: 1 }));
+    },
+    createGatewayFn: async () => {
+      steps.push("gateway");
+      return { port: PUBLISHED_PORT, close: async () => {} };
+    },
+    onExit: () => {},
+  });
+
+  await tick();
+  assert.deepEqual(steps, ["wait"], "the gateway must not exist while the runtime is not answering");
+  assert.equal(waitCalls.length, 1, "the runtime is waited for exactly once");
+  assert.equal(waitCalls[0].host, UPSTREAM_HOST, "the wait probes the loopback address the runtime was given");
+  assert.equal(waitCalls[0].port, UPSTREAM_PORT);
+  assert.equal(typeof waitCalls[0].logger, "function", "the wait logs through the entrypoint logger");
+
+  accept();
+  const result = await started;
+  assert.deepEqual(steps, ["wait", "gateway"], "the gateway starts once the runtime accepted");
+  assert.equal(result.gateway.port, PUBLISHED_PORT);
+});
+
+test("the readiness wait is bounded and probes at the documented pace", () => {
+  assert.equal(RUNTIME_READY_TIMEOUT_MS, 30_000);
+  assert.equal(RUNTIME_READY_INTERVAL_MS, 250);
+});
+
+/**
+ * The wait itself, driven with an injected probe, a fake clock and immediate
+ * sleeps: the bound is measured without touching a socket or sleeping through
+ * it. Every dependency is injectable for exactly this reason.
+ */
+test("waitForRuntime returns as soon as the runtime accepts connections", async () => {
+  let clock = 0;
+  let probes = 0;
+  const logs = [];
+  const result = await waitForRuntime({
+    probe: async () => {
+      probes += 1;
+      return probes >= 3;
+    },
+    sleep: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    logger: (line) => logs.push(line),
+  });
+
+  assert.deepEqual(result, { ready: true, waitedMs: 500 });
+  assert.equal(probes, 3, "the accepting probe ends the wait");
+  assert.equal(logs.length, 1, "waiting is announced once, not on every probe");
+  assert.match(logs[0], /waiting for the runtime/);
+  assert.match(logs[0], /127\.0\.0\.1:3131/);
+});
+
+test("waitForRuntime gives up at the bound and says so, leaving the 502 page to explain itself", async () => {
+  let clock = 0;
+  let probes = 0;
+  const logs = [];
+  const result = await waitForRuntime({
+    probe: async () => {
+      probes += 1;
+      return false;
+    },
+    sleep: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    logger: (line) => logs.push(line),
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.waitedMs, RUNTIME_READY_TIMEOUT_MS, "the wait is bounded by the advertised timeout");
+  assert.equal(probes, RUNTIME_READY_TIMEOUT_MS / RUNTIME_READY_INTERVAL_MS + 1);
+  assert.equal(clock, RUNTIME_READY_TIMEOUT_MS);
+  assert.equal(logs.length, 2, "waiting, then giving up");
+  assert.match(logs[1], /starting the gateway anyway/);
+  assert.match(logs[1], /127\.0\.0\.1:3131/);
+});
+
+test("the default probe detects a listening runtime and refuses a dead address", async () => {
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const listening = await waitForRuntime({ port, intervalMs: 10, timeoutMs: 1000, logger: () => {} });
+    assert.equal(listening.ready, true, "an accepting address is ready on the first probe");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  const refused = await waitForRuntime({ port, intervalMs: 10, timeoutMs: 100, logger: () => {} });
+  assert.equal(refused.ready, false, "a refused connection never counts as ready");
 });
