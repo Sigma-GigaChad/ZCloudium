@@ -1,0 +1,967 @@
+diff --git a/packages/rpc/src/index.ts b/packages/rpc/src/index.ts
+index dc8b2053..92b1f7ce 100644
+--- a/packages/rpc/src/index.ts
++++ b/packages/rpc/src/index.ts
+@@ -101,6 +101,10 @@ export {
+   type RPCLogger,
+   LoggingChannelServer,
+   LoggingChannelClient,
++  // zcloudium: RPC log gate (quiet by default, ZCODE_RPC_LOG=1 restores).
++  RPC_LOG_ENV,
++  isRpcLogEnabled,
++  gatedRpcLogger,
+ } from "./logging-middleware.js";
+ 
+ export {
+diff --git a/packages/rpc/src/logging-middleware.ts b/packages/rpc/src/logging-middleware.ts
+index 838b4cae..3322e560 100644
+--- a/packages/rpc/src/logging-middleware.ts
++++ b/packages/rpc/src/logging-middleware.ts
+@@ -20,6 +20,49 @@ import { Event } from "./foundation.js";
+ 
+ export type RPCLogger = (message: string, ...args: unknown[]) => void;
+ 
++// ============================================================================
++// zcloudium: RPC log gate — quiet by default
++// ============================================================================
++
++/** Environment variable that re-enables the RPC log lines. */
++export const RPC_LOG_ENV = "ZCODE_RPC_LOG";
++
++/** Minimal env surface: this package is also bundled for the browser. */
++type RpcLogEnv = Record<string, string | undefined>;
++
++function readRpcLogEnv(): RpcLogEnv | undefined {
++  // No `process` global in a browser bundle: read it off globalThis.
++  return (globalThis as { process?: { env?: RpcLogEnv } }).process?.env;
++}
++
++/**
++ * zcloudium: this middleware writes a formatted line for every RPC call, on
++ * success and on failure — in a container that drowns stdout in per-call
++ * noise. The gate is off by default; `ZCODE_RPC_LOG=1` (or `true`, case and
++ * whitespace insensitive) restores the historical lines verbatim.
++ */
++export function isRpcLogEnabled(env: RpcLogEnv | undefined = readRpcLogEnv()): boolean {
++  const raw = env?.[RPC_LOG_ENV];
++  if (!raw) {
++    return false;
++  }
++  const normalized = raw.trim().toLowerCase();
++  return normalized === "1" || normalized === "true";
++}
++
++/**
++ * Wraps a logger so nothing is emitted while the gate is off. Call sites that
++ * want upstream's verbosity (desktop host, server-cli) keep their raw logger;
++ * the web server wraps its own (see packages/server/src/http.ts).
++ */
++export function gatedRpcLogger(logger: RPCLogger): RPCLogger {
++  return (message, ...args) => {
++    if (isRpcLogEnabled()) {
++      logger(message, ...args);
++    }
++  };
++}
++
+ // ============================================================================
+ // LoggingServerChannel —— 装饰单个 IServerChannel，记录 call/listen
+ // ============================================================================
+diff --git a/packages/rpc/test/rpcLogGate.test.ts b/packages/rpc/test/rpcLogGate.test.ts
+new file mode 100644
+index 00000000..b065ec76
+--- /dev/null
++++ b/packages/rpc/test/rpcLogGate.test.ts
+@@ -0,0 +1,206 @@
++/**
++ * zcloudium: tests for the RPC log gate — the middleware emits one line per
++ * call (success and failure) which drowns stdout in a container; a logger
++ * wrapped by gatedRpcLogger is silent by default and ZCODE_RPC_LOG=1 restores
++ * the upstream lines verbatim. A failing call is still propagated while mute.
++ */
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { Event } from "../src/foundation.js";
++import {
++  gatedRpcLogger,
++  isRpcLogEnabled,
++  LoggingChannelClient,
++  LoggingChannelServer,
++} from "../src/logging-middleware.js";
++import type { IChannel, IChannelClient, IChannelServer, IServerChannel } from "../src/channels.js";
++
++const ENV_NAME = "ZCODE_RPC_LOG";
++let savedEnv: string | undefined;
++
++beforeEach(() => {
++  savedEnv = process.env[ENV_NAME];
++  delete process.env[ENV_NAME];
++});
++
++afterEach(() => {
++  if (savedEnv === undefined) {
++    delete process.env[ENV_NAME];
++  } else {
++    process.env[ENV_NAME] = savedEnv;
++  }
++});
++
++interface LogLine {
++  message: string;
++  args: unknown[];
++}
++
++function captureLogger(lines: LogLine[]): (message: string, ...args: unknown[]) => void {
++  return (message, ...args) => {
++    lines.push({ message, args });
++  };
++}
++
++function createServerWithGate(lines: LogLine[]): {
++  server: LoggingChannelServer<string>;
++  getRegistered: () => IServerChannel<string>;
++} {
++  let registered: IServerChannel<string> | undefined;
++  const innerServer: IChannelServer<string> = {
++    registerChannel(_channelName, channel) {
++      registered = channel;
++    },
++  };
++  const server = new LoggingChannelServer(innerServer, gatedRpcLogger(captureLogger(lines)));
++  return {
++    server,
++    getRegistered: () => {
++      if (!registered) {
++        throw new Error("channel not registered");
++      }
++      return registered;
++    },
++  };
++}
++
++function createClientWithGate(lines: LogLine[]): LoggingChannelClient {
++  const channel: IChannel = {
++    async call() {
++      return "ok";
++    },
++    listen() {
++      return Event.None;
++    },
++  };
++  const innerClient: IChannelClient = {
++    getChannel: () => channel,
++  };
++  return new LoggingChannelClient(innerClient, gatedRpcLogger(captureLogger(lines)));
++}
++
++describe("isRpcLogEnabled", () => {
++  it("is off by default and on negative values", () => {
++    expect(isRpcLogEnabled()).toBe(false);
++    expect(isRpcLogEnabled({})).toBe(false);
++    expect(isRpcLogEnabled({ [ENV_NAME]: "" })).toBe(false);
++    expect(isRpcLogEnabled({ [ENV_NAME]: "0" })).toBe(false);
++    expect(isRpcLogEnabled({ [ENV_NAME]: "false" })).toBe(false);
++  });
++
++  it("turns on with 1 or true, case and whitespace insensitive", () => {
++    expect(isRpcLogEnabled({ [ENV_NAME]: "1" })).toBe(true);
++    expect(isRpcLogEnabled({ [ENV_NAME]: "true" })).toBe(true);
++    expect(isRpcLogEnabled({ [ENV_NAME]: " TRUE " })).toBe(true);
++  });
++});
++
++describe("gatedRpcLogger", () => {
++  it("emits nothing by default", () => {
++    const lines: LogLine[] = [];
++    const logger = gatedRpcLogger(captureLogger(lines));
++    logger("[rpc:call] test.fail FAIL (0.1ms)", new Error("boom"));
++    expect(lines).toEqual([]);
++  });
++
++  it("ZCODE_RPC_LOG=1 restores the lines verbatim", () => {
++    process.env[ENV_NAME] = "1";
++    const lines: LogLine[] = [];
++    const logger = gatedRpcLogger(captureLogger(lines));
++    const error = new Error("boom");
++    logger("[rpc:call] test.fail FAIL (0.1ms)", error);
++    expect(lines).toEqual([{ message: "[rpc:call] test.fail FAIL (0.1ms)", args: [error] }]);
++  });
++});
++
++describe("LoggingChannelServer with the gate", () => {
++  it("is silent by default across register, call and listen", async () => {
++    const lines: LogLine[] = [];
++    const { server, getRegistered } = createServerWithGate(lines);
++    server.registerChannel("events", {
++      async call() {
++        return "ok";
++      },
++      listen() {
++        return Event.None;
++      },
++    });
++
++    const channel = getRegistered();
++    await channel.call("ctx", "ping");
++    await channel.call("ctx", "boom").catch(() => undefined);
++    channel.listen("ctx", "onData");
++
++    expect(lines).toEqual([]);
++  });
++
++  it("ZCODE_RPC_LOG=1 restores the upstream lines", async () => {
++    process.env[ENV_NAME] = "1";
++    const lines: LogLine[] = [];
++    const { server, getRegistered } = createServerWithGate(lines);
++    server.registerChannel("events", {
++      async call(_ctx, command) {
++        if (command === "boom") {
++          throw new Error("boom");
++        }
++        return "ok";
++      },
++      listen() {
++        return Event.None;
++      },
++    });
++
++    expect(lines[0]?.message).toBe('[rpc:register] channel "events"');
++
++    const channel = getRegistered();
++    await channel.call("ctx", "ping");
++    expect(
++      lines.some((line) => /^\[rpc:call\] events\.ping OK \(\d+\.\d+ms\)$/.test(line.message)),
++    ).toBe(true);
++
++    await channel.call("ctx", "boom").catch(() => undefined);
++    const failLine = lines.find((line) => line.message.startsWith("[rpc:call] events.boom FAIL "));
++    expect(failLine?.message).toMatch(/^\[rpc:call\] events\.boom FAIL \(\d+\.\d+ms\)$/);
++    expect(failLine?.args[0]).toBeInstanceOf(Error);
++
++    channel.listen("ctx", "onData");
++    expect(lines.some((line) => line.message === "[rpc:listen] events.onData subscribed")).toBe(
++      true,
++    );
++  });
++
++  it("a failing call is propagated even while the gate is mute", async () => {
++    const lines: LogLine[] = [];
++    const { server, getRegistered } = createServerWithGate(lines);
++    server.registerChannel("events", {
++      async call() {
++        throw new Error("boom");
++      },
++      listen() {
++        return Event.None;
++      },
++    });
++
++    await expect(getRegistered().call("ctx", "boom")).rejects.toThrow("boom");
++    expect(lines).toEqual([]);
++  });
++});
++
++describe("LoggingChannelClient with the gate", () => {
++  it("is silent by default and restored by ZCODE_RPC_LOG=1", async () => {
++    const silentLines: LogLine[] = [];
++    const silentClient = createClientWithGate(silentLines);
++    await silentClient.getChannel<IChannel>("workspace").call("open");
++    silentClient.getChannel<IChannel>("workspace").listen("onChange");
++    expect(silentLines).toEqual([]);
++
++    process.env[ENV_NAME] = "1";
++    const loudLines: LogLine[] = [];
++    const loudClient = createClientWithGate(loudLines);
++    await loudClient.getChannel<IChannel>("workspace").call("open");
++    expect(
++      loudLines.some((line) =>
++        /^\[rpc:call\] workspace\.open → OK \(\d+\.\d+ms\)$/.test(line.message),
++      ),
++    ).toBe(true);
++  });
++});
+diff --git a/packages/server/src/http.ts b/packages/server/src/http.ts
+index 3c146d2d..ce1bd968 100644
+--- a/packages/server/src/http.ts
++++ b/packages/server/src/http.ts
+@@ -1,6 +1,6 @@
+ /* eslint-disable max-lines -- HTTP、WebSocket 与静态资源路由集中注册，保持同一鉴权顺序。 */
+ import { randomUUID } from "node:crypto";
+-import { readFile, stat } from "node:fs/promises";
++import { stat } from "node:fs/promises";
+ import { basename, extname, join, relative, resolve, sep } from "node:path";
+ import { hostname } from "node:os";
+ import { Hono, type Context } from "hono";
+@@ -14,6 +14,7 @@ import {
+   ChannelServer,
+   ChannelClient,
+   LoggingChannelServer,
++  gatedRpcLogger,
+   type ISocket,
+ } from "@zcode/rpc";
+ import type { TopicResourcePeers } from "@zcode/services/node";
+@@ -43,6 +44,7 @@ import {
+ } from "@zcode/shared";
+ import { connectRemote, createRemoteBackend } from "./remote/index.js";
+ import { attachWsLiveness } from "./wsLiveness.js";
++import { serveStaticAsset } from "./staticAssets.js";
+ import {
+   RemoteSessionRegistry,
+   type RemoteSessionScope,
+@@ -98,6 +100,10 @@ function wrapWebSocket(ws: WebSocket): ISocket {
+ const log = (...args: unknown[]) =>
+   console.log(formatLogPrefix("zcode-server:http", process.pid), ...args);
+ 
++// zcloudium: one line per RPC call (success and failure) drowned stdout in the
++// container; silent by default, ZCODE_RPC_LOG=1 restores the lines.
++const rpcLog = gatedRpcLogger(log);
++
+ function setupChannelServer(
+   ws: WebSocket,
+   services: ServiceCollection,
+@@ -124,7 +130,7 @@ function setupChannelServer(
+     },
+   });
+   // 用日志中间件包装，统一记录所有 RPC 调用
+-  const server = new LoggingChannelServer(rawServer, log);
++  const server = new LoggingChannelServer(rawServer, rpcLog);
+   const agentService = services.getOptional(IZCodeAgentService);
+   const reverseClient =
+     clientMode === "desktop-continuous" && resourcePeers ? new ChannelClient(protocol) : undefined;
+@@ -687,10 +693,24 @@ export function createHttpServer(
+       if (!filePath) {
+         return c.notFound();
+       }
+-      return c.body(await readFile(filePath), 200, {
+-        "Cache-Control": filePath.endsWith("index.html")
+-          ? "no-cache"
+-          : "public, max-age=31536000, immutable",
++      // zcloudium: compress br/gzip lazily on first demand and validate
++      // index.html with an ETag (see staticAssets.ts). Without Accept-Encoding
++      // the served bytes are byte-identical to upstream's readFile response.
++      const asset = await serveStaticAsset(filePath, {
++        acceptEncoding: c.req.header("accept-encoding"),
++        ifNoneMatch: c.req.header("if-none-match"),
++      });
++      if (!asset) {
++        return c.notFound();
++      }
++      if (asset.status === 304) {
++        return c.body(null, 304, asset.headers);
++      }
++      if (!asset.body) {
++        return c.notFound();
++      }
++      return c.body(asset.body, 200, {
++        ...asset.headers,
+         "Content-Type": staticContentType(filePath),
+       });
+     });
+diff --git a/packages/server/src/staticAssets.ts b/packages/server/src/staticAssets.ts
+new file mode 100644
+index 00000000..58245ecd
+--- /dev/null
++++ b/packages/server/src/staticAssets.ts
+@@ -0,0 +1,258 @@
++import { readFile, stat } from "node:fs/promises";
++import { extname } from "node:path";
++import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
++
++/**
++ * zcloudium: static-asset service for the web bundle.
++ *
++ * The runtime used to read the whole file from disk on every request and send
++ * it raw, with no validator for index.html. This module keeps the bytes in an
++ * in-process cache keyed by path + mtime, compresses each eligible file once
++ * per process (brotli preferred, gzip fallback, both served with `Vary`), and
++ * answers `304` for `index.html` revalidation. Nothing is written back to
++ * disk: the deployed image tree stays read-only-safe.
++ *
++ * Without `Accept-Encoding` the bytes served are exactly the upstream bytes,
++ * so a client that never negotiated an encoding sees today's response body.
++ */
++
++export type StaticEncoding = "br" | "gz";
++
++/** Bytes of an asset: readFile/zlib hand back Uint8Array backed by ArrayBuffer. */
++export type StaticAssetBytes = Uint8Array<ArrayBuffer>;
++
++const CONTENT_ENCODING: Record<StaticEncoding, string> = { br: "br", gz: "gzip" };
++
++/** Accept-Encoding token per internal encoding (gz ⇄ gzip). */
++const ENCODING_TOKEN: Record<StaticEncoding, string> = { br: "br", gz: "gzip" };
++
++// Below this size an encoding header costs more than it saves; the real web
++// bundle (JS/CSS/HTML) is always far above it.
++const MIN_COMPRESS_BYTES = 1024;
++
++// Text-ish extensions only: png/woff2 & co are already compressed, retrying
++// them wastes CPU for a bigger body.
++const COMPRESSIBLE_EXTENSIONS = new Set([
++  ".css",
++  ".html",
++  ".js",
++  ".json",
++  ".map",
++  ".mjs",
++  ".svg",
++  ".txt",
++  ".wasm",
++]);
++
++interface CachedStaticAsset {
++  /** Raw file bytes, read once per (path, mtime). */
++  raw: StaticAssetBytes;
++  /**
++   * Compressed variants, computed on first demand. `null` means compression
++   * produced a bigger body: the raw bytes stay the only sensible answer and
++   * the decision is remembered instead of retried.
++   */
++  variants: Map<StaticEncoding, StaticAssetBytes | null>;
++  /** Weak validator derived from size + mtime (index.html only). */
++  etag: string;
++  /** Whether this file is worth compressing at all. */
++  compressible: boolean;
++}
++
++// Entries are never evicted: the web bundle is bounded by its build manifest
++// and a redeploy restarts the process. A stale (path, mtime) key is simply
++// never requested again.
++const assetCache = new Map<string, CachedStaticAsset>();
++
++export interface StaticAssetRequest {
++  acceptEncoding?: string | undefined;
++  ifNoneMatch?: string | undefined;
++}
++
++export interface StaticAssetResult {
++  status: 200 | 304;
++  headers: Record<string, string>;
++  /** Absent on 304 (no body). */
++  body?: StaticAssetBytes;
++}
++
++/**
++ * Picks the response encoding from an `Accept-Encoding` header: q-values are
++ * honoured, `q=0` is an explicit refusal, `*` covers codings not listed, and
++ * brotli wins ties because it is the more compact of the two.
++ */
++export function negotiateEncoding(acceptEncoding: string | undefined): StaticEncoding | null {
++  if (!acceptEncoding) {
++    return null;
++  }
++  const qualities = new Map<string, number>();
++  let wildcard: number | undefined;
++  for (const entry of acceptEncoding.split(",")) {
++    const [coding = "", ...params] = entry.split(";");
++    const name = coding.trim().toLowerCase();
++    if (!name) {
++      continue;
++    }
++    let quality = 1;
++    for (const param of params) {
++      const [key = "", value = ""] = param.split("=");
++      if (key.trim().toLowerCase() === "q") {
++        const parsed = Number.parseFloat(value.trim());
++        // An unreadable q closes the coding: refusal is the safe default.
++        quality = Number.isFinite(parsed) ? parsed : 0;
++      }
++    }
++    if (name === "*") {
++      wildcard = quality;
++    } else {
++      qualities.set(name, quality);
++    }
++  }
++  let best: StaticEncoding | null = null;
++  let bestQuality = 0;
++  // brotli first: on equal quality it is the better representation.
++  for (const candidate of ["br", "gz"] as const) {
++    const quality = qualities.get(ENCODING_TOKEN[candidate]) ?? wildcard ?? 0;
++    if (quality > bestQuality) {
++      best = candidate;
++      bestQuality = quality;
++    }
++  }
++  return best;
++}
++
++/**
++ * Weak comparison against an `If-None-Match` header: exact tag, tag inside a
++ * list, or `*` all revalidate. `W/` is irrelevant for `If-None-Match`.
++ */
++export function etagMatches(ifNoneMatch: string | undefined, etag: string): boolean {
++  if (!ifNoneMatch) {
++    return false;
++  }
++  const target = opaqueTag(etag);
++  return ifNoneMatch.split(",").some((candidate) => {
++    const tag = candidate.trim();
++    return tag === "*" || opaqueTag(tag) === target;
++  });
++}
++
++function opaqueTag(tag: string): string {
++  const trimmed = tag.trim();
++  return trimmed.startsWith("W/") ? trimmed.slice(2) : trimmed;
++}
++
++function weakEtagFor(size: number, mtimeMs: number): string {
++  // Second and byte precision is enough for a validator: a rebuild that kept
++  // both the size and the mtime would still be a different file on disk.
++  return `W/"${size.toString(16)}-${Math.floor(mtimeMs).toString(16)}"`;
++}
++
++function compressBytes(encoding: StaticEncoding, input: StaticAssetBytes): Promise<StaticAssetBytes> {
++  return new Promise<StaticAssetBytes>((resolve, reject) => {
++    if (encoding === "br") {
++      // Quality 5: the first load is a one-off cost and quality 11 buys a few
++      // percent for a lot of blocked event-loop time.
++      brotliCompress(
++        input,
++        {
++          params: {
++            [zlibConstants.BROTLI_PARAM_QUALITY]: 5,
++            [zlibConstants.BROTLI_PARAM_SIZE_HINT]: input.byteLength,
++          },
++        },
++        (error, result) => {
++          if (error) {
++            reject(error);
++            return;
++          }
++          resolve(result);
++        },
++      );
++      return;
++    }
++    gzip(input, { level: 6 }, (error, result) => {
++      if (error) {
++        reject(error);
++        return;
++      }
++      resolve(result);
++    });
++  });
++}
++
++async function compressedVariant(
++  entry: CachedStaticAsset,
++  encoding: StaticEncoding,
++): Promise<StaticAssetBytes | null> {
++  const cached = entry.variants.get(encoding);
++  if (cached !== undefined) {
++    return cached;
++  }
++  const compressed = await compressBytes(encoding, entry.raw);
++  const variant = compressed.byteLength < entry.raw.byteLength ? compressed : null;
++  entry.variants.set(encoding, variant);
++  return variant;
++}
++
++/**
++ * Builds the response description for one static file request, or `null` when
++ * the file is gone (the caller keeps its 404 semantics). The caller owns the
++ * `Content-Type` header; this module only owns caching, encoding and
++ * cache-validity headers.
++ */
++export async function serveStaticAsset(
++  filePath: string,
++  request: StaticAssetRequest = {},
++): Promise<StaticAssetResult | null> {
++  let info;
++  try {
++    info = await stat(filePath);
++  } catch {
++    return null;
++  }
++  if (!info.isFile()) {
++    return null;
++  }
++
++  const cacheKey = `${filePath}\u0000${info.mtimeMs}:${info.size}`;
++  let entry = assetCache.get(cacheKey);
++  if (!entry) {
++    entry = {
++      raw: await readFile(filePath),
++      variants: new Map(),
++      etag: weakEtagFor(info.size, info.mtimeMs),
++      compressible:
++        info.size >= MIN_COMPRESS_BYTES &&
++        COMPRESSIBLE_EXTENSIONS.has(extname(filePath).toLowerCase()),
++    };
++    assetCache.set(cacheKey, entry);
++  }
++
++  const isIndex = filePath.endsWith("index.html");
++  const headers: Record<string, string> = {
++    "Cache-Control": isIndex ? "no-cache" : "public, max-age=31536000, immutable",
++  };
++  if (entry.compressible) {
++    // Set on the identity answer too: a shared cache must know the
++    // representation depends on Accept-Encoding.
++    headers.Vary = "Accept-Encoding";
++  }
++  if (isIndex) {
++    headers.ETag = entry.etag;
++    if (etagMatches(request.ifNoneMatch, entry.etag)) {
++      return { status: 304, headers };
++    }
++  }
++
++  if (entry.compressible) {
++    const encoding = negotiateEncoding(request.acceptEncoding);
++    if (encoding) {
++      const variant = await compressedVariant(entry, encoding);
++      if (variant) {
++        headers["Content-Encoding"] = CONTENT_ENCODING[encoding];
++        return { status: 200, headers, body: variant };
++      }
++    }
++  }
++  return { status: 200, headers, body: entry.raw };
++}
+diff --git a/packages/server/test/staticAssets.test.ts b/packages/server/test/staticAssets.test.ts
+new file mode 100644
+index 00000000..ad4865cf
+--- /dev/null
++++ b/packages/server/test/staticAssets.test.ts
+@@ -0,0 +1,211 @@
++/**
++ * zcloudium: tests for staticAssets.ts — Content-Encoding negotiation (br
++ * preferred over gz on equal quality, q-values honoured), variants compressed
++ * once per file per process (cache keyed by path + mtime), Vary:
++ * Accept-Encoding, and weak ETag + 304 for index.html. Hashed assets stay
++ * `immutable` with no ETag; without Accept-Encoding the served body is
++ * byte-identical to upstream's raw readFile.
++ */
++import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { brotliDecompress, gunzip } from "node:zlib";
++import { promisify } from "node:util";
++import { randomBytes } from "node:crypto";
++import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { negotiateEncoding, serveStaticAsset } from "../src/staticAssets.ts";
++
++const brotliDecompressAsync = promisify(brotliDecompress);
++const gunzipAsync = promisify(gunzip);
++
++// Large repetitive texts: compressible, above the 1 KiB threshold.
++const BIG_SOURCE = `// fake bundle\nconsole.log("${"x".repeat(4096)}");\n`;
++const INDEX_SOURCE = `<!doctype html><html><body><div id="root"></div>${"<p>zcloudium</p>".repeat(200)}</body></html>`;
++const TINY_SOURCE = "console.log('tiny');";
++const NOISE_SOURCE = randomBytes(4096);
++
++describe("negotiateEncoding", () => {
++  it("prefers br when the client accepts both at equal quality", () => {
++    expect(negotiateEncoding("gzip, deflate, br")).toBe("br");
++    expect(negotiateEncoding("gzip;q=0.8, br;q=0.8")).toBe("br");
++    expect(negotiateEncoding("br")).toBe("br");
++  });
++
++  it("honours the client's q-values", () => {
++    expect(negotiateEncoding("br;q=0.2, gzip;q=0.9")).toBe("gz");
++    expect(negotiateEncoding("gzip")).toBe("gz");
++  });
++
++  it("treats q=0 as an explicit refusal", () => {
++    expect(negotiateEncoding("br;q=0, gzip")).toBe("gz");
++    expect(negotiateEncoding("br;q=0, gzip;q=0")).toBeNull();
++    expect(negotiateEncoding("gzip;q=0.5, *;q=0")).toBe("gz");
++  });
++
++  it("accepts through the * wildcard only what is not listed explicitly", () => {
++    expect(negotiateEncoding("*")).toBe("br");
++    expect(negotiateEncoding("gzip, *;q=0")).toBe("gz");
++    expect(negotiateEncoding("*;q=0")).toBeNull();
++  });
++
++  it("without the header (or identity alone) no encoding is acceptable", () => {
++    expect(negotiateEncoding(undefined)).toBeNull();
++    expect(negotiateEncoding("")).toBeNull();
++    expect(negotiateEncoding("identity")).toBeNull();
++  });
++
++  it("an unreadable q does not open the encoding", () => {
++    expect(negotiateEncoding("br;q=bogus")).toBeNull();
++    expect(negotiateEncoding("br;q=0.5, gzip;q=oops")).toBe("br");
++  });
++});
++
++describe("serveStaticAsset", () => {
++  let root: string;
++
++  beforeAll(async () => {
++    root = await mkdtemp(join(tmpdir(), "zcloudium-static-assets-"));
++    await mkdir(join(root, "assets"), { recursive: true });
++    await writeFile(join(root, "index.html"), INDEX_SOURCE);
++    await writeFile(join(root, "assets", "app-abc123.js"), BIG_SOURCE);
++    await writeFile(join(root, "assets", "tiny.js"), TINY_SOURCE);
++    await writeFile(join(root, "assets", "noise.js"), NOISE_SOURCE);
++    await writeFile(join(root, "assets", "photo-abc123.png"), NOISE_SOURCE);
++    await writeFile(join(root, "assets", "cache-abc123.js"), BIG_SOURCE);
++  });
++
++  afterAll(async () => {
++    await rm(root, { recursive: true, force: true });
++  });
++
++  it("without Accept-Encoding the bytes are today's bytes", async () => {
++    const file = join(root, "assets", "app-abc123.js");
++    const result = await serveStaticAsset(file, {});
++    expect(result).not.toBeNull();
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBeUndefined();
++    expect(result?.body).toEqual(await readFile(file));
++  });
++
++  it("serves br when the client accepts it, with Vary", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "app-abc123.js"), {
++      acceptEncoding: "gzip, deflate, br",
++    });
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBe("br");
++    expect(result?.headers.Vary).toBe("Accept-Encoding");
++    expect(await brotliDecompressAsync(result?.body as Uint8Array)).toEqual(
++      Buffer.from(BIG_SOURCE),
++    );
++  });
++
++  it("serves gzip when the client prefers it", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "app-abc123.js"), {
++      acceptEncoding: "br;q=0.2, gzip;q=0.9",
++    });
++    expect(result?.headers["Content-Encoding"]).toBe("gzip");
++    expect(result?.headers.Vary).toBe("Accept-Encoding");
++    expect(await gunzipAsync(result?.body as Uint8Array)).toEqual(Buffer.from(BIG_SOURCE));
++  });
++
++  it("no acceptable encoding: raw body, Vary kept", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "app-abc123.js"), {
++      acceptEncoding: "br;q=0, gzip;q=0",
++    });
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBeUndefined();
++    expect(result?.headers.Vary).toBe("Accept-Encoding");
++    expect(result?.body?.byteLength).toBe(Buffer.byteLength(BIG_SOURCE));
++  });
++
++  it("a file below the compression threshold stays raw, without Vary", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "tiny.js"), {
++      acceptEncoding: "br",
++    });
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBeUndefined();
++    expect(result?.headers.Vary).toBeUndefined();
++    expect(result?.body).toEqual(Buffer.from(TINY_SOURCE));
++  });
++
++  it("a non-compressible extension stays raw, without Vary", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "photo-abc123.png"), {
++      acceptEncoding: "br",
++    });
++    expect(result?.headers["Content-Encoding"]).toBeUndefined();
++    expect(result?.headers.Vary).toBeUndefined();
++    expect(result?.body).toEqual(Buffer.from(NOISE_SOURCE));
++  });
++
++  it("incompressible content is never served in a bigger encoding", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "noise.js"), {
++      acceptEncoding: "br",
++    });
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBeUndefined();
++    expect(result?.headers.Vary).toBe("Accept-Encoding");
++    expect(result?.body).toEqual(Buffer.from(NOISE_SOURCE));
++  });
++
++  it("index.html: no-cache + weak ETag, 304 on If-None-Match", async () => {
++    const file = join(root, "index.html");
++    const first = await serveStaticAsset(file, {});
++    expect(first?.status).toBe(200);
++    expect(first?.headers["Cache-Control"]).toBe("no-cache");
++    const etag = first?.headers.ETag;
++    expect(etag).toMatch(/^W\/"[0-9a-f]+-[0-9a-f]+"$/);
++
++    const revalidated = await serveStaticAsset(file, { ifNoneMatch: etag });
++    expect(revalidated?.status).toBe(304);
++    expect(revalidated?.body).toBeUndefined();
++    expect(revalidated?.headers.ETag).toBe(etag);
++    expect(revalidated?.headers["Cache-Control"]).toBe("no-cache");
++
++    // Weak comparison: both tag forms validate, so does a list and the * wildcard.
++    const strongForm = String(etag).replace(/^W\//, "");
++    expect((await serveStaticAsset(file, { ifNoneMatch: strongForm }))?.status).toBe(304);
++    expect((await serveStaticAsset(file, { ifNoneMatch: `"other", ${etag}` }))?.status).toBe(304);
++    expect((await serveStaticAsset(file, { ifNoneMatch: "*" }))?.status).toBe(304);
++    expect((await serveStaticAsset(file, { ifNoneMatch: '"other"' }))?.status).toBe(200);
++  });
++
++  it("index.html is compressible too and keeps its ETag", async () => {
++    const result = await serveStaticAsset(join(root, "index.html"), { acceptEncoding: "br" });
++    expect(result?.status).toBe(200);
++    expect(result?.headers["Content-Encoding"]).toBe("br");
++    expect(result?.headers.ETag).toBeDefined();
++    expect(await brotliDecompressAsync(result?.body as Uint8Array)).toEqual(
++      Buffer.from(INDEX_SOURCE),
++    );
++  });
++
++  it("hashed assets stay immutable and carry no ETag", async () => {
++    const result = await serveStaticAsset(join(root, "assets", "app-abc123.js"), {});
++    expect(result?.headers["Cache-Control"]).toBe("public, max-age=31536000, immutable");
++    expect(result?.headers.ETag).toBeUndefined();
++  });
++
++  it("reads the file once and reuses the compressed variant (key: path + mtime)", async () => {
++    const file = join(root, "assets", "cache-abc123.js");
++    const rawFirst = await serveStaticAsset(file, {});
++    const rawSecond = await serveStaticAsset(file, {});
++    // Same instance = the file was not re-read from disk.
++    expect(rawSecond?.body).toBe(rawFirst?.body);
++
++    const encodedFirst = await serveStaticAsset(file, { acceptEncoding: "br" });
++    const encodedSecond = await serveStaticAsset(file, { acceptEncoding: "br" });
++    // Same instance = compression ran once per process.
++    expect(encodedSecond?.body).toBe(encodedFirst?.body);
++
++    // Different mtime → new entry, content read again.
++    const later = new Date(Date.now() + 5000);
++    await utimes(file, later, later);
++    const afterTouch = await serveStaticAsset(file, {});
++    expect(afterTouch?.body).not.toBe(rawFirst?.body);
++    expect(afterTouch?.body).toEqual(rawFirst?.body);
++  });
++
++  it("returns null for a missing file (caller keeps the 404 semantics)", async () => {
++    expect(await serveStaticAsset(join(root, "assets", "missing.js"), {})).toBeNull();
++  });
++});
+diff --git a/packages/server/test/staticAssetsHttp.test.ts b/packages/server/test/staticAssetsHttp.test.ts
+new file mode 100644
+index 00000000..0d7f892f
+--- /dev/null
++++ b/packages/server/test/staticAssetsHttp.test.ts
+@@ -0,0 +1,122 @@
++/**
++ * zcloudium: end-to-end test of staticAssets.ts wired into http.ts —
++ * negotiated Content-Encoding (br/gzip) + Vary, ETag/304 for index.html (direct
++ * path and SPA fallback), and an unchanged body without Accept-Encoding. Raw
++ * node:http client: no implicit decompression, the bytes on the wire are
++ * inspected as-is.
++ */
++import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { brotliDecompress, gunzip } from "node:zlib";
++import { promisify } from "node:util";
++import { request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
++import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import type { AddressInfo } from "node:net";
++import { ServiceCollection } from "@zcode/services";
++import { createHttpServer } from "../src/http.ts";
++
++const brotliDecompressAsync = promisify(brotliDecompress);
++const gunzipAsync = promisify(gunzip);
++
++const APP_SOURCE = `console.log("${"y".repeat(4096)}");\n`;
++const INDEX_SOURCE = `<!doctype html><html><body><div id="root"></div>${"<p>zcloudium</p>".repeat(200)}</body></html>`;
++
++let server: Server;
++let port: number;
++let staticRoot: string;
++
++beforeAll(async () => {
++  staticRoot = await mkdtemp(join(tmpdir(), "zcloudium-static-http-"));
++  await mkdir(join(staticRoot, "assets"), { recursive: true });
++  await writeFile(join(staticRoot, "index.html"), INDEX_SOURCE);
++  await writeFile(join(staticRoot, "assets", "app-abc123.js"), APP_SOURCE);
++
++  server = createHttpServer(new ServiceCollection(), 0, { staticRoot, spaFallback: true });
++  port = (server.address() as AddressInfo).port;
++});
++
++afterAll(async () => {
++  await new Promise<void>((resolve, reject) => {
++    server.close((error) => (error ? reject(error) : resolve()));
++  });
++  await rm(staticRoot, { recursive: true, force: true });
++});
++
++function httpGet(
++  path: string,
++  headers: Record<string, string> = {},
++): Promise<{ status: number; headers: IncomingHttpHeaders; body: Buffer }> {
++  return new Promise((resolve, reject) => {
++    const request = httpRequest(
++      {
++        host: "127.0.0.1",
++        port,
++        path,
++        method: "GET",
++        headers: { connection: "close", ...headers },
++      },
++      (response) => {
++        const chunks: Buffer[] = [];
++        response.on("data", (chunk: Buffer) => chunks.push(chunk));
++        response.on("end", () =>
++          resolve({
++            status: response.statusCode ?? 0,
++            headers: response.headers,
++            body: Buffer.concat(chunks),
++          }),
++        );
++      },
++    );
++    request.on("error", reject);
++    request.end();
++  });
++}
++
++describe("static assets over HTTP", () => {
++  it("serves br when the client accepts it, with Vary", async () => {
++    const response = await httpGet("/assets/app-abc123.js", {
++      "accept-encoding": "gzip, deflate, br",
++    });
++    expect(response.status).toBe(200);
++    expect(response.headers["content-encoding"]).toBe("br");
++    expect(response.headers.vary).toContain("Accept-Encoding");
++    expect(await brotliDecompressAsync(response.body)).toEqual(Buffer.from(APP_SOURCE));
++  });
++
++  it("honours q-values (gzip when the client prefers it)", async () => {
++    const response = await httpGet("/assets/app-abc123.js", {
++      "accept-encoding": "br;q=0.2, gzip;q=0.9",
++    });
++    expect(response.status).toBe(200);
++    expect(response.headers["content-encoding"]).toBe("gzip");
++    expect(await gunzipAsync(response.body)).toEqual(Buffer.from(APP_SOURCE));
++  });
++
++  it("without Accept-Encoding the body is identical to today's", async () => {
++    const response = await httpGet("/assets/app-abc123.js");
++    expect(response.status).toBe(200);
++    expect(response.headers["content-encoding"]).toBeUndefined();
++    expect(response.headers["content-type"]).toContain("text/javascript");
++    expect(response.body).toEqual(await readFile(join(staticRoot, "assets", "app-abc123.js")));
++  });
++
++  it("index.html answers 304 on If-None-Match, directly and through the SPA fallback", async () => {
++    const first = await httpGet("/");
++    expect(first.status).toBe(200);
++    expect(first.headers["cache-control"]).toBe("no-cache");
++    expect(first.headers["content-type"]).toContain("text/html");
++    const etag = first.headers.etag;
++    expect(etag).toBeTruthy();
++
++    const revalidated = await httpGet("/", { "if-none-match": String(etag) });
++    expect(revalidated.status).toBe(304);
++    expect(revalidated.body.byteLength).toBe(0);
++    expect(revalidated.headers.etag).toBe(etag);
++
++    const fallback = await httpGet("/workspaces/deep/link", {
++      "if-none-match": String(etag),
++    });
++    expect(fallback.status).toBe(304);
++  });
++});
