@@ -6,8 +6,7 @@
  * It never imports application code, so an upstream update cannot break it.
  */
 
-import { createServer } from "node:http";
-import { request as httpRequest } from "node:http";
+import { Agent, createServer, request as httpRequest } from "node:http";
 import { createServer as createSecureServer } from "node:https";
 import { hashPassword, verifyPassword, checkPasswordStrength } from "./password.mjs";
 import { generateSecret, otpauthUri, totp, verifyTotp } from "./totp.mjs";
@@ -62,6 +61,62 @@ export const MAX_FAILURES = 8;
  * it, and a change here that is not also made to what is advertised fails.
  */
 export const BLOCK_MS = 5 * 60 * 1000;
+
+/**
+ * How long an upgrade may wait for the runtime to answer before the client is
+ * released with a 504.
+ *
+ * Without this, a runtime that accepts the upgrade and then goes quiet leaves
+ * the client socket parked with no answer at all. The web client awaits its
+ * WebSocket before the first render, so the UI hangs silently with it; a 504
+ * turns the hang into the reconnect the client already knows how to do.
+ */
+export const UPGRADE_TIMEOUT_MS = 10_000;
+
+/**
+ * How long the listening server keeps an idle connection, and how long it
+ * allows a request head to arrive.
+ *
+ * Node's defaults (5s and 60s) are tuned for a public edge shedding idle
+ * clients; behind this gateway sits one operator's browser holding a dashboard
+ * open, where a dropped socket costs a WebSocket reconnect. The head allowance
+ * is kept above the idle one, which is what Node asks of the pair.
+ */
+export const KEEP_ALIVE_TIMEOUT_MS = 60_000;
+export const HEADERS_TIMEOUT_MS = 66_000;
+
+/**
+ * The headers that describe one connection rather than one message (RFC 9110
+ * §7.6.1), which a proxy must not pass on: they belong to the hop that just
+ * ended. `connection` is the one that matters most in practice — a client
+ * asking to close its socket would otherwise close the pooled upstream one,
+ * or vice versa — and `transfer-encoding` is re-framed by whichever Node
+ * writes the next hop. The `proxy-*` pair and `proxy-connection` are not in
+ * the RFC list (they cover a proxy that sits *in front* of this one), so they
+ * are stripped by prefix.
+ */
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+/** The same header bag minus everything that belongs to the hop alone. */
+function forwardedHeaders(headers) {
+  const kept = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP.has(name) || name.startsWith("proxy-")) {
+      continue;
+    }
+    kept[name] = value;
+  }
+  return kept;
+}
 
 /** Raised against a fixed origin to prove that a `next` value stays on it. */
 const NEXT_ORIGIN = "http://gateway.invalid";
@@ -244,6 +299,11 @@ export async function createGateway({
   tls = null,
   // Injectable so tests can advance time instead of sleeping through TOTP steps.
   now = () => Date.now(),
+  /**
+   * The bounded wait for the runtime's answer to an upgrade, injectable so the
+   * tests can measure the answer without waiting ten seconds for it.
+   */
+  upgradeTimeoutMs = UPGRADE_TIMEOUT_MS,
 } = {}) {
   if (!dataDir) {
     throw new Error("createGateway requires a dataDir");
@@ -261,6 +321,15 @@ export async function createGateway({
   // Upgraded sockets leave the HTTP connection tracking, so close() would wait for
   // them forever. They are tracked here and destroyed explicitly on shutdown.
   const upgradedSockets = new Set();
+  /**
+   * One pool for every request the gateway makes to the runtime, upgrades
+   * included.
+   *
+   * Explicit rather than the implicit `http.globalAgent`: the pool's lifetime is
+   * then the gateway's own, `close()` can drain it, and the keep-alive behaviour
+   * the gateway relies on does not change with a Node default it does not state.
+   */
+  const upstreamAgent = new Agent({ keepAlive: true });
 
   const clientAddress = (req) => {
     if (trustProxy) {
@@ -791,10 +860,10 @@ export async function createGateway({
   }
 
   function proxy(req, res) {
-    const headers = { ...req.headers, host: target.host };
+    const headers = forwardedHeaders(req.headers);
+    headers.host = target.host;
     headers["x-forwarded-for"] = clientAddress(req);
     headers["x-forwarded-proto"] = req.socket.encrypted ? "https" : "http";
-    delete headers["connection"];
     const startedAt = now();
 
     const upstream = httpRequest(
@@ -805,6 +874,7 @@ export async function createGateway({
         method: req.method,
         path: req.url,
         headers,
+        agent: upstreamAgent,
       },
       (response) => {
         counters.upstreamRequests += 1;
@@ -814,7 +884,7 @@ export async function createGateway({
         // HTML here would mean buffering every page and recomputing lengths —
         // and would put the entry outside the UI, where it cannot be placed or
         // styled with everything else.
-        res.writeHead(response.statusCode ?? 502, response.headers);
+        res.writeHead(response.statusCode ?? 502, forwardedHeaders(response.headers));
         response.pipe(res);
       },
     );
@@ -860,16 +930,52 @@ export async function createGateway({
       return;
     }
 
+    const headers = forwardedHeaders(req.headers);
+    headers.host = target.host;
+    // The handshake itself is hop-by-hop by nature: `Connection` and `Upgrade`
+    // are exactly what the client and the runtime negotiate, so the two are put
+    // back after the strip. Everything else the strip removed stays removed.
+    headers.connection = req.headers.connection ?? "Upgrade";
+    headers.upgrade = req.headers.upgrade;
+
+    let answered = false;
     const upstream = httpRequest({
       protocol: target.protocol,
       hostname: target.hostname,
       port: target.port || 80,
       method: "GET",
       path: req.url,
-      headers: { ...req.headers, host: target.host },
+      headers,
+      agent: upstreamAgent,
     });
 
+    /**
+     * The runtime may accept the upgrade and then never answer it: a stuck
+     * process, a half-open socket. The client awaits its WebSocket before its
+     * first render, so this wait is bounded. When it runs out the upstream
+     * attempt is destroyed, the client is told 504 with `Connection: close`
+     * and released, and a hang becomes the reconnect the client already knows
+     * how to do.
+     */
+    const giveUp = setTimeout(() => {
+      if (answered) {
+        return;
+      }
+      answered = true;
+      logger(`[auth] the runtime did not answer the upgrade of ${req.url} within ${upgradeTimeoutMs}ms; answering 504`);
+      upstream.destroy();
+      if (!socket.destroyed) {
+        socket.write("HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      }
+      socket.destroy();
+    }, upgradeTimeoutMs);
+    // A parked upgrade must not keep a closing process alive; the listening
+    // server and the client socket do that already while the gateway serves.
+    giveUp.unref();
+
     upstream.on("upgrade", (response, upstreamSocket, upstreamHead) => {
+      answered = true;
+      clearTimeout(giveUp);
       const lines = [`HTTP/1.1 ${response.statusCode} ${response.statusMessage ?? ""}`.trim()];
       for (let index = 0; index < response.rawHeaders.length; index += 2) {
         lines.push(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}`);
@@ -898,6 +1004,11 @@ export async function createGateway({
     });
 
     upstream.on("error", (error) => {
+      if (answered) {
+        return;
+      }
+      answered = true;
+      clearTimeout(giveUp);
       logger(`[auth] upgrade error: ${error.message}`);
       socket.destroy();
     });
@@ -937,6 +1048,11 @@ export async function createGateway({
   // The only difference between the two: who terminates the connection. The
   // handler, the sockets it tracks and the upgrade path below are shared.
   const server = tls ? createSecureServer({ cert: tls.cert, key: tls.key }, handler) : createServer(handler);
+
+  // Longer than Node's defaults, because one operator's dashboard holds a
+  // connection open for hours while they work, and a reconnect is visible.
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
 
   server.on("upgrade", handleUpgrade);
 
@@ -982,6 +1098,10 @@ export async function createGateway({
           socket.destroy();
         }
         connections.clear();
+        // Pooled upstream sockets are neither upgraded nor accepted here, so
+        // nothing above releases them; without this a keep-alive socket to a
+        // stopped runtime would keep the process alive.
+        upstreamAgent.destroy();
         server.closeAllConnections?.();
         server.close(() => resolve());
       }),

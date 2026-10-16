@@ -10,7 +10,16 @@ import { join } from "node:path";
 // The block duration is read from the gateway rather than copied here: a copy
 // would keep the old value and the timing tests below would then measure a
 // number the product no longer uses.
-import { BLOCK_MS, createGateway, MAX_FAILURES, safeNext } from "../gateway/lib/server.mjs";
+import {
+  BLOCK_MS,
+  HEADERS_TIMEOUT_MS,
+  KEEP_ALIVE_TIMEOUT_MS,
+  MAX_FAILURES,
+  UPGRADE_TIMEOUT_MS,
+  createGateway,
+  safeNext,
+} from "../gateway/lib/server.mjs";
+import { signSession } from "../gateway/lib/session.mjs";
 import { totp } from "../gateway/lib/totp.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -29,7 +38,27 @@ const ADVERTISED_BLOCK_MS = 5 * 60 * 1000;
 /** Stub of the ZCode server: plain HTTP plus a WebSocket upgrade. */
 async function startUpstream() {
   const sockets = new Set();
+  /** What the upstream actually received, hop by hop: the leak checks read this. */
+  const received = [];
+  let connections = 0;
   const server = createServer((req, res) => {
+    received.push({ url: req.url, headers: req.headers });
+    // One path answers with the hop-by-hop headers a proxy must not pass on.
+    if (req.url.startsWith("/hop-by-hop-response")) {
+      res.writeHead(200, {
+        "content-type": "text/plain",
+        "transfer-encoding": "chunked",
+        "trailer": "x-checksum",
+        "keep-alive": "timeout=999",
+        "te": "trailers",
+        "proxy-authenticate": "Basic realm=upstream",
+        "proxy-authorization": "Basic c2VjcmV0",
+      });
+      res.write("response with hop-by-hop headers");
+      res.addTrailers({ "x-checksum": "abc" });
+      res.end();
+      return;
+    }
     // One path answers a document, because the gateway edits documents and
     // nothing else, and a test of that edit needs something to edit.
     if (req.url.startsWith("/gzipped.html")) {
@@ -48,6 +77,7 @@ async function startUpstream() {
     res.end(`UPSTREAM ${req.url}`);
   });
   server.on("connection", (socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
@@ -72,6 +102,8 @@ async function startUpstream() {
   return {
     server,
     url: `http://127.0.0.1:${server.address().port}`,
+    received,
+    connectionCount: () => connections,
     // An upgraded socket never ends on its own, and server.close() waits for every
     // connection to drain, so the suite would hang forever without this.
     destroy: () => {
@@ -106,6 +138,8 @@ async function withGateway(run, options = {}) {
       dataDir,
       now,
       advance,
+      server: gateway.server,
+      upstream,
     });
   } finally {
     await gateway.close();
@@ -981,4 +1015,230 @@ test("compressed HTML responses pass through byte-identical, no injection", () =
     // The body must be the exact gzip bytes — no anchor appended, no re-encode.
     assert.ok(body.length > 0, "body must not be empty");
     assert.ok(!body.toString("utf8").includes("logout"), "no anchor injected into compressed responses");
+  }));
+
+/** Sends a raw HTTP/1.1 request and resolves with what the gateway wrote back. */
+function rawRequest(port, request) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1", () => socket.write(request));
+    const chunks = [];
+    const answer = () => Buffer.concat(chunks).toString("latin1");
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("end", () => resolve(answer()));
+    socket.on("error", reject);
+    setTimeout(() => {
+      socket.destroy();
+      resolve(answer());
+    }, 3000).unref();
+  });
+}
+
+/**
+ * The hop-by-hop headers describe one connection, not one message (RFC 9110
+ * §7.6.1), so a proxy must never pass them on: they belong to the hop that
+ * just ended. `connection` in particular is how a client asks to close *its*
+ * socket, and handing that to the upstream would close the pooled one instead.
+ * A raw request is used because fetch refuses to set most of them.
+ */
+test("hop-by-hop request headers never reach the upstream", () =>
+  withGateway(async ({ base, port, upstream }) => {
+    const { session } = await completeSetup(base);
+    const response = await rawRequest(
+      port,
+      [
+        "GET /raw-headers HTTP/1.1",
+        `Host: 127.0.0.1:${port}`,
+        `Cookie: ${session}`,
+        "Connection: close",
+        "Keep-Alive: timeout=999",
+        "TE: trailers",
+        "Trailer: x-checksum",
+        "Proxy-Authorization: Basic c2VjcmV0",
+        "Proxy-Authenticate: Basic realm=upstream",
+        "Upgrade: h2c",
+        "",
+        "",
+      ].join("\r\n"),
+    );
+    assert.match(response.split("\r\n")[0], /200/, `the request must still be proxied, got "${response.split("\r\n")[0]}"`);
+
+    const seen = upstream.received.at(-1).headers;
+    assert.equal(seen.cookie, session, "the session cookie still travels");
+    for (const name of ["keep-alive", "te", "trailer", "proxy-authorization", "proxy-authenticate", "upgrade"]) {
+      assert.equal(name in seen, false, `${name} must not cross the request hop`);
+    }
+    // `connection` is re-created by Node for the gateway → runtime hop, which
+    // is its own business; what must not survive is the client's value, which
+    // asks to close a socket the gateway is pooling.
+    assert.doesNotMatch(String(seen.connection ?? ""), /close/, "the client's Connection must not close the pooled upstream socket");
+  }));
+
+test("hop-by-hop headers of the upstream response never reach the client", () =>
+  withGateway(async ({ base }) => {
+    const { session } = await completeSetup(base);
+    const response = await fetch(`${base}/hop-by-hop-response`, { headers: { cookie: session } });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "response with hop-by-hop headers");
+    // `keep-alive` cannot be asserted absent: Node stamps the gateway's own
+    // hop with its own timeout, which is the point. What must not survive is
+    // the upstream's value.
+    assert.notEqual(response.headers.get("keep-alive"), "timeout=999", "the upstream's Keep-Alive must not survive");
+    for (const name of ["trailer", "te", "proxy-authenticate", "proxy-authorization"]) {
+      assert.equal(response.headers.has(name), false, `${name} must not cross the response hop`);
+    }
+  }));
+
+/**
+ * An upstream that accepts connections, upgrades included, and then never
+ * answers: what the runtime looks like when it is listening but stuck. The
+ * `ended` counter records the EOF the gateway's release produces: a socket
+ * that was handed to an upgrade path is half closed by a FIN, so the stub
+ * observes the end and closes its side, which is what the runtime would do.
+ */
+async function startSilentUpstream() {
+  const sockets = new Set();
+  let ended = 0;
+  const server = createServer(() => {});
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("end", () => {
+      ended += 1;
+      socket.destroy();
+    });
+    socket.on("close", () => sockets.delete(socket));
+  });
+  // Without a listener Node destroys the socket on an upgrade request, which
+  // would be an answer of sorts; this stub holds it open and stays silent.
+  server.on("upgrade", () => {});
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    server,
+    url: `http://127.0.0.1:${server.address().port}`,
+    endedCount: () => ended,
+    openSockets: () => sockets.size,
+    destroy: () => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      sockets.clear();
+    },
+  };
+}
+
+/** Raw WebSocket handshake, resolved when the gateway releases the socket. */
+function rawUpgrade(port, path, cookie) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1", () => {
+      socket.write(
+        [
+          `GET ${path} HTTP/1.1`,
+          `Host: 127.0.0.1:${port}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}`,
+          "Sec-WebSocket-Version: 13",
+          `Cookie: ${cookie}`,
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+    let received = "";
+    let closed = false;
+    socket.on("data", (chunk) => {
+      received += chunk.toString("latin1");
+    });
+    socket.on("close", () => {
+      closed = true;
+      resolve({ statusLine: received.split("\r\n")[0], headers: received, closed });
+    });
+    socket.on("error", reject);
+    setTimeout(() => {
+      socket.destroy();
+      resolve({ statusLine: received.split("\r\n")[0] || "TIMEOUT", headers: received, closed });
+    }, 3000).unref();
+  });
+}
+
+/** Polls `condition` until it holds or the bound runs out. */
+async function waitFor(condition, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/**
+ * A runtime that accepts the upgrade and then never answers must not park the
+ * client forever: the web client waits for its WebSocket before its first
+ * render, so a silent handshake is a silent UI. Once the bounded wait is over
+ * the gateway destroys the upstream attempt, answers 504 and releases the
+ * client, which turns a hang into the reconnect the client already knows how
+ * to do.
+ */
+test("an upgrade the runtime never answers is released with a 504", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zcloudium-gateway-"));
+  const upstream = await startSilentUpstream();
+  const gateway = await createGateway({
+    upstreamUrl: upstream.url,
+    dataDir,
+    logger: () => {},
+    upgradeTimeoutMs: 100,
+  });
+  try {
+    const session = signSession({ user: USERNAME, exp: Date.now() + 60_000 }, gateway.key);
+    const answer = await rawUpgrade(gateway.port, "/ws", `zc_sess=${session}`);
+    assert.match(answer.statusLine, /504/, `an unanswered upgrade must be answered 504, got "${answer.statusLine}"`);
+    assert.match(answer.headers, /connection: close/i, "the client is told the socket will close");
+    assert.equal(answer.closed, true, "the client socket must be destroyed, not parked");
+
+    // The parked upstream attempt is released too: a gateway that answers the
+    // client but keeps the request open to a stuck runtime leaks one per
+    // upgrade. The release is a FIN, so what the runtime sees is the end of
+    // that connection.
+    await waitFor(() => upstream.endedCount() === 1, 2000);
+    assert.equal(upstream.endedCount(), 1, "the parked upstream attempt must be released");
+    assert.equal(upstream.openSockets(), 0, "the stub closes its side once the end is seen");
+  } finally {
+    await gateway.close();
+    upstream.destroy();
+    await new Promise((resolve) => upstream.server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("the upgrade timeout is the bounded wait the issue asks for", () => {
+  assert.equal(UPGRADE_TIMEOUT_MS, 10_000);
+});
+
+/**
+ * The runtime connection is pooled: reconnecting for every request has a cost
+ * and, behind a fixed port mapping, needlessly churns sockets. One explicit
+ * agent owns the pool for both the request path and the upgrade path.
+ */
+test("proxied requests reuse one keep-alive connection to the runtime", () =>
+  withGateway(async ({ base, upstream }) => {
+    const { session } = await completeSetup(base);
+    const before = upstream.connectionCount();
+    await (await fetch(`${base}/first`, { headers: { cookie: session } })).text();
+    await (await fetch(`${base}/second`, { headers: { cookie: session } })).text();
+    assert.equal(
+      upstream.connectionCount() - before,
+      1,
+      "the second request must travel on the pooled connection",
+    );
+  }));
+
+/**
+ * Node's defaults (5s idle keep-alive, 60s for a request head) are tuned for a
+ * public edge; behind this gateway sits one operator's browser holding a
+ * dashboard open, and a dropped socket costs a WebSocket reconnect.
+ */
+test("the listening server holds idle connections and request heads longer than the defaults", () =>
+  withGateway(async ({ server }) => {
+    assert.equal(server.keepAliveTimeout, KEEP_ALIVE_TIMEOUT_MS);
+    assert.equal(server.headersTimeout, HEADERS_TIMEOUT_MS);
+    assert.ok(server.headersTimeout > server.keepAliveTimeout, "the head allowance must exceed the idle one");
+    assert.equal(KEEP_ALIVE_TIMEOUT_MS, 60_000);
+    assert.equal(HEADERS_TIMEOUT_MS, 66_000);
   }));

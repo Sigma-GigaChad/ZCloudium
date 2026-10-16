@@ -13,6 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
+import { connect } from "node:net";
 import { constants } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,22 @@ export const PUBLISHED_PORT = 3030;
 /** The loopback address the runtime is confined to while the gateway is in front. */
 export const UPSTREAM_HOST = "127.0.0.1";
 export const UPSTREAM_PORT = 3131;
+
+/**
+ * How long the gateway waits for the runtime to accept connections before it
+ * starts serving, and how often it probes while waiting.
+ *
+ * The runtime needs a moment to bind its port after it is spawned; serving
+ * before that gets the first request the 502 page. The wait is bounded so a
+ * runtime that never comes up (a crash loop, an unusable workspace) does not
+ * hold the published port hostage: after the bound the gateway starts anyway,
+ * because its 502 page already explains itself and retries.
+ */
+export const RUNTIME_READY_TIMEOUT_MS = 30_000;
+export const RUNTIME_READY_INTERVAL_MS = 250;
+
+/** How long one probe may take before it counts as a refusal. */
+const RUNTIME_PROBE_TIMEOUT_MS = 1_000;
 
 export const DEFAULT_WORKSPACE = "/workspace";
 export const DEFAULT_DATA_DIR = "/data";
@@ -193,6 +210,72 @@ export function exitCodeFor(code, signal) {
 }
 
 /**
+ * One connection attempt against the runtime's loopback address: true when the
+ * address accepts, false when it refuses, times out or answers nothing. The
+ * probe exists to observe the runtime's listening socket, so it is a bare TCP
+ * connect, not an application request.
+ */
+function runtimeAccepts({ host, port, timeoutMs = RUNTIME_PROBE_TIMEOUT_MS }) {
+  return new Promise((resolve) => {
+    const socket = connect({ host, port });
+    let settled = false;
+    const finish = (accepted) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(accepted);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/**
+ * Waits until the runtime accepts connections on its loopback address.
+ *
+ * The gateway used to be put in front the moment the runtime was spawned, so
+ * the first request after `compose up` could race the runtime's own listen()
+ * and land on the 502 page. On timeout the caller proceeds anyway: the 502
+ * page already explains itself and retries, and a gateway that never binds
+ * would be worse than one that explains an upstream that is still waking.
+ * Every dependency is injectable, which is what the tests use.
+ */
+export async function waitForRuntime({
+  host = UPSTREAM_HOST,
+  port = UPSTREAM_PORT,
+  timeoutMs = RUNTIME_READY_TIMEOUT_MS,
+  intervalMs = RUNTIME_READY_INTERVAL_MS,
+  logger = () => {},
+  probe = () => runtimeAccepts({ host, port }),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+} = {}) {
+  const startedAt = now();
+  let announced = false;
+  for (;;) {
+    if (await probe()) {
+      return { ready: true, waitedMs: now() - startedAt };
+    }
+    const waitedMs = now() - startedAt;
+    if (waitedMs >= timeoutMs) {
+      logger(
+        `[start] the runtime is still not accepting connections on ${host}:${port} after ` +
+          `${Math.round(waitedMs / 1000)}s: starting the gateway anyway, its page explains the 502 and retries`,
+      );
+      return { ready: false, waitedMs };
+    }
+    if (!announced) {
+      logger(`[start] waiting for the runtime to accept connections on ${host}:${port}`);
+      announced = true;
+    }
+    await sleep(Math.min(intervalMs, timeoutMs - waitedMs));
+  }
+}
+
+/**
  * Starts the runtime, and the gateway in front of it unless authentication is
  * off. Returns once both are up; the process keeps running until the runtime
  * exits. Every dependency is injectable, which is what the tests use.
@@ -204,6 +287,12 @@ export async function start({
   signals = process,
   spawnRuntime = (file, args, options) => spawn(file, args, options),
   createGatewayFn = createGateway,
+  /**
+   * The readiness wait that runs between spawning the runtime and putting the
+   * gateway in front of it. Injectable so the tests can time it without
+   * touching a socket.
+   */
+  waitForRuntimeFn = waitForRuntime,
   loadOrCreateCertificateFn = loadOrCreateCertificate,
   /**
    * The kernel's view of this container's mounts, and a way to ask whether a
@@ -375,6 +464,12 @@ export async function start({
   });
 
   if (config.authEnabled) {
+    // The runtime is spawned but not necessarily listening yet: wait for its
+    // loopback port before the gateway starts answering, so the first request
+    // after `compose up` finds an upstream that is ready rather than the 502
+    // page. The wait is bounded and proceeds anyway on timeout.
+    await waitForRuntimeFn({ host: UPSTREAM_HOST, port: UPSTREAM_PORT, logger });
+
     // The logger travels with the options, so the gateway reports its own
     // startup and every authentication event through the same sink as the rest
     // of the startup lines. Without it, a refused password, the reason a code was
