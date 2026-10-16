@@ -1,0 +1,113 @@
+name: pr
+
+# The fast gates every pull request passes before merge. The heavy image build
+# and the Playwright suite stay on main (build.yml, e2e.yml): this workflow is
+# the early warning, run on the pull request itself while the change is still
+# cheap to fix.
+#
+# The series gates run against the pinned ZCodium revision with the patch
+# series applied, exactly like Dockerfile.from-source does, so a pull request
+# that no longer applies, no longer typechecks, or breaks a series unit test
+# fails here instead of on main.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gateway:
+    name: gateway unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.14.0"
+      # No path argument: default discovery (what the README documents) is the
+      # only form that runs on the product's Node 24 — it loads a directory
+      # argument as a module instead of scanning it.
+      - name: Run the gateway and entrypoint suite
+        run: node --test --test-force-exit
+
+  series:
+    name: patch series applies on the pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Apply the series on the pinned revision
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '[:space:]' < zcode.version)"
+          git clone --quiet --depth 1 --branch "$ref" \
+            https://github.com/ZCodium-project/ZCodium.git "$RUNNER_TEMP/zc-src"
+          cd "$RUNNER_TEMP/zc-src"
+          git submodule update --init --recursive || true
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "applying $(basename "$patch")"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+
+  typecheck:
+    name: typecheck + series unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clone the pinned revision and apply the series
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '[:space:]' < zcode.version)"
+          git clone --quiet --depth 1 --branch "$ref" \
+            https://github.com/ZCodium-project/ZCodium.git zc-src
+          cd zc-src
+          git submodule update --init --recursive || true
+          # Same mount as Dockerfile.from-source: the bridge contract script
+          # lives in this repo and is injected into the source tree.
+          cp "$GITHUB_WORKSPACE/scripts/validate-remote-bridge.mts" \
+            packages/server/validate-remote-bridge.mts
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.14.0"
+      - name: Install pnpm
+        run: npm install -g pnpm@10.33.2
+      - name: Install the workspace
+        working-directory: zc-src
+        env:
+          CI: "1"
+          HUSKY: "0"
+          COREPACK_ENABLE_PROJECT_SPEC: "0"
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          ZCODE_SKIP_REMOTE_ASSETS: "1"
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm prepare:desktop-runtime || true
+      - name: Validate the remote services bridge
+        working-directory: zc-src
+        run: pnpm exec tsx packages/server/validate-remote-bridge.mts
+      - name: Typecheck
+        working-directory: zc-src
+        run: pnpm typecheck
+      - name: Series unit tests
+        working-directory: zc-src
+        run: |
+          set -euo pipefail
+          paths=(
+            packages/server/test/wsLiveness.test.ts
+            packages/web/test/wsWatchdog.test.ts
+            packages/server/test/openSshEd25519.test.ts
+            packages/ui/test/restoreSessionOwnedAttachments.test.ts
+          )
+          for path in "${paths[@]}"; do test -f "$path"; done
+          pnpm exec vitest run "${paths[@]}"
